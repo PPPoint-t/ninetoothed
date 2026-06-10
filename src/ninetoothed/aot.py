@@ -10,6 +10,8 @@ import uuid
 
 import ninetoothed.dtype
 import ninetoothed.naming as naming
+from ninetoothed.AscendAOTBackend import should_use_ascend_aot_dispatch
+from ninetoothed.CudaAOTBackend import CudaAotBackend
 from ninetoothed.generation import CACHE_DIR, CodeGenerator
 from ninetoothed.tensor import Tensor
 from ninetoothed.utils import calculate_default_configs
@@ -31,17 +33,21 @@ def aot(
     if num_stages is None:
         num_stages = default_num_stages
 
-    output_dir = pathlib.Path(output_dir)
+    if should_use_ascend_aot_dispatch(caller):
+        from ninetoothed.AscendAOTBackend import AscendAOTBackend
 
-    output_contents = _aot(func, caller, kernel_name, num_warps, num_stages)
+        return AscendAOTBackend()(
+            func, kernel_name=kernel_name, num_warps=num_warps, num_stages=num_stages
+        )
 
-    for output_name, output_content in output_contents.items():
-        output_path = output_dir / output_name
-
-        with open(output_path, "w") as f:
-            f.write(output_content)
-
-    return _generate_launch_func(kernel_name=kernel_name, output_dir=output_dir)
+    return CudaAotBackend(_aot, _generate_launch_func)(
+        func,
+        caller=caller,
+        kernel_name=kernel_name,
+        output_dir=output_dir,
+        num_warps=num_warps,
+        num_stages=num_stages,
+    )
 
 
 def _aot(func, caller, kernel_name, num_warps, num_stages):

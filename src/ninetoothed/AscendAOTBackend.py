@@ -239,8 +239,8 @@ def build_from_records(
     auto_tuned_kernel_cls,
 ):
     """Assemble dispatcher and auto-tuned wrapper from prebuilt records."""
-    configs = tuple(record[3] for record in records)
-    all_tensors = tuple(record[4] for record in records)
+    tuple(record[3] for record in records)
+    tuple(record[4] for record in records)
     all_param_names = tuple(record[1] for record in records)
     combinations = tuple(record[2] for record in records)
     built_kernels = tuple(load_kernel_artifact(record[5]) for record in records)

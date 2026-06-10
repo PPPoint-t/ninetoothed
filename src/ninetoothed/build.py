@@ -20,8 +20,12 @@ from ninetoothed.aot import (
     _load_launch_func,
 )
 from ninetoothed.AscendAOTBackend import (
-    build_record as _build_ascend_record,
     build_from_records as _build_ascend_from_records,
+)
+from ninetoothed.AscendAOTBackend import (
+    build_record as _build_ascend_record,
+)
+from ninetoothed.AscendAOTBackend import (
     should_use_ascend_aot_dispatch as _should_use_ascend_aot_dispatch,
 )
 from ninetoothed.auto_tuner import AutoTuner

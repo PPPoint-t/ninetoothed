@@ -218,6 +218,7 @@ class LaunchPlan:
     abi: LaunchABI
     grid: tuple[IndexExpr, ...] = ()
     block: tuple[IndexExpr, ...] = ()
+    logical_domain: IndexExpr = field(default_factory=lambda: IndexExpr.parse(1))
     dynamic_parameters: tuple[str, ...] = ()
     specialization_key: tuple[str, ...] = ()
     tuning_candidates: tuple[Mapping[str, Any], ...] = ()
@@ -225,6 +226,7 @@ class LaunchPlan:
     def __post_init__(self):
         object.__setattr__(self, "grid", tuple(self.grid))
         object.__setattr__(self, "block", tuple(self.block))
+        object.__setattr__(self, "logical_domain", IndexExpr.parse(self.logical_domain))
         object.__setattr__(self, "dynamic_parameters", tuple(self.dynamic_parameters))
         object.__setattr__(self, "specialization_key", tuple(self.specialization_key))
         object.__setattr__(

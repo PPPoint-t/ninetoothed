@@ -1,3 +1,5 @@
+import pytest
+
 from ninetoothed.backends.core import Target
 from ninetoothed.compiler.passes import (
     BACKEND_SPECIFIC,
@@ -94,10 +96,17 @@ class TestPipeline:
                 descriptor.name
                 for descriptor in registered(category=BACKEND_SPECIFIC, backend=backend)
             }
-            assert backend_passes == {f"ssa.{backend.value}.optimize_schedule"}
+            expected = {f"ssa.{backend.value}.optimize_schedule"}
+
+            if backend == Target.ASCEND:
+                expected.add("ssa.ascend.analyze_alias")
+
+            assert backend_passes == expected
             assert (
                 f"ssa.{backend.value}.optimize_schedule" in default_spec(backend).passes
             )
+
+        assert "ssa.ascend.analyze_alias" in default_spec(Target.ASCEND).passes
 
     def test_custom_pipeline_can_disable_backend_optimization_pass(self):
         program = _program(
@@ -170,13 +179,21 @@ class TestPipeline:
             lowered = lower_for_target(program, backend=backend)
             candidates = lowered.metadata["schedule_candidates"]
             assert len(candidates) == expected_count
-            assert (
-                lowered.metadata["selected_schedule_candidate"] == candidates[0]["name"]
-            )
-            assert (
-                lowered.metadata["schedule"]["tile"]
-                == candidates[0]["schedule"]["tile"]
-            )
+
+            if candidates:
+                assert (
+                    lowered.metadata["selected_schedule_candidate"]
+                    == candidates[0]["name"]
+                )
+                assert (
+                    lowered.metadata["schedule"]["tile"]
+                    == candidates[0]["schedule"]["tile"]
+                )
+            else:
+                assert lowered.metadata["selected_schedule_candidate"] is None
+
+        with pytest.raises(ValueError, match="granularity `blocked-linalg`"):
+            lower_for_target(program, backend=Target.ASCEND)
 
     def test_schedule_candidate_can_be_selected_by_pass_option(self):
         program = _program(

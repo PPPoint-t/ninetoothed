@@ -1,0 +1,396 @@
+import sys
+from types import SimpleNamespace
+
+import pytest
+
+from ninetoothed.backends.core import Artifact, BuiltArtifact, Target
+from ninetoothed.backends.materializers.ascend import (
+    AscendMaterializer,
+    _ascend_wrapper,
+    _current_npu_stream,
+    _load_source_module,
+    _logical_offset,
+    _validate_ascend_bindings,
+)
+from ninetoothed.ir import LaunchABI, LaunchBinding, TensorSpec
+
+
+class _Storage:
+    def __init__(self, elements):
+        self._elements = elements
+
+    def nbytes(self):
+        return self._elements * 4
+
+
+class _Tensor:
+    dtype = "torch.float32"
+
+    def __init__(
+        self,
+        elements=256,
+        *,
+        shape=None,
+        contiguous=True,
+        device_type="npu",
+        device_index=0,
+        storage_elements=None,
+        storage_offset=0,
+        data_ptr=None,
+    ):
+        self.shape = tuple(shape) if shape is not None else (elements,)
+        self.device = SimpleNamespace(type=device_type, index=device_index)
+        self._elements = elements
+        self._contiguous = contiguous
+        self._storage_elements = storage_elements or elements
+        self._storage_offset = storage_offset
+        self._data_ptr = data_ptr if data_ptr is not None else id(self) * 8
+
+    def element_size(self):
+        return 4
+
+    def is_contiguous(self):
+        return self._contiguous
+
+    def numel(self):
+        return self._elements
+
+    def storage_offset(self):
+        return self._storage_offset
+
+    def untyped_storage(self):
+        return _Storage(self._storage_elements)
+
+    def data_ptr(self):
+        return self._data_ptr
+
+    def stride(self):
+        return (1,)
+
+
+def _abi():
+    return LaunchABI(
+        public_args=("x", "out"),
+        kernel_args=(
+            LaunchBinding(name="x", kind="tensor", source="x"),
+            LaunchBinding(name="out", kind="tensor", source="out"),
+        ),
+        outputs=("out",),
+    )
+
+
+def _specs():
+    return (
+        TensorSpec(ndim=1, shape=("n",), dtype="float32", name="x"),
+        TensorSpec(ndim=1, shape=("n",), dtype="float32", name="out"),
+    )
+
+
+def test_ascend_binding_validator_requires_contiguous_broadcastable_tensors():
+    abi = _abi()
+    specs = _specs()
+
+    _validate_ascend_bindings(
+        abi,
+        {"x": _Tensor(), "out": _Tensor()},
+        specs,
+        max_core_dim=1,
+    )
+
+    with pytest.raises(TypeError, match="must be contiguous"):
+        _validate_ascend_bindings(
+            abi,
+            {"x": _Tensor(contiguous=False), "out": _Tensor()},
+            specs,
+            max_core_dim=1,
+        )
+
+    with pytest.raises(ValueError, match="requires 256 elements"):
+        _validate_ascend_bindings(
+            abi,
+            {"x": _Tensor(128), "out": _Tensor()},
+            specs,
+            max_core_dim=1,
+        )
+
+
+def test_ascend_binding_validator_accepts_one_dimensional_singleton_broadcast():
+    abi = LaunchABI(
+        public_args=("x", "bias", "out"),
+        kernel_args=(
+            LaunchBinding(name="x", kind="tensor", source="x"),
+            LaunchBinding(name="bias", kind="tensor", source="bias"),
+            LaunchBinding(name="out", kind="tensor", source="out"),
+        ),
+        outputs=("out",),
+    )
+    specs = (
+        TensorSpec(ndim=1, shape=("n",), dtype="float32", name="x"),
+        TensorSpec(ndim=1, shape=("1",), dtype="float32", name="bias"),
+        TensorSpec(ndim=1, shape=("n",), dtype="float32", name="out"),
+    )
+
+    _validate_ascend_bindings(
+        abi,
+        {"x": _Tensor(256), "bias": _Tensor(1), "out": _Tensor(256)},
+        specs,
+        max_core_dim=1,
+    )
+
+
+def test_ascend_binding_validator_accepts_scalar_output_pointer():
+    abi = LaunchABI(
+        public_args=("x", "out"),
+        kernel_args=(
+            LaunchBinding(name="x", kind="tensor", source="x", access="read"),
+            LaunchBinding(name="out", kind="tensor", source="out", access="write"),
+        ),
+        outputs=("out",),
+    )
+    specs = (
+        TensorSpec(ndim=1, shape=("1",), dtype="float32", name="x"),
+        TensorSpec(ndim=0, shape=(), dtype="float32", name="out"),
+    )
+
+    _validate_ascend_bindings(
+        abi,
+        {"x": _Tensor(1), "out": _Tensor(1, shape=())},
+        specs,
+        max_core_dim=1,
+        logical_domain=1,
+    )
+
+
+def test_ascend_binding_validator_uses_output_for_core_limit():
+    abi = LaunchABI(
+        public_args=("x", "bias", "out"),
+        kernel_args=(
+            LaunchBinding(name="x", kind="tensor", source="x"),
+            LaunchBinding(name="bias", kind="tensor", source="bias"),
+            LaunchBinding(name="out", kind="tensor", source="out"),
+        ),
+        outputs=("out",),
+    )
+    specs = (
+        TensorSpec(ndim=1, shape=("n",), dtype="float32", name="x"),
+        TensorSpec(ndim=1, shape=("1",), dtype="float32", name="bias"),
+        TensorSpec(ndim=1, shape=("n",), dtype="float32", name="out"),
+    )
+
+    with pytest.raises(ValueError, match="required 2, limit 1"):
+        _validate_ascend_bindings(
+            abi,
+            {"x": _Tensor(257), "bias": _Tensor(1), "out": _Tensor(257)},
+            specs,
+            max_core_dim=1,
+        )
+
+
+def test_ascend_binding_validator_rejects_grid_over_core_limit():
+    with pytest.raises(ValueError, match="required 2, limit 1"):
+        _validate_ascend_bindings(
+            _abi(),
+            {"x": _Tensor(257), "out": _Tensor(257)},
+            _specs(),
+            max_core_dim=1,
+        )
+
+
+def test_ascend_source_loader_does_not_register_a_global_module(tmp_path):
+    source = tmp_path / "artifact.ascend.py"
+    source.write_text("def launch_test():\n    return 'ok'\n", encoding="utf-8")
+
+    module = _load_source_module(source, "test")
+
+    assert module.launch_test() == "ok"
+    assert module.__name__ == "_ninetoothed_ascend_test"
+
+
+def test_ascend_source_loader_reports_missing_toolchain_dependency(tmp_path):
+    source = tmp_path / "missing_dependency.ascend.py"
+    source.write_text("import triton_ascend_missing_for_test\n", encoding="utf-8")
+
+    with pytest.raises(ImportError, match="Triton Ascend and CANN runtime"):
+        _load_source_module(source, "missing_dependency")
+
+
+def test_ascend_built_source_artifact_reloads_without_a_binary(tmp_path):
+    source_path = tmp_path / "reload.ascend.py"
+    source_path.write_text("def launch_reload():\n    return None\n", encoding="utf-8")
+    artifact = Artifact(
+        backend=Target.ASCEND,
+        kernel_name="reload",
+        language="python/triton",
+        sources={"reload.ascend.py": source_path.read_text(encoding="utf-8")},
+        entrypoint="launch_reload",
+        metadata={"ssa_schedule": {"core_dim_limit": 1}},
+    )
+    built = BuiltArtifact(
+        source=artifact,
+        cache_key="reload-key",
+        source_path=str(source_path),
+        binary_path=None,
+        manifest_path=str(tmp_path / "reload.manifest.json"),
+        abi={},
+    )
+
+    assert AscendMaterializer().load_built_artifact(built)() is None
+
+
+def test_ascend_wrapper_rejects_non_npu_before_launch():
+    calls = []
+    launch = _ascend_wrapper(
+        lambda *values: calls.append(values),
+        _abi(),
+        _specs(),
+        source_path=SimpleNamespace(),
+        kernel_name="test",
+        max_core_dim=1,
+        module=object(),
+    )
+
+    with pytest.raises(TypeError, match="NPU device"):
+        launch(_Tensor(device_type="cuda"), _Tensor(device_type="cuda"))
+
+    assert calls == []
+
+
+def test_ascend_wrapper_rejects_mixed_npu_devices_before_launch():
+    calls = []
+    launch = _ascend_wrapper(
+        lambda *values: calls.append(values),
+        _abi(),
+        _specs(),
+        source_path=SimpleNamespace(),
+        kernel_name="test",
+        max_core_dim=1,
+        module=object(),
+    )
+
+    with pytest.raises(TypeError, match="same NPU device"):
+        launch(_Tensor(device_index=0), _Tensor(device_index=1))
+
+    assert calls == []
+
+
+def test_ascend_empty_tensor_returns_without_launch_or_stream_lookup():
+    calls = []
+    output = _Tensor(elements=0)
+    launch = _ascend_wrapper(
+        lambda *values: calls.append(values),
+        _abi(),
+        _specs(),
+        source_path=SimpleNamespace(),
+        kernel_name="test",
+        max_core_dim=1,
+        module=object(),
+    )
+
+    assert launch(_Tensor(elements=0), output) is output
+    assert calls == []
+
+
+def test_ascend_binding_validator_rejects_invalid_storage_offset():
+    with pytest.raises(ValueError, match="storage span"):
+        _validate_ascend_bindings(
+            _abi(),
+            {"x": _Tensor(storage_offset=-1), "out": _Tensor()},
+            _specs(),
+            max_core_dim=1,
+        )
+
+
+def test_ascend_binding_validator_uses_logical_domain_for_offset_view():
+    specs = (
+        TensorSpec(
+            ndim=1,
+            shape=("257",),
+            dtype="float32",
+            name="x",
+            attrs={"view_offsets": ("index + 1",)},
+        ),
+        TensorSpec(
+            ndim=1,
+            shape=("257",),
+            dtype="float32",
+            name="out",
+            attrs={"view_offsets": ("index + 1",)},
+        ),
+    )
+
+    _validate_ascend_bindings(
+        _abi(),
+        {"x": _Tensor(258), "out": _Tensor(258)},
+        specs,
+        max_core_dim=2,
+        logical_domain=257,
+    )
+
+    with pytest.raises(ValueError, match="requires 258 elements"):
+        _validate_ascend_bindings(
+            _abi(),
+            {"x": _Tensor(257), "out": _Tensor(258)},
+            specs,
+            max_core_dim=2,
+            logical_domain=257,
+        )
+
+
+@pytest.mark.parametrize(
+    ("expression", "offset"),
+    (("0", 0), ("index", 0), ("index + 2", 2)),
+)
+def test_ascend_materializer_uses_static_view_offset_contract(expression, offset):
+    spec = TensorSpec(
+        ndim=1,
+        shape=("n",),
+        dtype="float32",
+        name="x",
+        attrs={"view_offsets": (expression,)},
+    )
+
+    assert _logical_offset(spec, _abi(), {}) == offset
+
+
+@pytest.mark.parametrize("expression", ("-1", "index - 1", "index + n"))
+def test_ascend_materializer_rejects_invalid_static_view_offsets(expression):
+    spec = TensorSpec(
+        ndim=1,
+        shape=("n",),
+        dtype="float32",
+        name="x",
+        attrs={"view_offsets": (expression,)},
+    )
+
+    with pytest.raises(ValueError, match="static forward offset"):
+        _logical_offset(spec, _abi(), {})
+
+
+def test_ascend_binding_validator_rejects_writer_reader_storage_alias():
+    abi = LaunchABI(
+        public_args=("x", "out"),
+        kernel_args=(
+            LaunchBinding(name="x", kind="tensor", source="x", access="read"),
+            LaunchBinding(name="out", kind="tensor", source="out", access="write"),
+        ),
+        outputs=("out",),
+    )
+
+    with pytest.raises(ValueError, match="storage overlap.*writer 'out'.*reader 'x'"):
+        _validate_ascend_bindings(
+            abi,
+            {
+                "x": _Tensor(data_ptr=4096),
+                "out": _Tensor(data_ptr=4096),
+            },
+            _specs(),
+            max_core_dim=1,
+            logical_domain=256,
+        )
+
+
+def test_ascend_stream_error_identifies_missing_torch_npu(monkeypatch):
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace())
+
+    with pytest.raises(RuntimeError, match="torch_npu"):
+        _current_npu_stream({"x": _Tensor()})

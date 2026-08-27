@@ -16,6 +16,8 @@ from ninetoothed.backends.core import (
     Target,
     normalize_target,
 )
+from ninetoothed.compiler.ascend_contracts import static_forward_view_offset
+from ninetoothed.compiler.effects import tensor_access_modes
 from ninetoothed.frontend.layout import tensor_specs
 from ninetoothed.frontend.python import LoweringError, from_application
 from ninetoothed.ir import IndexExpr, Kernel, LaunchABI, LaunchBinding, LaunchPlan, ssa
@@ -313,7 +315,7 @@ def _compile_kernel(request: CompileRequest) -> Compilation:
         program=program,
         meta_defaults=scheduled_defaults,
     )
-    launch_plan = _launch_plan(launch_abi, artifact, request, arranged)
+    launch_plan = _launch_plan(launch_abi, artifact, request, arranged, specs)
     kernel = replace(
         kernel,
         launch_abi=launch_abi,
@@ -359,7 +361,7 @@ def _launch_abi(
         for name, tensor in zip(params, arranged)
     }
     output_names = tuple(artifact.metadata.get("outputs", ()))
-    access_modes = _tensor_access_modes(program)
+    access_modes = _launch_access_modes(artifact, program)
     bindings = []
 
     for name in (
@@ -384,6 +386,8 @@ def _launch_abi(
         kind = (
             "constexpr"
             if spec.constexpr
+            else "tensor"
+            if spec.ndim == 0 and name in output_names
             else "scalar"
             if spec.ndim == 0
             else "jagged_values"
@@ -430,151 +434,24 @@ def _binding_access(kind, source, access_modes, output_names):
 
     return access_modes.get(
         source,
-        "read_write" if source in output_names else "read",
+        "write" if source in output_names else "read",
     )
 
 
-def _tensor_access_modes(program: ssa.Program) -> dict[str, str]:
-    tensor_names = {
-        value.name for value in program.inputs if value.type.kind == "tensor"
-    }
-    operations = tuple(
-        operation
-        for block in program.blocks
-        for operation in _walk_ssa_operations(block.operations)
-    )
-    producers = {
-        result.name: operation
-        for operation in operations
-        for result in operation.results
-    }
-    block_sources = {}
+def _launch_access_modes(artifact: Artifact, program: ssa.Program) -> Mapping[str, str]:
+    if artifact.backend != Target.ASCEND:
+        return tensor_access_modes(program)
 
-    for operation in operations:
-        if operation.opcode != "scf.for" or not operation.regions:
-            continue
+    analysis = artifact.metadata.get("ssa_metadata", {}).get("ascend_alias_analysis")
 
-        block_args = operation.regions[0].args
-
-        if not block_args:
-            continue
-
-        block_sources[block_args[0].name] = operation.operands[:3]
-        yield_operation = next(
-            (
-                nested
-                for nested in reversed(operation.regions[0].operations)
-                if nested.opcode == "scf.yield"
-            ),
-            None,
+    if not isinstance(analysis, Mapping) or not isinstance(
+        analysis.get("access_modes"), Mapping
+    ):
+        raise ValueError(
+            "Ascend launch ABI requires `ssa.ascend.analyze_alias` access metadata."
         )
-        yielded = yield_operation.operands if yield_operation is not None else ()
 
-        for block_arg, initial, result in zip(
-            block_args[1:], operation.operands[3:], yielded
-        ):
-            block_sources[block_arg.name] = (initial, result)
-
-    dependencies: dict[str, frozenset[str]] = {}
-
-    def data_dependencies(name, visiting=frozenset()):
-        if name in tensor_names:
-            return frozenset((name,))
-
-        if name in dependencies:
-            return dependencies[name]
-
-        if name in visiting:
-            return frozenset()
-
-        sources = block_sources.get(name)
-
-        if sources is not None:
-            result = frozenset().union(
-                *(data_dependencies(source, visiting | {name}) for source in sources)
-            )
-            dependencies[name] = result
-
-            return result
-
-        producer = producers.get(name)
-
-        if producer is None or producer.opcode.startswith(("index.", "shape.")):
-            return frozenset()
-
-        nested_yields = (
-            operand
-            for region in producer.regions
-            for operation in _walk_ssa_operations(region.operations)
-            if operation.opcode == "scf.yield"
-            for operand in operation.operands
-        )
-        result = frozenset().union(
-            *(
-                data_dependencies(operand, visiting | {name})
-                for operand in (*producer.operands, *nested_yields)
-            )
-        )
-        dependencies[name] = result
-
-        return result
-
-    reads = set()
-    writes = set()
-
-    def visit_effects(effect_operations, control_operands=()):
-        for operation in effect_operations:
-            if operation.opcode == "mem.store" and len(operation.operands) >= 2:
-                reads.update(data_dependencies(operation.operands[0]))
-
-                for index in operation.attrs.get("indices", ()):
-                    reads.update(data_dependencies(str(index)))
-
-                writes.update(data_dependencies(operation.operands[1]))
-            elif operation.opcode == "mem.atomic_add" and operation.operands:
-                target = data_dependencies(operation.operands[0])
-                reads.update(target)
-                writes.update(target)
-
-                for operand in operation.operands[1:]:
-                    reads.update(data_dependencies(operand))
-
-            if operation.opcode in {"mem.store", "mem.atomic_add"}:
-                for operand in control_operands:
-                    reads.update(data_dependencies(operand))
-
-            control_arity = {"scf.if": 1, "scf.for": 3}.get(operation.opcode, 0)
-            nested_controls = (
-                *control_operands,
-                *operation.operands[:control_arity],
-            )
-
-            for region in operation.regions:
-                visit_effects(region.operations, nested_controls)
-
-    visit_effects(program.blocks[0].operations)
-
-    writes.update(value.name for value in program.outputs if value.name in tensor_names)
-
-    return {
-        name: (
-            "read_write"
-            if name in reads and name in writes
-            else "write"
-            if name in writes
-            else "read"
-        )
-        for name in tensor_names
-        if name in reads or name in writes
-    }
-
-
-def _walk_ssa_operations(operations):
-    for operation in operations:
-        yield operation
-
-        for region in operation.regions:
-            yield from _walk_ssa_operations(region.operations)
+    return dict(analysis["access_modes"])
 
 
 def _launch_plan(
@@ -582,6 +459,7 @@ def _launch_plan(
     artifact: Artifact,
     request: CompileRequest,
     arranged,
+    specs,
 ) -> LaunchPlan:
     metadata = artifact.metadata
     grid = tuple(
@@ -590,6 +468,7 @@ def _launch_plan(
     block = tuple(
         IndexExpr.parse(str(value)) for value in metadata.get("launch_block", ())
     )
+    logical_domain = _logical_domain(artifact, specs)
     dynamic = tuple(
         binding.name
         for binding in abi.kernel_args
@@ -611,20 +490,79 @@ def _launch_plan(
             )
         )
     )
-    candidates = (
-        _triton_tuning_candidates(metadata, request, arranged)
-        if artifact.backend == Target.TRITON
-        else ()
-    )
+
+    if artifact.backend == Target.TRITON:
+        candidates = _triton_tuning_candidates(metadata, request, arranged)
+    elif artifact.backend == Target.ASCEND:
+        _validate_ascend_build_policy(metadata, request)
+        candidates = ()
+    else:
+        candidates = ()
 
     return LaunchPlan(
         abi=abi,
         grid=grid,
         block=block,
+        logical_domain=logical_domain,
         dynamic_parameters=dynamic,
         specialization_key=specialization,
         tuning_candidates=candidates,
     )
+
+
+def _logical_domain(artifact: Artifact, specs) -> IndexExpr:
+    if artifact.backend != Target.ASCEND:
+        return IndexExpr.parse(artifact.metadata.get("launch_grid", ("1",))[0])
+
+    output_names = tuple(artifact.metadata.get("outputs", ()))
+
+    if len(output_names) != 1:
+        raise ValueError(
+            "Ascend logical-domain launch planning requires exactly one output tensor."
+        )
+
+    by_name = {spec.name: spec for spec in specs}
+
+    try:
+        output = by_name[output_names[0]]
+    except KeyError as exc:
+        raise ValueError(
+            "Ascend logical-domain launch planning cannot resolve output tensor "
+            f"'{output_names[0]}'."
+        ) from exc
+
+    if output.ndim == 0:
+        return IndexExpr.parse(1)
+
+    dimensions = tuple(output.layout.application_shape) if output.layout else ()
+
+    if len(dimensions) != 1:
+        raise ValueError(
+            "Ascend logical-domain launch planning currently supports only "
+            "one-dimensional output views."
+        )
+
+    source_shape = tuple(output.attrs.get("source_shape", ()))
+
+    if len(source_shape) != 1:
+        raise ValueError(
+            "Ascend logical-domain launch planning requires one source dimension."
+        )
+
+    offset = _logical_view_offset(output)
+
+    return IndexExpr.parse(
+        f"min({dimensions[0].render()}, ({source_shape[0]} - {offset}))"
+    )
+
+
+def _logical_view_offset(spec) -> int:
+    offsets = tuple(spec.attrs.get("view_offsets", ()))
+
+    if not offsets:
+        return 0
+
+    return static_forward_view_offset(offsets[0])
 
 
 def _validate_tuning_options(target: Target, request: CompileRequest) -> None:
@@ -646,6 +584,25 @@ def _validate_tuning_options(target: Target, request: CompileRequest) -> None:
     if target == Target.TRITON:
         return
 
+    if target == Target.ASCEND:
+        for name, value in (
+            ("num_warps", request.num_warps),
+            ("num_stages", request.num_stages),
+        ):
+            if value is not None:
+                raise ValueError(
+                    f"Ascend backend does not support `{name}`; its initial "
+                    "build policy uses the deterministic SSA schedule."
+                )
+
+        if request.max_num_configs not in {None, 1}:
+            raise NotImplementedError(
+                "Ascend backend auto-tuning is not supported yet; use "
+                "max_num_configs=1."
+            )
+
+        return
+
     if (
         isinstance(request.num_warps, tuple)
         or isinstance(request.num_stages, tuple)
@@ -654,6 +611,29 @@ def _validate_tuning_options(target: Target, request: CompileRequest) -> None:
         raise NotImplementedError(
             f"Backend auto-tuning is not supported for `{target.value}` yet; "
             "use scalar num_warps/num_stages and max_num_configs=1."
+        )
+
+
+def _validate_ascend_build_policy(
+    metadata: Mapping[str, Any], request: CompileRequest
+) -> None:
+    """Keep Ascend build choices owned by the selected SSA schedule."""
+    schedule = dict(metadata.get("ssa_schedule", {}))
+
+    if schedule.get("tile", {}).get("elements") != 256:
+        raise ValueError(
+            "Ascend build requires the deterministic `fp32-elementwise-256` "
+            "SSA schedule."
+        )
+
+    if schedule.get("vector_width") != 1:
+        raise ValueError(
+            "Ascend build requires the deterministic scalar-vector-width SSA schedule."
+        )
+
+    if request.num_warps is not None or request.num_stages is not None:
+        raise ValueError(
+            "Ascend build does not accept runtime warp or stage configuration."
         )
 
 
@@ -1011,6 +991,7 @@ def _launch_plan_dict(plan: LaunchPlan) -> dict[str, Any]:
         "abi": _abi_dict(plan.abi),
         "grid": tuple(value.render() for value in plan.grid),
         "block": tuple(value.render() for value in plan.block),
+        "logical_domain": plan.logical_domain.render(),
         "dynamic_parameters": plan.dynamic_parameters,
         "specialization_key": plan.specialization_key,
         "tuning_candidates": plan.tuning_candidates,

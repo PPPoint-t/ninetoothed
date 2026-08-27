@@ -5,6 +5,7 @@ import pytest
 from ninetoothed.backends.core import Target
 from ninetoothed.backends.materializers import create_default_registry
 from ninetoothed.backends.materializers import triton as triton_materializer
+from ninetoothed.backends.materializers.ascend import AscendMaterializer
 from ninetoothed.backends.materializers.base import MaterializerRegistry
 from ninetoothed.backends.materializers.cuda import CudaMaterializer
 
@@ -27,6 +28,12 @@ def test_materializer_registry_rejects_duplicate_without_replace():
         registry.register(CudaMaterializer())
 
     registry.register(CudaMaterializer(), replace=True)
+
+
+def test_ascend_materializer_implements_the_source_artifact_contract():
+    materializer = AscendMaterializer()
+
+    assert materializer.target == Target.ASCEND
 
 
 def test_triton_materializer_uses_shared_toolchain_boundary():

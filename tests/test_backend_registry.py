@@ -11,6 +11,7 @@ from ninetoothed.backends import (
     normalize_target,
 )
 from ninetoothed.backends.toolchain import cuda_compile_command
+from ninetoothed.compiler import resolve_target
 from ninetoothed.frontend.python import from_source
 from ninetoothed.ir import Kernel, TensorSpec, ir_to_dict
 
@@ -78,13 +79,26 @@ class TestRegistry:
         assert normalize_target("triton") == Target.TRITON
         assert normalize_target("tilelang") == Target.TILELANG
         assert normalize_target("cuda") == Target.CUDA
+        assert normalize_target("ascend") == Target.ASCEND
 
-        for alias in ("tl", "tile-lang", "tile_lang", "cu"):
+        for alias in ("tl", "tile-lang", "tile_lang", "cu", "npu", "cann"):
             with pytest.raises(ValueError, match="Unsupported backend"):
                 normalize_target(alias)
 
         with pytest.raises(ValueError, match="Unsupported backend"):
             normalize_target("tvm")
+
+    def test_backend_environment_selection_remains_strict(self, monkeypatch):
+        monkeypatch.delenv("NINETOOTHED_BACKEND", raising=False)
+        assert resolve_target(None) == Target.TRITON
+
+        monkeypatch.setenv("NINETOOTHED_BACKEND", "ascend")
+        assert resolve_target(None) == Target.ASCEND
+
+        monkeypatch.setenv("NINETOOTHED_BACKEND", "npu")
+
+        with pytest.raises(ValueError, match="Supported backends: ascend, cuda"):
+            resolve_target(None)
 
     def test_backend_options_are_validated_and_normalized_by_target(self):
         cuda = default_registry().get(Target.CUDA)
@@ -112,18 +126,46 @@ class TestRegistry:
         )
         assert "-arch=sm_90" in command
 
-    def test_default_registry_reports_three_backends(self):
+    def test_default_registry_reports_builtin_backends(self):
         names = {capability.name for capability in backend_capabilities()}
         assert names == {
             Target.TRITON,
             Target.TILELANG,
             Target.CUDA,
+            Target.ASCEND,
         }
 
     def test_backends_reject_source_only_kernel_without_ssa(self):
         for backend in ("triton", "cuda", "tilelang"):
             with pytest.raises(ValueError, match="requires ssa.Program"):
                 emit(_source_only_kernel(), backend)
+
+    def test_ascend_emits_the_verified_first_source_tier(self):
+        ascend = default_registry().get(Target.ASCEND)
+        assert ascend.capability.emits_source
+        assert ascend.capability.can_execute
+        assert ascend.normalize_options({"soc_version": "Ascend910B3"}) == {
+            "soc_version": "Ascend910B3"
+        }
+
+        assert ascend.normalize_options({"max_core_dim": 65535}) == {
+            "max_core_dim": 65535
+        }
+
+        with pytest.raises(ValueError, match="between 1 and 65535"):
+            ascend.normalize_options({"max_core_dim": 65536})
+
+        with pytest.raises(TypeError, match="Unsupported ascend backend option"):
+            ascend.normalize_options({"arch": "Ascend910B3"})
+
+        artifact = emit(_add_kernel(), Target.ASCEND)
+        assert artifact.language == "python/triton"
+        assert artifact.metadata["source_route"] == "ssa-unified-ascend-triton-emitter"
+        assert (
+            "from triton.language.extra.cann import libdevice"
+            in artifact.primary_source
+        )
+        assert "tl.store(out + index, v0, mask=mask)" in artifact.primary_source
 
     def test_backends_emit_ssa_elementwise_add(self):
         expected = {
@@ -194,7 +236,7 @@ class TestRegistry:
             "vector_width",
         }
 
-        for backend in Target:
+        for backend in (Target.TRITON, Target.CUDA, Target.TILELANG):
             artifact = emit(_matmul_kernel("float16"), backend)
             optimization = artifact.metadata["ssa_optimization"]
             assert set(optimization) <= {"preserve_linalg", "schedule"}

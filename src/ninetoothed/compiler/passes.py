@@ -544,8 +544,9 @@ def default_spec(
 ) -> PipelineSpec:
     """Return the default declarative pipeline for a backend."""
     backend_name = normalize_target(backend)
-    pass_names = _default_pass_names(backend_name)
-    _validate_passes(pass_names, backend_name, _default_registry(registry))
+    pass_registry = _default_registry(registry)
+    pass_names = _default_pass_names(backend_name, pass_registry)
+    _validate_passes(pass_names, backend_name, pass_registry)
 
     return PipelineSpec(
         passes=pass_names,
@@ -705,7 +706,7 @@ def _normalize_pipeline_spec(
         passes = spec.get("passes")
 
         if passes is None:
-            passes = _default_pass_names(backend)
+            passes = _default_pass_names(backend, registry)
 
         normalized = PipelineSpec(
             passes=tuple(str(name) for name in passes),
@@ -741,11 +742,21 @@ def _validate_passes(
             )
 
 
-def _default_pass_names(backend: Target) -> tuple[str, ...]:
+def _default_pass_names(backend: Target, registry: Registry) -> tuple[str, ...]:
+    analysis_passes = tuple(
+        descriptor.name
+        for descriptor in registry.descriptors(
+            category=BACKEND_SPECIFIC,
+            backend=backend,
+        )
+        if descriptor.phase == "analysis" and descriptor.default_enabled
+    )
+
     return (
         "ssa.canonicalize",
         "ssa.analyze_effects",
         "ssa.select_schedule",
+        *analysis_passes,
         _backend_optimize_pass_name(backend),
         "ssa.decompose_linalg",
     )

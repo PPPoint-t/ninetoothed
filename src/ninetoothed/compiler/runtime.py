@@ -20,7 +20,7 @@ from ninetoothed.compiler.cache import (
     write_manifest,
     write_source,
 )
-from ninetoothed.ir import LaunchABI, LaunchBinding, ir_to_dict
+from ninetoothed.ir import IndexExpr, LaunchABI, LaunchBinding, LaunchPlan, ir_to_dict
 
 
 class KernelLaunchError(RuntimeError):
@@ -128,6 +128,18 @@ def _launch_abi_from_dict(value) -> LaunchABI:
         ),
         outputs=tuple(value.get("outputs", ())),
         shape_params=tuple(value.get("shape_params", ())),
+    )
+
+
+def _launch_plan_from_dict(value) -> LaunchPlan:
+    return LaunchPlan(
+        abi=_launch_abi_from_dict(value.get("abi", {})),
+        grid=tuple(IndexExpr.parse(item) for item in value.get("grid", ())),
+        block=tuple(IndexExpr.parse(item) for item in value.get("block", ())),
+        logical_domain=IndexExpr.parse(value.get("logical_domain", 1)),
+        dynamic_parameters=tuple(value.get("dynamic_parameters", ())),
+        specialization_key=tuple(value.get("specialization_key", ())),
+        tuning_candidates=tuple(value.get("tuning_candidates", ())),
     )
 
 
@@ -1118,7 +1130,14 @@ def _runtime_wrapper(
     return launch
 
 
-def _public_values(abi: LaunchABI, args, kwargs, *, specs=()) -> dict[str, Any]:
+def _public_values(
+    abi: LaunchABI,
+    args,
+    kwargs,
+    *,
+    specs=(),
+    expected_device_type: str = "cuda",
+) -> dict[str, Any]:
     if len(args) > len(abi.public_args):
         raise TypeError(f"Expected at most {len(abi.public_args)} arguments.")
 
@@ -1147,7 +1166,7 @@ def _public_values(abi: LaunchABI, args, kwargs, *, specs=()) -> dict[str, Any]:
     if missing:
         raise TypeError(f"Missing kernel arguments: {', '.join(missing)}.")
 
-    _validate_runtime_values(values, specs)
+    _validate_runtime_values(values, specs, expected_device_type=expected_device_type)
 
     return values
 
@@ -1162,7 +1181,7 @@ def _filter_runtime_kwargs(abi: LaunchABI, kwargs) -> dict[str, Any]:
     return {name: value for name, value in kwargs.items() if name in accepted}
 
 
-def _validate_runtime_values(values, specs) -> None:
+def _validate_runtime_values(values, specs, *, expected_device_type: str) -> None:
     expected_device = None
 
     for spec in specs:
@@ -1170,11 +1189,16 @@ def _validate_runtime_values(values, specs) -> None:
             continue
 
         value = values[spec.name]
-        expected_device = _validate_tensor_contract(spec, value, expected_device)
+        expected_device = _validate_tensor_contract(
+            spec,
+            value,
+            expected_device,
+            expected_device_type=expected_device_type,
+        )
         _validate_dtype_contract(spec, value)
 
 
-def _validate_tensor_contract(spec, value, expected_device):
+def _validate_tensor_contract(spec, value, expected_device, *, expected_device_type):
     source_ndim = int(spec.attrs.get("source_ndim", spec.ndim))
 
     if source_ndim == 0:
@@ -1212,11 +1236,17 @@ def _validate_tensor_contract(spec, value, expected_device):
 
     device_type = getattr(device, "type", str(device).split(":")[0])
 
-    if device_type != "cuda":
-        raise TypeError(f"Kernel argument `{spec.name}` must be on a CUDA device.")
+    if device_type != expected_device_type:
+        raise TypeError(
+            f"Kernel argument `{spec.name}` must be on a {expected_device_type.upper()} "
+            "device."
+        )
 
     if expected_device is not None and device != expected_device:
-        raise TypeError("All tensor arguments must use the same CUDA device.")
+        raise TypeError(
+            f"All tensor arguments must use the same {expected_device_type.upper()} "
+            "device."
+        )
     return device if expected_device is None else expected_device
 
 

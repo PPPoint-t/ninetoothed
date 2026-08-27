@@ -14,3 +14,5 @@ NineToothed Documentation
    basics
    build
    python_api
+   ascend_backend_adr
+   ascend_compatibility_matrix

@@ -23,7 +23,7 @@ from ninetoothed.compiler.passes import (
     Pass,
     ScheduleCandidate,
 )
-from ninetoothed.ir import Kernel, ssa
+from ninetoothed.ir import IndexExpr, Kernel, ssa
 
 if TYPE_CHECKING:
     from ninetoothed.compiler.passes import Registry
@@ -198,8 +198,9 @@ class AscendOptimizeSchedule(OptimizeSchedule):
         if unsupported_views:
             names = ", ".join(unsupported_views)
             raise ValueError(
-                "Ascend backend supports only one-dimensional static forward "
-                "unit-stride logical views; unsupported tensors: "
+                "Ascend backend supports only contiguous base tensors, one-dimensional "
+                "static forward views, and zero-offset multidimensional views; "
+                "unsupported tensors: "
                 f"{names}."
             )
 
@@ -289,11 +290,16 @@ def _logical_view(tensor) -> Mapping[str, str]:
     if tensor.ndim == 0:
         return {"domain": "1", "offset": "0", "mask": "True"}
 
-    return {
-        "domain": str(tensor.layout.application_shape[0])
+    dimensions = (
+        tuple(value.render() for value in tensor.layout.application_shape)
         if tensor.layout and tensor.layout.application_shape
-        else str(tensor.shape[0]),
-        "offset": str(attrs.get("view_offsets", ("index",))[0]),
+        else tuple(IndexExpr.parse(value).render() for value in tensor.shape)
+    )
+    offsets = tuple(str(value) for value in attrs.get("view_offsets", ()))
+
+    return {
+        "domain": " * ".join(f"({value})" for value in dimensions) or "1",
+        "offset": offsets[0] if len(offsets) == 1 else "0",
         "mask": str(attrs.get("view_mask", True)),
     }
 
@@ -302,13 +308,12 @@ def _is_supported_logical_view(tensor) -> bool:
     if tensor.ndim == 0:
         return True
 
-    if tensor.ndim != 1:
-        return False
-
     if tensor.layout is None:
         return True
 
-    if len(tensor.layout.application_shape) != 1:
+    rank = len(tensor.layout.application_shape)
+
+    if rank != tensor.ndim or rank == 0:
         return False
 
     attrs = dict(tensor.attrs)
@@ -317,10 +322,16 @@ def _is_supported_logical_view(tensor) -> bool:
     if not offsets:
         return True
 
-    if len(offsets) != 1:
+    if len(offsets) != rank:
         return False
 
-    return is_static_forward_view_offset(offsets[0])
+    if rank == 1:
+        return is_static_forward_view_offset(offsets[0])
+
+    return all(
+        is_static_forward_view_offset(offset) and str(offset) == "0"
+        for offset in offsets
+    )
 
 
 def register_ssa_passes(registry: "Registry") -> None:

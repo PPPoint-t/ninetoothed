@@ -37,6 +37,7 @@ class _Tensor:
         storage_offset=0,
         data_ptr=None,
         dtype="torch.float32",
+        strides=None,
     ):
         self.shape = tuple(shape) if shape is not None else (elements,)
         self.device = SimpleNamespace(type=device_type, index=device_index)
@@ -46,6 +47,14 @@ class _Tensor:
         self._storage_offset = storage_offset
         self._data_ptr = data_ptr if data_ptr is not None else id(self) * 8
         self.dtype = dtype
+        default_strides = []
+        stride = 1
+
+        for size in reversed(self.shape):
+            default_strides.append(stride)
+            stride *= size
+
+        self._strides = strides or tuple(reversed(default_strides))
 
     def element_size(self):
         return 4
@@ -66,15 +75,25 @@ class _Tensor:
         return self._data_ptr
 
     def stride(self):
-        return (1,)
+        return self._strides
 
 
-def _abi():
+def _abi(*, with_access=False):
     return LaunchABI(
         public_args=("x", "out"),
         kernel_args=(
-            LaunchBinding(name="x", kind="tensor", source="x"),
-            LaunchBinding(name="out", kind="tensor", source="out"),
+            LaunchBinding(
+                name="x",
+                kind="tensor",
+                source="x",
+                access="read" if with_access else None,
+            ),
+            LaunchBinding(
+                name="out",
+                kind="tensor",
+                source="out",
+                access="write" if with_access else None,
+            ),
         ),
         outputs=("out",),
     )
@@ -136,7 +155,7 @@ def test_ascend_binding_validator_accepts_verified_dtypes(dtype):
 def test_ascend_binding_validator_rejects_runtime_dtype_mismatch():
     with pytest.raises(TypeError, match="dtype float32; expected float16"):
         _validate_ascend_bindings(
-            _abi(),
+            _abi(with_access=True),
             {"x": _Tensor(), "out": _Tensor()},
             (
                 TensorSpec(ndim=1, shape=("n",), dtype="float16", name="x"),
@@ -176,6 +195,125 @@ def test_ascend_binding_validator_accepts_one_dimensional_singleton_broadcast():
         specs,
         max_core_dim=1,
     )
+
+
+def test_ascend_binding_validator_accepts_contiguous_matrix_and_row_broadcast():
+    abi = LaunchABI(
+        public_args=("x", "bias", "out"),
+        kernel_args=(
+            LaunchBinding(name="x", kind="tensor", source="x"),
+            LaunchBinding(name="bias", kind="tensor", source="bias"),
+            LaunchBinding(name="out", kind="tensor", source="out"),
+        ),
+        outputs=("out",),
+    )
+    specs = (
+        TensorSpec(ndim=2, shape=("m", "n"), dtype="float32", name="x"),
+        TensorSpec(ndim=2, shape=("1", "n"), dtype="float32", name="bias"),
+        TensorSpec(ndim=2, shape=("m", "n"), dtype="float32", name="out"),
+    )
+
+    _validate_ascend_bindings(
+        abi,
+        {
+            "x": _Tensor(527, shape=(17, 31), strides=(31, 1)),
+            "bias": _Tensor(31, shape=(1, 31), strides=(31, 1)),
+            "out": _Tensor(527, shape=(17, 31), strides=(31, 1)),
+        },
+        specs,
+        max_core_dim=3,
+        logical_domain=527,
+    )
+
+
+def test_ascend_binding_validator_accepts_multiple_outputs_and_rejects_output_alias():
+    abi = LaunchABI(
+        public_args=("x", "out0", "out1"),
+        kernel_args=(
+            LaunchBinding(name="x", kind="tensor", source="x", access="read"),
+            LaunchBinding(name="out0", kind="tensor", source="out0", access="write"),
+            LaunchBinding(name="out1", kind="tensor", source="out1", access="write"),
+        ),
+        outputs=("out0", "out1"),
+    )
+    specs = tuple(
+        TensorSpec(ndim=2, shape=("m", "n"), dtype="float32", name=name)
+        for name in ("x", "out0", "out1")
+    )
+    public = {
+        "x": _Tensor(527, shape=(17, 31), strides=(31, 1), data_ptr=1024),
+        "out0": _Tensor(527, shape=(17, 31), strides=(31, 1), data_ptr=4096),
+        "out1": _Tensor(527, shape=(17, 31), strides=(31, 1), data_ptr=8192),
+    }
+
+    _validate_ascend_bindings(abi, public, specs, max_core_dim=3, logical_domain=527)
+
+    public["out1"] = _Tensor(0, shape=(17, 31), strides=(31, 1), data_ptr=8192)
+
+    with pytest.raises(ValueError, match="requires every output to contain"):
+        _validate_ascend_bindings(
+            abi, public, specs, max_core_dim=3, logical_domain=527
+        )
+
+    public["out1"] = _Tensor(527, shape=(17, 31), strides=(31, 1), data_ptr=4096)
+
+    with pytest.raises(ValueError, match="storage overlap between writers"):
+        _validate_ascend_bindings(
+            abi, public, specs, max_core_dim=3, logical_domain=527
+        )
+
+
+def test_ascend_binding_validator_rejects_multidimensional_noncontiguous_and_alias():
+    specs = tuple(
+        TensorSpec(ndim=2, shape=("m", "n"), dtype="float32", name=name)
+        for name in ("x", "out")
+    )
+
+    with pytest.raises(TypeError, match="must be contiguous"):
+        _validate_ascend_bindings(
+            _abi(),
+            {
+                "x": _Tensor(527, shape=(17, 31), contiguous=False, strides=(1, 17)),
+                "out": _Tensor(527, shape=(17, 31), strides=(31, 1)),
+            },
+            specs,
+            max_core_dim=3,
+            logical_domain=527,
+        )
+
+    with pytest.raises(ValueError, match="storage overlap"):
+        _validate_ascend_bindings(
+            _abi(with_access=True),
+            {
+                "x": _Tensor(527, shape=(17, 31), strides=(31, 1), data_ptr=4096),
+                "out": _Tensor(527, shape=(17, 31), strides=(31, 1), data_ptr=4096),
+            },
+            specs,
+            max_core_dim=3,
+            logical_domain=527,
+        )
+
+
+@pytest.mark.parametrize("shape", ((17, 1), (17,), (2, 17, 31)))
+def test_ascend_binding_validator_rejects_unsupported_multidimensional_broadcast(shape):
+    specs = (
+        TensorSpec(ndim=2, shape=("m", "n"), dtype="float32", name="x"),
+        TensorSpec(ndim=2, shape=("m", "n"), dtype="float32", name="out"),
+    )
+
+    with pytest.raises(
+        ValueError, match="match the output rank|broadcast|requires 527 elements"
+    ):
+        _validate_ascend_bindings(
+            _abi(),
+            {
+                "x": _Tensor(17, shape=shape),
+                "out": _Tensor(527, shape=(17, 31)),
+            },
+            specs,
+            max_core_dim=3,
+            logical_domain=527,
+        )
 
 
 def test_ascend_binding_validator_accepts_scalar_output_pointer():

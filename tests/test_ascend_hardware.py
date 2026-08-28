@@ -41,6 +41,34 @@ def _broadcast_application(input, bias, output):
     output = input + bias  # noqa: F841
 
 
+def _matrix_arrangement(input, other, output):
+    return tuple(tensor.tile((17, 31)) for tensor in (input, other, output))
+
+
+def _volume_arrangement(input, other, output):
+    return tuple(tensor.tile((2, 17, 31)) for tensor in (input, other, output))
+
+
+def _matrix_broadcast_arrangement(input, bias, output):
+    return input.tile((17, 31)), bias.tile((1, 31)), output.tile((17, 31))
+
+
+def _matrix_scalar_arrangement(input, alpha, output):
+    return input.tile((17, 31)), alpha, output.tile((17, 31))
+
+
+def _multi_output_matrix_arrangement(input, other, out0, out1):
+    return tuple(tensor.tile((17, 31)) for tensor in (input, other, out0, out1))
+
+
+def _multi_output_volume_arrangement(input, other, out0, out1):
+    return tuple(tensor.tile((2, 17, 31)) for tensor in (input, other, out0, out1))
+
+
+def _multi_output_scalar_arrangement(input, alpha, out0, out1):
+    return input.tile((17, 31)), alpha, out0.tile((17, 31)), out1.tile((17, 31))
+
+
 def _offset_arrangement(input, output):
     return input[1:258], output[1:258]
 
@@ -83,6 +111,20 @@ def _scalar_extract_application(input, output):
 
 def _scalar_input_mul_application(input, alpha, output):
     output = input * alpha  # noqa: F841
+
+
+def _matrix_scalar_mul_application(input, alpha, output):
+    output = input * alpha  # noqa: F841
+
+
+def _multi_output_application(input, other, out0, out1):
+    out0 = input + other  # noqa: F841
+    out1 = input - other  # noqa: F841
+
+
+def _multi_output_scalar_application(input, alpha, out0, out1):
+    out0 = input * alpha  # noqa: F841
+    out1 = input + alpha  # noqa: F841
 
 
 def _select_eq_application(input, other, output):
@@ -299,6 +341,181 @@ def test_ascend_fp32_scalar_input_tail_and_reload(tmp_path):
     assert reloaded(input, alpha, output) is output
     torch.npu.synchronize()
     torch.testing.assert_close(output, input * alpha)
+
+
+@pytest.mark.parametrize(
+    ("shape", "arrangement"),
+    (((17, 31), _matrix_arrangement), ((2, 17, 31), _volume_arrangement)),
+)
+def test_ascend_fp32_contiguous_multidimensional_jit_aot_reload(
+    shape, arrangement, tmp_path
+):
+    import torch
+    import torch_npu  # noqa: F401
+
+    tensors = tuple(Tensor(len(shape), dtype="float32") for _ in range(3))
+    jit = _compile_dtype(
+        _application,
+        tmp_path,
+        arrangement=arrangement,
+        tensors=tensors,
+        mode="jit",
+    )
+    input = torch.arange(
+        17 * 31 if len(shape) == 2 else 2 * 17 * 31, device="npu", dtype=torch.float32
+    ).reshape(shape)
+    other = torch.full_like(input, 2.0)
+    output = torch.empty_like(input)
+
+    assert jit(input, other, output) is output
+    torch.npu.synchronize()
+    torch.testing.assert_close(output, input + other)
+
+    aot = _compile_dtype(
+        _application,
+        tmp_path,
+        arrangement=arrangement,
+        tensors=tensors,
+        mode="aot",
+    )
+    reloaded = load_built_artifact(aot._built_artifact)
+    output.zero_()
+    assert reloaded(input, other, output) is output
+    torch.npu.synchronize()
+    torch.testing.assert_close(output, input + other)
+
+
+def test_ascend_fp32_matrix_row_broadcast_and_scalar_input_jit_aot_reload(tmp_path):
+    import torch
+    import torch_npu  # noqa: F401
+
+    input = torch.arange(17 * 31, device="npu", dtype=torch.float32).reshape(17, 31)
+    bias = torch.arange(31, device="npu", dtype=torch.float32).reshape(1, 31)
+    output = torch.empty_like(input)
+    jit = _compile_dtype(
+        _broadcast_application,
+        tmp_path,
+        arrangement=_matrix_broadcast_arrangement,
+        tensors=(
+            Tensor(2, dtype="float32"),
+            Tensor(2, shape=(1, 31), dtype="float32"),
+            Tensor(2, dtype="float32"),
+        ),
+        mode="jit",
+    )
+
+    assert jit(input, bias, output) is output
+    torch.npu.synchronize()
+    torch.testing.assert_close(output, input + bias)
+
+    aot = _compile_dtype(
+        _matrix_scalar_mul_application,
+        tmp_path,
+        arrangement=_matrix_scalar_arrangement,
+        tensors=(
+            Tensor(2, dtype="float32"),
+            Tensor(0, dtype="float32"),
+            Tensor(2, dtype="float32"),
+        ),
+        mode="aot",
+    )
+    reloaded = load_built_artifact(aot._built_artifact)
+    alpha = 1.75
+    output.zero_()
+    assert reloaded(input, alpha, output) is output
+    torch.npu.synchronize()
+    torch.testing.assert_close(output, input * alpha)
+
+
+@pytest.mark.parametrize(
+    ("shape", "arrangement"),
+    (
+        ((17, 31), _multi_output_matrix_arrangement),
+        ((2, 17, 31), _multi_output_volume_arrangement),
+    ),
+)
+def test_ascend_fp32_multidimensional_multiple_outputs_jit_aot_reload(
+    shape, arrangement, tmp_path
+):
+    import torch
+    import torch_npu  # noqa: F401
+
+    tensors = tuple(Tensor(len(shape), dtype="float32") for _ in range(4))
+    elements = 17 * 31 if len(shape) == 2 else 2 * 17 * 31
+    input = torch.arange(elements, device="npu", dtype=torch.float32).reshape(shape)
+    other = torch.full_like(input, 2.0)
+    out0 = torch.empty_like(input)
+    out1 = torch.empty_like(input)
+    jit = _compile_dtype(
+        _multi_output_application,
+        tmp_path,
+        arrangement=arrangement,
+        tensors=tensors,
+        mode="jit",
+    )
+
+    assert jit(input, other, out0, out1) == (out0, out1)
+    torch.npu.synchronize()
+    torch.testing.assert_close(out0, input + other)
+    torch.testing.assert_close(out1, input - other)
+
+    aot = _compile_dtype(
+        _multi_output_application,
+        tmp_path,
+        arrangement=arrangement,
+        tensors=tensors,
+        mode="aot",
+    )
+    reloaded = load_built_artifact(aot._built_artifact)
+    out0.zero_()
+    out1.zero_()
+    assert reloaded(input, other, out0, out1) == (out0, out1)
+    torch.npu.synchronize()
+    torch.testing.assert_close(out0, input + other)
+    torch.testing.assert_close(out1, input - other)
+
+
+def test_ascend_fp32_multiple_outputs_with_scalar_input_jit_aot_reload(tmp_path):
+    import torch
+    import torch_npu  # noqa: F401
+
+    input = torch.arange(17 * 31, device="npu", dtype=torch.float32).reshape(17, 31)
+    alpha = 1.75
+    out0 = torch.empty_like(input)
+    out1 = torch.empty_like(input)
+    tensors = (
+        Tensor(2, dtype="float32"),
+        Tensor(0, dtype="float32"),
+        Tensor(2, dtype="float32"),
+        Tensor(2, dtype="float32"),
+    )
+    jit = _compile_dtype(
+        _multi_output_scalar_application,
+        tmp_path,
+        arrangement=_multi_output_scalar_arrangement,
+        tensors=tensors,
+        mode="jit",
+    )
+
+    assert jit(input, alpha, out0, out1) == (out0, out1)
+    torch.npu.synchronize()
+    torch.testing.assert_close(out0, input * alpha)
+    torch.testing.assert_close(out1, input + alpha)
+
+    aot = _compile_dtype(
+        _multi_output_scalar_application,
+        tmp_path,
+        arrangement=_multi_output_scalar_arrangement,
+        tensors=tensors,
+        mode="aot",
+    )
+    reloaded = load_built_artifact(aot._built_artifact)
+    out0.zero_()
+    out1.zero_()
+    assert reloaded(input, alpha, out0, out1) == (out0, out1)
+    torch.npu.synchronize()
+    torch.testing.assert_close(out0, input * alpha)
+    torch.testing.assert_close(out1, input + alpha)
 
 
 @pytest.mark.parametrize("dtype", ("float64", "int32"))

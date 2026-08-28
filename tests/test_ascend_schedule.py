@@ -9,8 +9,13 @@ from ninetoothed.compiler.ascend_contracts import (
     is_static_forward_view_offset,
     static_forward_view_offset,
 )
-from ninetoothed.compiler.driver import _launch_access_modes, _logical_view_offset
+from ninetoothed.compiler.driver import (
+    _launch_access_modes,
+    _launch_plan_dict,
+    _logical_view_offset,
+)
 from ninetoothed.compiler.passes import lower_for_target
+from ninetoothed.compiler.runtime import _launch_plan_from_dict
 from ninetoothed.frontend.layout import tensor_specs
 from ninetoothed.frontend.python import from_source
 from ninetoothed.ir import TensorSpec
@@ -41,6 +46,40 @@ def _offset_arrangement(input, output):
 
 def _offset_application(input, output):
     output = input + input  # noqa: F841
+
+
+def _matrix_arrangement(input, other, output):
+    return tuple(tensor.tile((17, 31)) for tensor in (input, other, output))
+
+
+def _volume_arrangement(input, other, output):
+    return tuple(tensor.tile((2, 17, 31)) for tensor in (input, other, output))
+
+
+def _matrix_application(input, other, output):
+    output = input + other  # noqa: F841
+
+
+def _multi_output_matrix_arrangement(input, other, out0, out1):
+    return tuple(tensor.tile((17, 31)) for tensor in (input, other, out0, out1))
+
+
+def _multi_output_volume_arrangement(input, other, out0, out1):
+    return tuple(tensor.tile((2, 17, 31)) for tensor in (input, other, out0, out1))
+
+
+def _mismatched_multi_output_arrangement(input, other, out0, out1):
+    return (
+        input.tile((17, 31)),
+        other.tile((17, 31)),
+        out0.tile((17, 31)),
+        out1.tile((17, 30)),
+    )
+
+
+def _multi_output_application(input, other, out0, out1):
+    out0 = input + other  # noqa: F841
+    out1 = input - other  # noqa: F841
 
 
 def test_ascend_elementwise_schedule_is_conservative_and_deterministic():
@@ -93,6 +132,83 @@ def test_ascend_launch_plan_carries_static_offset_logical_domain():
         if binding.kind == "tensor"
     }
     assert accesses == dict(analysis["access_modes"])
+
+
+@pytest.mark.parametrize(
+    ("arrangement", "rank", "domain"),
+    (
+        (_matrix_arrangement, 2, "min(((1 * 17) * 31),"),
+        (_volume_arrangement, 3, "min((((1 * 2) * 17) * 31),"),
+    ),
+)
+def test_ascend_launch_plan_accepts_contiguous_multidimensional_logical_domains(
+    arrangement, rank, domain
+):
+    compilation = DEFAULT_COMPILER.compile(
+        CompileRequest(
+            arrangement=arrangement,
+            application=_matrix_application,
+            tensors=tuple(Tensor(rank, dtype="float32") for _ in range(3)),
+            backend=Target.ASCEND,
+        )
+    )
+
+    assert compilation.launch_plan.logical_domain.render().startswith(domain)
+    analysis = compilation.artifact.metadata["ssa_metadata"]["ascend_alias_analysis"]
+    assert (
+        analysis["logical_views"]["input"]["domain"]
+        == "(" + ") * (".join("2 17 31".split()[-rank:]) + ")"
+    )
+    restored = _launch_plan_from_dict(_launch_plan_dict(compilation.launch_plan))
+    assert (
+        restored.logical_domain.render()
+        == compilation.launch_plan.logical_domain.render()
+    )
+
+
+@pytest.mark.parametrize(
+    ("arrangement", "rank"),
+    (
+        (_multi_output_matrix_arrangement, 2),
+        (_multi_output_volume_arrangement, 3),
+    ),
+)
+def test_ascend_launch_plan_accepts_matching_multidimensional_outputs(
+    arrangement, rank
+):
+    compilation = DEFAULT_COMPILER.compile(
+        CompileRequest(
+            arrangement=arrangement,
+            application=_multi_output_application,
+            tensors=tuple(Tensor(rank, dtype="float32") for _ in range(4)),
+            backend=Target.ASCEND,
+        )
+    )
+
+    assert compilation.launch_abi.outputs == ("out0", "out1")
+    access = {
+        binding.source: binding.access
+        for binding in compilation.launch_abi.kernel_args
+        if binding.kind == "tensor"
+    }
+    assert access["out0"] == access["out1"] == "write"
+    restored = _launch_plan_from_dict(_launch_plan_dict(compilation.launch_plan))
+    assert (
+        restored.logical_domain.render()
+        == compilation.launch_plan.logical_domain.render()
+    )
+
+
+def test_ascend_launch_plan_rejects_mismatched_multiple_output_domains():
+    with pytest.raises(ValueError, match="output application shapes to match"):
+        DEFAULT_COMPILER.compile(
+            CompileRequest(
+                arrangement=_mismatched_multi_output_arrangement,
+                application=_multi_output_application,
+                tensors=tuple(Tensor(2, dtype="float32") for _ in range(4)),
+                backend=Target.ASCEND,
+            )
+        )
 
 
 def test_ascend_launch_abi_requires_alias_analysis_metadata():

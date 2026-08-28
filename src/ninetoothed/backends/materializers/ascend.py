@@ -172,7 +172,6 @@ def _ascend_wrapper(
     from ninetoothed.compiler.runtime import (
         _bound_values,
         _empty_launch,
-        _first_output,
         _public_values,
     )
 
@@ -185,9 +184,6 @@ def _ascend_wrapper(
             expected_device_type="npu",
         )
 
-        if _empty_launch(abi, public):
-            return _first_output(abi, public)
-
         _validate_ascend_bindings(
             abi,
             public,
@@ -197,6 +193,10 @@ def _ascend_wrapper(
                 launch_plan.logical_domain if launch_plan is not None else None
             ),
         )
+
+        if _empty_launch(abi, public):
+            return _ascend_outputs(abi, public)
+
         values, keepalive = _bound_values(abi, public, scalar_mode="value")
         stream = _current_npu_stream(public)
         keepalive.extend((module, stream))
@@ -212,7 +212,7 @@ def _ascend_wrapper(
         finally:
             keepalive.clear()
 
-        return _first_output(abi, public)
+        return _ascend_outputs(abi, public)
 
     return launch
 
@@ -266,15 +266,23 @@ def _validate_ascend_bindings(
         return
 
     if not abi.outputs:
-        raise ValueError("Ascend FP32 elementwise launch requires an output tensor.")
+        raise ValueError("Ascend elementwise launch requires an output tensor.")
 
-    output_name = abi.outputs[0]
+    output_names = tuple(abi.outputs)
+    output_name = output_names[0]
     output = tensors.get(output_name)
 
     if output is None:
         raise ValueError(
-            "Ascend FP32 elementwise launch requires its output tensor "
-            f"`{output_name}`."
+            f"Ascend elementwise launch requires its output tensor `{output_name}`."
+        )
+
+    missing_outputs = tuple(name for name in output_names if name not in tensors)
+
+    if missing_outputs:
+        raise ValueError(
+            "Ascend elementwise launch requires output tensor arguments: "
+            f"{', '.join(missing_outputs)}."
         )
 
     logical_elements = (
@@ -287,40 +295,77 @@ def _validate_ascend_bindings(
     if not output_shape:
         if logical_elements != 1:
             raise ValueError("Ascend scalar output launch requires logical domain one.")
-    elif len(output_shape) != 1:
+    elif len(output_shape) not in {1, 2, 3}:
         raise ValueError(
-            "Ascend FP32 elementwise broadcast currently supports only "
-            "one-dimensional or scalar output tensors."
+            "Ascend elementwise launch supports only one-, two-, or three-dimensional "
+            "contiguous output tensors."
         )
 
     for name, value in tensors.items():
         shape = tuple(value.shape)
 
-        if name == output_name and not shape:
+        is_output = name in output_names
+
+        if is_output and not shape:
+            if output_shape:
+                raise ValueError(
+                    "Ascend multi-output elementwise launch requires every output "
+                    f"shape to match {output_shape}; `{name}` is scalar."
+                )
+
             continue
 
-        if len(shape) != 1:
+        if not output_shape:
+            if is_output:
+                raise ValueError(
+                    "Ascend multi-output elementwise launch requires every output "
+                    "to be scalar when its primary output is scalar."
+                )
+
+            if shape != (1,):
+                raise ValueError(
+                    "Ascend scalar output launch accepts only scalar-compatible "
+                    f"(1,) tensor inputs; `{name}` has shape {shape}."
+                )
+
+            continue
+
+        if len(shape) != len(output_shape):
             raise ValueError(
-                "Ascend FP32 elementwise broadcast currently supports only "
-                f"one-dimensional tensor arguments and scalar outputs; `{name}` "
-                f"has shape {shape}."
+                "Ascend elementwise launch requires tensor arguments to match the "
+                f"output rank {len(output_shape)}; `{name}` has shape {shape}."
             )
 
-        if name != output_name and shape[0] == 1:
+        if is_output and shape != output_shape:
+            raise ValueError(
+                "Ascend multi-output elementwise launch requires every output "
+                f"shape to match {output_shape}; `{name}` has shape {shape}."
+            )
+
+        if is_output and value.numel() != output.numel():
+            raise ValueError(
+                "Ascend multi-output elementwise launch requires every output "
+                f"to contain {output.numel()} elements; `{name}` has {value.numel()}."
+            )
+
+        if not is_output and _is_supported_broadcast_shape(shape, output_shape):
             continue
 
         offset = _logical_offset(spec_by_name[name], abi, public)
 
-        if shape[0] < offset + logical_elements:
+        required_elements = offset + logical_elements
+
+        if value.numel() < required_elements:
             raise ValueError(
-                f"Ascend logical view for '{name}' requires {offset + logical_elements} "
+                f"Ascend logical view for '{name}' requires {required_elements} "
                 f"elements but its base tensor has {value.numel()}."
             )
 
-        if name != output_name and offset == 0 and shape[0] != logical_elements:
+        if not is_output and offset == 0 and shape != output_shape:
             raise ValueError(
-                "Ascend FP32 elementwise broadcast requires each input to have "
-                f"shape ({logical_elements},) or (1,); `{name}` has shape {shape}."
+                "Ascend elementwise broadcast requires an input shape equal to the "
+                f"output shape {output_shape}, (1,), or (1, N); `{name}` has shape "
+                f"{shape}."
             )
 
     _reject_storage_aliases(abi, tensors)
@@ -331,6 +376,28 @@ def _validate_ascend_bindings(
             "Ascend launch grid exceeds `max_core_dim`: "
             f"required {core_dim}, limit {max_core_dim}."
         )
+
+
+def _is_supported_broadcast_shape(shape, output_shape) -> bool:
+    if shape == output_shape:
+        return True
+
+    if len(output_shape) == 1:
+        return shape == (1,)
+
+    return len(output_shape) == 2 and shape == (1, output_shape[1])
+
+
+def _ascend_outputs(abi, public):
+    outputs = tuple(public[name] for name in abi.outputs)
+
+    if not outputs:
+        return None
+
+    if len(outputs) == 1:
+        return outputs[0]
+
+    return outputs
 
 
 def _validate_storage_span(name: str, value: Any) -> None:
@@ -376,14 +443,20 @@ def _logical_offset(spec, abi, public) -> int:
     if not offsets:
         return 0
 
-    if len(offsets) != 1:
+    if len(offsets) == 1:
+        del abi, public
+
+        return static_forward_view_offset(offsets[0])
+
+    if any(static_forward_view_offset(offset) != 0 for offset in offsets):
         raise ValueError(
-            f"Ascend logical view for '{spec.name}' must provide one offset."
+            f"Ascend multidimensional logical view for '{spec.name}' must provide "
+            "only zero offsets."
         )
 
     del abi, public
 
-    return static_forward_view_offset(offsets[0])
+    return 0
 
 
 def _resolve_expression(expression, abi, public, *, symbols=None) -> int:

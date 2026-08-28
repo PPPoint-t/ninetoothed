@@ -115,6 +115,43 @@ def test_ascend_emits_singleton_broadcast_coordinates():
     ast.parse(source)
 
 
+def test_ascend_emits_multiple_output_stores_and_tuple_return():
+    tensors = tuple(
+        TensorSpec(ndim=2, shape=("m", "n"), dtype="float32", name=name)
+        for name in ("x", "y", "out0", "out1")
+    )
+    source = emit(
+        _kernel(
+            "\ndef pair(x, y, out0, out1):\n    out0 = x + y\n    out1 = x - y\n",
+            name="pair",
+            tensors=tensors,
+        ),
+        Target.ASCEND,
+    ).primary_source
+
+    assert source.count("tl.store(out0 +") == 1
+    assert source.count("tl.store(out1 +") == 1
+    assert "return (out0, out1)" in source
+    ast.parse(source)
+
+
+@pytest.mark.parametrize("shape", (("m", "n"), ("b", "m", "n")))
+def test_ascend_emits_flat_contiguous_multidimensional_accesses(shape):
+    tensors = tuple(
+        TensorSpec(ndim=len(shape), shape=shape, dtype="float32", name=name)
+        for name in ("x", "y", "out")
+    )
+    source = emit(
+        _kernel("\ndef add(x, y, out):\n    out = x + y\n", tensors=tensors),
+        Target.ASCEND,
+    ).primary_source
+
+    assert f"triton.cdiv({' * '.join(shape)}, block)" in source
+    assert "tl.load(x +" in source
+    assert "tl.store(out + index" in source
+    ast.parse(source)
+
+
 @pytest.mark.parametrize(
     ("dtype", "triton_dtype"),
     (("float16", "float16"), ("bfloat16", "bfloat16")),

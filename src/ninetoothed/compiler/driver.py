@@ -516,44 +516,80 @@ def _logical_domain(artifact: Artifact, specs) -> IndexExpr:
 
     output_names = tuple(artifact.metadata.get("outputs", ()))
 
-    if len(output_names) != 1:
+    if not output_names:
         raise ValueError(
-            "Ascend logical-domain launch planning requires exactly one output tensor."
+            "Ascend logical-domain launch planning requires at least one output tensor."
         )
 
     by_name = {spec.name: spec for spec in specs}
 
     try:
-        output = by_name[output_names[0]]
+        outputs = tuple(by_name[name] for name in output_names)
     except KeyError as exc:
         raise ValueError(
             "Ascend logical-domain launch planning cannot resolve output tensor "
-            f"'{output_names[0]}'."
+            f"'{exc.args[0]}'."
         ) from exc
+
+    output = outputs[0]
+    reference_shape = _ascend_output_application_shape(output)
+
+    for other in outputs[1:]:
+        if _ascend_output_application_shape(other) != reference_shape:
+            raise ValueError(
+                "Ascend multi-output elementwise launch requires all output "
+                "application shapes to match."
+            )
 
     if output.ndim == 0:
         return IndexExpr.parse(1)
 
     dimensions = tuple(output.layout.application_shape) if output.layout else ()
 
-    if len(dimensions) != 1:
-        raise ValueError(
-            "Ascend logical-domain launch planning currently supports only "
-            "one-dimensional output views."
-        )
-
     source_shape = tuple(output.attrs.get("source_shape", ()))
 
-    if len(source_shape) != 1:
+    if len(dimensions) != len(source_shape):
         raise ValueError(
-            "Ascend logical-domain launch planning requires one source dimension."
+            "Ascend logical-domain launch planning requires matching output and "
+            "source ranks."
         )
 
     offset = _logical_view_offset(output)
 
-    return IndexExpr.parse(
-        f"min({dimensions[0].render()}, ({source_shape[0]} - {offset}))"
+    if len(dimensions) == 1:
+        return IndexExpr.parse(
+            f"min({dimensions[0].render()}, ({source_shape[0]} - {offset}))"
+        )
+
+    if offset != 0:
+        raise ValueError(
+            "Ascend multidimensional logical-domain launch planning requires a "
+            "zero-offset base view."
+        )
+
+    return IndexExpr(
+        op="call",
+        operands=(_shape_product(dimensions), _shape_product(source_shape)),
+        value="min",
     )
+
+
+def _ascend_output_application_shape(spec) -> tuple[str, ...]:
+    if spec.ndim == 0:
+        return ()
+
+    dimensions = tuple(spec.layout.application_shape) if spec.layout else ()
+
+    return tuple(dimension.render() for dimension in dimensions)
+
+
+def _shape_product(dimensions) -> IndexExpr:
+    product = IndexExpr.parse(1)
+
+    for dimension in dimensions:
+        product = IndexExpr(op="mul", operands=(product, IndexExpr.parse(dimension)))
+
+    return product
 
 
 def _logical_view_offset(spec) -> int:
@@ -562,7 +598,16 @@ def _logical_view_offset(spec) -> int:
     if not offsets:
         return 0
 
-    return static_forward_view_offset(offsets[0])
+    if len(offsets) == 1:
+        return static_forward_view_offset(offsets[0])
+
+    if any(static_forward_view_offset(offset) != 0 for offset in offsets):
+        raise ValueError(
+            "Ascend multidimensional logical-domain launch planning requires a "
+            "zero-offset base view."
+        )
+
+    return 0
 
 
 def _validate_tuning_options(target: Target, request: CompileRequest) -> None:

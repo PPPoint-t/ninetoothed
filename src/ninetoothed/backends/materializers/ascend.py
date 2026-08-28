@@ -6,7 +6,11 @@ from typing import Any
 
 from ninetoothed.backends.core import BuiltArtifact, Target
 from ninetoothed.backends.materializers.base import Materializer
-from ninetoothed.compiler.ascend_contracts import static_forward_view_offset
+from ninetoothed.compiler.ascend_contracts import (
+    normalize_ascend_dtype,
+    static_forward_view_offset,
+    unsupported_ascend_elementwise_dtypes,
+)
 from ninetoothed.compiler.cache import (
     atomic_write_text,
     cache_lock,
@@ -48,6 +52,8 @@ class AscendMaterializer(Materializer):
             _runtime_specs,
         )
 
+        specs = _runtime_specs(built.source)
+        _validate_ascend_dtype_specs(specs)
         module = _load_source_module(source_path, built.source.kernel_name)
 
         try:
@@ -62,7 +68,7 @@ class AscendMaterializer(Materializer):
         return _ascend_wrapper(
             launch,
             _launch_abi_from_dict(built.abi),
-            _runtime_specs(built.source),
+            specs,
             launch_plan=_launch_plan_from_dict(
                 built.source.metadata.get("launch_plan", {})
             ),
@@ -77,6 +83,7 @@ def _materialize(compilation, *, output_dir: str | Path | None):
     from ninetoothed.compiler.runtime import Handle, _built_manifest
 
     artifact = compilation.artifact
+    _validate_ascend_dtype_specs(compilation.kernel.tensors)
     cache_key = compilation_cache_key(compilation)
     source = write_source(
         artifact.kernel_name,
@@ -219,6 +226,7 @@ def _validate_ascend_bindings(
     logical_domain=None,
 ) -> None:
     spec_by_name = {spec.name: spec for spec in specs}
+    _validate_ascend_dtype_specs(tuple(spec_by_name.values()))
     tensors = {}
 
     for binding in abi.kernel_args:
@@ -229,6 +237,15 @@ def _validate_ascend_bindings(
 
         if binding.source not in spec_by_name:
             continue
+
+        expected_dtype = normalize_ascend_dtype(spec_by_name[binding.source].dtype)
+        actual_dtype = normalize_ascend_dtype(getattr(value, "dtype", None))
+
+        if actual_dtype != expected_dtype:
+            raise TypeError(
+                f"Ascend kernel argument `{binding.source}` has dtype {actual_dtype}; "
+                f"expected {expected_dtype}."
+            )
 
         if not value.is_contiguous():
             raise TypeError(
@@ -325,6 +342,19 @@ def _validate_storage_span(name: str, value: Any) -> None:
     if start < 0 or end > storage_elements:
         raise ValueError(
             f"Ascend kernel argument `{name}` exceeds its underlying storage span."
+        )
+
+
+def _validate_ascend_dtype_specs(specs) -> None:
+    unsupported = unsupported_ascend_elementwise_dtypes(
+        tuple(spec.dtype for spec in specs if not getattr(spec, "constexpr", False))
+    )
+
+    if unsupported:
+        raise ValueError(
+            "Ascend materializer supports only verified FP16, BF16, and FP32 "
+            "elementwise dtypes; received tensor dtypes: "
+            f"{', '.join(unsupported)}."
         )
 
 

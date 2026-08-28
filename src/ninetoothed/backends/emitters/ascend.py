@@ -8,6 +8,11 @@ from ninetoothed.backends.emitters import ssa as common
 from ninetoothed.backends.emitters.analysis import walk_ops
 from ninetoothed.backends.emitters.base import ModuleRenderContext
 from ninetoothed.backends.emitters.triton import TritonTarget
+from ninetoothed.compiler.ascend_contracts import (
+    ASCEND_ELEMENTWISE_DTYPES,
+    normalize_ascend_dtype,
+    unsupported_ascend_elementwise_dtypes,
+)
 from ninetoothed.ir import Kernel, ssa
 
 _SUPPORTED_OPCODES = frozenset(
@@ -43,6 +48,9 @@ class AscendTarget(TritonTarget):
     source_route: str = "ssa-unified-ascend-triton-emitter"
     contiguous_1d_fast_path: bool = False
     explicit_broadcast_coordinates: bool = True
+
+    def cast(self, dtype: str, value: str) -> str:
+        return f"{value}.to(tl.{_triton_dtype(dtype)})"
 
     def render_module(self, context: ModuleRenderContext) -> str:
         kernel = context.kernel
@@ -121,27 +129,49 @@ def _validate_program(kernel: Kernel) -> None:
     if unsupported:
         names = ", ".join(f"`{opcode}`" for opcode in unsupported)
         raise ValueError(
-            "Ascend emitter supports only the verified FP32 elementwise operation "
+            "Ascend emitter supports only the verified FP16, BF16, and FP32 "
+            "elementwise operation "
             f"tier; unsupported SSA opcode(s): {names}."
+        )
+
+    unsupported_dtypes = unsupported_ascend_elementwise_dtypes(
+        tuple(tensor.dtype for tensor in kernel.tensors if not tensor.constexpr)
+    )
+
+    if unsupported_dtypes:
+        raise ValueError(
+            "Ascend emitter supports only verified FP16, BF16, and FP32 elementwise "
+            "dtypes; received tensor dtypes: "
+            f"{', '.join(unsupported_dtypes)}."
         )
 
     schedule = kernel.ssa.metadata.get("schedule", {})
 
     if schedule.get("granularity") != "elementwise-grid":
         raise ValueError(
-            "Ascend emitter requires the FP32 elementwise schedule; received "
+            "Ascend emitter requires the verified elementwise schedule; received "
             f"granularity `{schedule.get('granularity')}`."
         )
 
     if schedule.get("tile", {}).get("elements") != 256:
         raise ValueError(
-            "Ascend emitter requires the `fp32-elementwise-256` schedule candidate."
+            "Ascend emitter requires the `fp16-bf16-fp32-elementwise-256` "
+            "schedule candidate."
         )
 
 
 def _operations(program: ssa.Program) -> Iterable[ssa.Operation]:
     for block in program.blocks:
         yield from walk_ops(block.operations)
+
+
+def _triton_dtype(dtype: str) -> str:
+    normalized = normalize_ascend_dtype(dtype)
+
+    if normalized not in ASCEND_ELEMENTWISE_DTYPES:
+        raise ValueError(f"Unsupported Ascend Triton dtype: {dtype!r}.")
+
+    return normalized
 
 
 __all__ = ["AscendTarget", "TARGET", "emit"]

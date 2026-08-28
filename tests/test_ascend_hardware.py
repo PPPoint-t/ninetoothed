@@ -4,7 +4,7 @@ import os
 
 import pytest
 
-from ninetoothed import Tensor, float32
+from ninetoothed import Tensor, bfloat16, float16, float32
 from ninetoothed.compiler import DEFAULT_COMPILER, CompileRequest, load_built_artifact
 
 pytestmark = pytest.mark.skipif(
@@ -127,6 +127,20 @@ def _compile(application, arity, tmp_path, arrangement=_arrangement, tensors=Non
         output_dir=tmp_path,
         mode="aot",
     )
+
+
+def _compile_dtype(application, tmp_path, *, arrangement, tensors, mode):
+    compilation = DEFAULT_COMPILER.compile(
+        CompileRequest(
+            arrangement=arrangement,
+            application=application,
+            tensors=tensors,
+            backend="ascend",
+            backend_options={"soc_version": "Ascend910B3", "max_core_dim": 8},
+        )
+    )
+
+    return DEFAULT_COMPILER.materialize(compilation, output_dir=tmp_path, mode=mode)
 
 
 def _assert_sizes(handle, reference):
@@ -287,9 +301,9 @@ def test_ascend_fp32_scalar_input_tail_and_reload(tmp_path):
     torch.testing.assert_close(output, input * alpha)
 
 
-@pytest.mark.parametrize("dtype", ("float16", "bfloat16", "float64", "int32"))
+@pytest.mark.parametrize("dtype", ("float64", "int32"))
 def test_ascend_unverified_dtype_fails_closed_before_materialization(dtype):
-    with pytest.raises(ValueError, match="only FP32 elementwise SSA"):
+    with pytest.raises(ValueError, match="only FP16, BF16, and FP32 elementwise SSA"):
         DEFAULT_COMPILER.compile(
             CompileRequest(
                 arrangement=_arrangement,
@@ -299,6 +313,81 @@ def test_ascend_unverified_dtype_fails_closed_before_materialization(dtype):
                 backend_options={"soc_version": "Ascend910B3", "max_core_dim": 8},
             )
         )
+
+
+@pytest.mark.parametrize(
+    ("ninetoothed_dtype", "torch_dtype", "rtol", "atol"),
+    (
+        (float16, "float16", 1e-3, 1e-3),
+        (bfloat16, "bfloat16", 1e-2, 1e-2),
+    ),
+)
+def test_ascend_low_precision_jit_aot_reload_and_scalar_output(
+    ninetoothed_dtype, torch_dtype, rtol, atol, tmp_path
+):
+    import torch
+    import torch_npu  # noqa: F401
+
+    assert torch.npu.is_available()
+    tensor_dtype = getattr(torch, torch_dtype)
+    tensors = tuple(Tensor(1, dtype=ninetoothed_dtype) for _ in range(3))
+    jit = _compile_dtype(
+        _application,
+        tmp_path,
+        arrangement=_arrangement,
+        tensors=tensors,
+        mode="jit",
+    )
+
+    for size in (0, 1, 255, 256, 257, 513):
+        input = torch.linspace(-2.0, 2.0, size, device="npu", dtype=tensor_dtype)
+        other = torch.linspace(1.0, 3.0, size, device="npu", dtype=tensor_dtype)
+        output = torch.empty_like(input)
+
+        assert jit(input, other, output) is output
+        torch.npu.synchronize()
+        torch.testing.assert_close(output, input + other, rtol=rtol, atol=atol)
+
+    aot = _compile_dtype(
+        _application,
+        tmp_path,
+        arrangement=_arrangement,
+        tensors=tensors,
+        mode="aot",
+    )
+    reloaded = load_built_artifact(aot._built_artifact)
+
+    for size in (257, 513):
+        input = torch.arange(size, device="npu", dtype=tensor_dtype)
+        other = torch.full_like(input, 2)
+        output = torch.empty_like(input)
+
+        assert reloaded(input, other, output) is output
+        torch.npu.synchronize()
+        torch.testing.assert_close(output, input + other, rtol=rtol, atol=atol)
+
+    scalar = _compile_dtype(
+        _scalar_extract_application,
+        tmp_path,
+        arrangement=_scalar_extract_arrangement,
+        tensors=(
+            Tensor(1, dtype=ninetoothed_dtype),
+            Tensor(0, dtype=ninetoothed_dtype),
+        ),
+        mode="aot",
+    )
+    scalar_input = torch.tensor([3.25], device="npu", dtype=tensor_dtype)
+    scalar_output = torch.empty((), device="npu", dtype=tensor_dtype)
+
+    assert scalar(scalar_input, scalar_output) is scalar_output
+    torch.npu.synchronize()
+    torch.testing.assert_close(scalar_output, scalar_input[0], rtol=rtol, atol=atol)
+
+    scalar_reloaded = load_built_artifact(scalar._built_artifact)
+    scalar_output.zero_()
+    assert scalar_reloaded(scalar_input, scalar_output) is scalar_output
+    torch.npu.synchronize()
+    torch.testing.assert_close(scalar_output, scalar_input[0], rtol=rtol, atol=atol)
 
 
 @pytest.mark.parametrize(

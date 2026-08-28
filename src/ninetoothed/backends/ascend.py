@@ -11,7 +11,9 @@ from ninetoothed.backends.core import (
 )
 from ninetoothed.backends.emitters.ascend import emit
 from ninetoothed.compiler.ascend_contracts import (
+    ASCEND_ELEMENTWISE_DTYPES,
     is_static_forward_view_offset,
+    unsupported_ascend_elementwise_dtypes,
 )
 from ninetoothed.compiler.effects import tensor_access_modes
 from ninetoothed.compiler.passes import (
@@ -38,8 +40,8 @@ class AscendBackend(Backend):
         can_execute=True,
         requires_external_compiler=True,
         notes=(
-            "Unified SSA backend emits FP32 elementwise Ascend Triton source.",
-            "Ascend 910B3 FP32 elementwise JIT and source reload are verified.",
+            "Unified SSA backend emits FP16, BF16, and FP32 elementwise Ascend Triton source.",
+            "Ascend 910B3 elementwise JIT and source reload are capability-gated.",
         ),
     )
 
@@ -102,18 +104,18 @@ class AscendOptimizeSchedule(OptimizeSchedule):
 
         return (
             ScheduleCandidate(
-                name="fp32-elementwise-256",
+                name="fp16-bf16-fp32-elementwise-256",
                 schedule={
                     "tile": {"elements": 256},
                     "vector_width": 1,
                     "core_dim_limit": max_core_dim,
                 },
                 constraints={
-                    "dtypes": ("float32",),
+                    "dtypes": tuple(sorted(ASCEND_ELEMENTWISE_DTYPES)),
                     "layout": "contiguous",
                     "max_core_dim": max_core_dim,
                 },
-                tags=("default", "elementwise", "fp32"),
+                tags=("default", "elementwise", "fp16", "bf16", "fp32"),
             ),
         )
 
@@ -156,7 +158,8 @@ class AscendOptimizeSchedule(OptimizeSchedule):
 
         if granularity != "elementwise-grid":
             raise ValueError(
-                "Ascend backend currently supports only FP32 elementwise SSA; "
+                "Ascend backend currently supports only FP16, BF16, and FP32 "
+                "elementwise SSA; "
                 f"received schedule granularity `{granularity}`."
             )
 
@@ -165,18 +168,13 @@ class AscendOptimizeSchedule(OptimizeSchedule):
         ) or tuple(
             value.type.dtype for value in program.inputs if value.type.kind == "tensor"
         )
-        unsupported_dtypes = sorted(
-            {
-                "unspecified" if dtype is None else _normalize_dtype(dtype)
-                for dtype in tensor_dtypes
-                if dtype is None or _normalize_dtype(dtype) != "float32"
-            }
-        )
+        unsupported_dtypes = unsupported_ascend_elementwise_dtypes(tensor_dtypes)
 
         if unsupported_dtypes:
             names = ", ".join(unsupported_dtypes)
             raise ValueError(
-                "Ascend backend currently supports only FP32 elementwise SSA; "
+                "Ascend backend currently supports only FP16, BF16, and FP32 "
+                "elementwise SSA; "
                 f"received tensor dtypes: {names}."
             )
 
@@ -283,20 +281,6 @@ def _granularity_for_analysis(analysis: Mapping[str, Any]) -> str:
         return "parallel-reduction"
 
     return "elementwise-grid"
-
-
-def _normalize_dtype(dtype: str | None) -> str:
-    value = str(dtype or "float32").strip().lower()
-
-    if "." in value:
-        value = value.rsplit(".", 1)[-1]
-
-    return {
-        "fp16": "float16",
-        "fp32": "float32",
-        "fp64": "float64",
-        "bf16": "bfloat16",
-    }.get(value, value)
 
 
 def _logical_view(tensor) -> Mapping[str, str]:

@@ -58,7 +58,10 @@ def test_ascend_elementwise_schedule_is_conservative_and_deterministic():
         "ssa.ascend.optimize_schedule",
         "ssa.decompose_linalg",
     )
-    assert lowered.metadata["selected_schedule_candidate"] == "fp32-elementwise-256"
+    assert (
+        lowered.metadata["selected_schedule_candidate"]
+        == "fp16-bf16-fp32-elementwise-256"
+    )
     schedule = lowered.metadata["schedule"]
     assert schedule["granularity"] == "elementwise-grid"
     assert schedule["indexing"] == "flat-contiguous"
@@ -133,13 +136,26 @@ def test_ascend_static_view_offset_contract_rejects_non_static_or_backward(expre
         _logical_view_offset(spec)
 
 
-def test_ascend_rejects_unverified_dtype_before_source_emission():
-    with pytest.raises(ValueError, match="only FP32 elementwise SSA.*float16"):
-        lower_for_target(_elementwise_program("float16"), backend=Target.ASCEND)
+@pytest.mark.parametrize("dtype", ("float16", "bfloat16", "fp16", "bf16"))
+def test_ascend_accepts_verified_low_precision_dtypes_before_source_emission(dtype):
+    lowered = lower_for_target(_elementwise_program(dtype), backend=Target.ASCEND)
+
+    assert (
+        lowered.metadata["selected_schedule_candidate"]
+        == "fp16-bf16-fp32-elementwise-256"
+    )
+
+
+@pytest.mark.parametrize("dtype", ("float64", "int32"))
+def test_ascend_rejects_unverified_dtype_before_source_emission(dtype):
+    with pytest.raises(ValueError, match="only FP16, BF16, and FP32 elementwise SSA"):
+        lower_for_target(_elementwise_program(dtype), backend=Target.ASCEND)
 
 
 def test_ascend_rejects_unspecified_runtime_dtype_before_source_emission():
-    with pytest.raises(ValueError, match="only FP32 elementwise SSA.*unspecified"):
+    with pytest.raises(
+        ValueError, match="only FP16, BF16, and FP32 elementwise SSA.*unspecified"
+    ):
         lower_for_target(
             _elementwise_program(),
             backend=Target.ASCEND,
@@ -173,7 +189,10 @@ def test_ascend_accepts_structured_contiguous_tiled_layouts():
 
     lowered = lower_for_target(program, backend=Target.ASCEND, tensors=specs)
 
-    assert lowered.metadata["selected_schedule_candidate"] == "fp32-elementwise-256"
+    assert (
+        lowered.metadata["selected_schedule_candidate"]
+        == "fp16-bf16-fp32-elementwise-256"
+    )
 
 
 def test_ascend_rejects_jagged_tensors_before_source_emission():

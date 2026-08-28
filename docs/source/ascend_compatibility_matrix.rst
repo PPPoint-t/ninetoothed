@@ -42,7 +42,7 @@ SSA 架构中的归属和迁移状态。它是实现清单，不是兼容承诺�
      - 后续验收条件
    * - ``triton.language.extra.libdevice`` 改为 ``triton.language.extra.cann``
        （旧 ``ascendifier.py`` 第 498--506 行）
-     - 已迁移（限 FP32 elementwise）
+     - 已迁移（限 FP16/BF16/FP32 elementwise）
      - Ascend emitter 的 module rendering
      - ``AscendTarget`` 固定生成 ``from triton.language.extra.cann import libdevice``，不复用 CUDA
        import。
@@ -51,16 +51,16 @@ SSA 架构中的归属和迁移状态。它是实现清单，不是兼容承诺�
    * - ``tl.float64`` 静默改成 ``tl.float32`` （第 490--496 行）
      - 已替换
      - Ascend SSA validation 与 emitter dtype policy
-     - 阶段 3 只接受 FP32 elementwise；FP64、FP16、BF16 和整数会在 source emission 前明确失败。
-     - 未来每个 dtype 以数值容差和硬件测试单独启用；不得恢复 FP64 到 FP32 的静默降级。
+     - 当前接受 FP16、BF16 和 FP32 elementwise；FP64 和整数会在 source emission 前明确失败。
+     - FP16/BF16 已以数值容差和 910B3 硬件测试单独启用；不得恢复 FP64 到 FP32 的静默降级。
    * - ``tl.load(..., other=None)`` 改为 ``other=0.0`` （第 464--475 行）
-     - 已替换（限 FP32 elementwise）
+     - 已替换（限 FP16/BF16/FP32 elementwise）
      - ``EmitterTarget.load``
-     - ``AscendTarget`` 复用 operation 级 ``EmitterTarget.load``，对本阶段唯一允许的 FP32 tail
+     - ``AscendTarget`` 复用 operation 级 ``EmitterTarget.load``，对本阶段允许的低精度与 FP32 tail
        mask 稳定发射 ``other=0.0``；没有 AST 改写。
      - Ascend 910B3 / CANN 9.0.0 已以 257 元素 tail add 验证 ``other=0.0`` 的 mask 路径，以及
-       NaN、``+inf``、``-inf`` 和 ``+inf + -inf -> NaN`` 的 FP32 数值结果。非 FP32 仍须在 schedule
-       validation 阶段明确拒绝；其它 operation 的 NaN 语义仍需独立验收。
+       NaN、``+inf``、``-inf`` 和 ``+inf + -inf -> NaN`` 的 FP32 数值结果。FP16/BF16 tail 的 add 和
+       0-D output 已在 910B3 验收；其它 operation 的 NaN 语义仍需独立验收。
    * - 三参数 ``tl.clamp`` 改写为 ``minimum(maximum(...))`` （第 477--488 行）
      - 延期
      - Ascend emitter scalar-call rendering，必要时辅以 opcode validation
@@ -71,7 +71,7 @@ SSA 架构中的归属和迁移状态。它是实现清单，不是兼容承诺�
        三个非方阵 config（第 350--405 行）
      - 延期
      - ``AscendOptimizeSchedule`` 与 LaunchPlan/tuning
-     - 阶段 3 只提供一个 ``fp32-elementwise-256`` candidate；不改写 decorator，也不生成
+     - 当前只提供一个 ``fp16-bf16-fp32-elementwise-256`` candidate；不改写 decorator，也不生成
        ``num_warps``/``num_stages``。
      - 在阶段 7 依据真实 SSA layout、dtype、tile 和 core/grid 限制产生候选；需要 NPU benchmark
        与全部 candidate 合法性验证。
@@ -128,11 +128,11 @@ validation、schedule/LaunchPlan 和 materializer/runtime 四类职责。当前�
 FP64 的显式拒绝、复杂 SDPA/linalg/reduction/layout pattern 的显式拒绝、65535 的静态 schedule
 metadata，以及删除双源码运行时 guard。其余行为均未实现，不得以“兼容旧分支”为由提前启用。
 
-阶段 5 已完成 CANN import 和 FP32 masked load/store 的源码发射，并以白名单限制 operation；没有
-恢复 AST 重写。``tl.clamp``、扩展 scalar call、额外 dtype，以及 add 以外 operation 的 NaN 语义仍延期。阶段 6 和阶段 7
+阶段 5 已完成 CANN import 和 FP16/BF16/FP32 masked load/store 的源码发射，并以白名单限制 operation；没有
+恢复 AST 重写。``tl.clamp``、扩展 scalar call、mixed dtype，以及 add 以外 operation 的 NaN 语义仍延期。阶段 6 和阶段 7
 分别处理 runtime/materialization 与 autotuning。阶段 6 已实现 source-only materializer；真实 NPU
 编译/launch 已在 Ascend 910B3 / CANN 9.0.0 的 capability-gated 测试中完成首版验收。
 
 后续增量：Ascend emitter 对一维 singleton 广播采用 SSA 坐标级发射，输入长度为 ``1`` 时固定读取
 offset ``0``，而不是沿输出 index 访问。materializer 以 ABI 的 output 为 launch domain，只接受连续
-FP32 的 ``N + 1 -> N``；二维和更一般的广播、scalar ABI、view/aliasing 仍延期。
+FP16/BF16/FP32 的 ``N + 1 -> N``；二维和更一般的广播、scalar ABI、view/aliasing 仍延期。

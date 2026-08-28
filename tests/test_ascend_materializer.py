@@ -11,6 +11,7 @@ from ninetoothed.backends.materializers.ascend import (
     _load_source_module,
     _logical_offset,
     _validate_ascend_bindings,
+    _validate_ascend_dtype_specs,
 )
 from ninetoothed.ir import LaunchABI, LaunchBinding, TensorSpec
 
@@ -24,8 +25,6 @@ class _Storage:
 
 
 class _Tensor:
-    dtype = "torch.float32"
-
     def __init__(
         self,
         elements=256,
@@ -37,6 +36,7 @@ class _Tensor:
         storage_elements=None,
         storage_offset=0,
         data_ptr=None,
+        dtype="torch.float32",
     ):
         self.shape = tuple(shape) if shape is not None else (elements,)
         self.device = SimpleNamespace(type=device_type, index=device_index)
@@ -45,6 +45,7 @@ class _Tensor:
         self._storage_elements = storage_elements or elements
         self._storage_offset = storage_offset
         self._data_ptr = data_ptr if data_ptr is not None else id(self) * 8
+        self.dtype = dtype
 
     def element_size(self):
         return 4
@@ -112,6 +113,45 @@ def test_ascend_binding_validator_requires_contiguous_broadcastable_tensors():
             specs,
             max_core_dim=1,
         )
+
+
+@pytest.mark.parametrize("dtype", ("float16", "bfloat16", "float32"))
+def test_ascend_binding_validator_accepts_verified_dtypes(dtype):
+    specs = tuple(
+        TensorSpec(ndim=1, shape=("n",), dtype=dtype, name=name)
+        for name in ("x", "out")
+    )
+
+    _validate_ascend_bindings(
+        _abi(),
+        {
+            "x": _Tensor(dtype=f"torch.{dtype}"),
+            "out": _Tensor(dtype=f"torch.{dtype}"),
+        },
+        specs,
+        max_core_dim=1,
+    )
+
+
+def test_ascend_binding_validator_rejects_runtime_dtype_mismatch():
+    with pytest.raises(TypeError, match="dtype float32; expected float16"):
+        _validate_ascend_bindings(
+            _abi(),
+            {"x": _Tensor(), "out": _Tensor()},
+            (
+                TensorSpec(ndim=1, shape=("n",), dtype="float16", name="x"),
+                TensorSpec(ndim=1, shape=("n",), dtype="float16", name="out"),
+            ),
+            max_core_dim=1,
+        )
+
+
+@pytest.mark.parametrize("dtype", ("float64", "int32", None))
+def test_ascend_materializer_rejects_unverified_dtype_specs(dtype):
+    specs = (TensorSpec(ndim=1, shape=("n",), dtype=dtype, name="x"),)
+
+    with pytest.raises(ValueError, match="verified FP16, BF16, and FP32"):
+        _validate_ascend_dtype_specs(specs)
 
 
 def test_ascend_binding_validator_accepts_one_dimensional_singleton_broadcast():

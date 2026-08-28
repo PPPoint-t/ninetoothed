@@ -113,3 +113,38 @@ def test_ascend_emits_singleton_broadcast_coordinates():
 
     assert "tl.load(bias + 0)" in source
     ast.parse(source)
+
+
+@pytest.mark.parametrize(
+    ("dtype", "triton_dtype"),
+    (("float16", "float16"), ("bfloat16", "bfloat16")),
+)
+def test_ascend_emits_verified_low_precision_casts(dtype, triton_dtype):
+    source = emit(
+        _kernel(
+            "\ndef cast(x, out):\n    out = x.to(" + dtype + ")\n",
+            name="cast",
+            tensors=(
+                TensorSpec(ndim=1, shape=("n",), dtype=dtype, name="x"),
+                TensorSpec(ndim=1, shape=("n",), dtype=dtype, name="out"),
+            ),
+        ),
+        Target.ASCEND,
+    ).primary_source
+
+    assert f".to(tl.{triton_dtype})" in source
+    ast.parse(source)
+
+
+def test_ascend_emitter_rejects_unverified_dtype_when_called_directly():
+    kernel = _kernel(
+        "\ndef add(x, y, out):\n    out = x + y\n",
+        tensors=(
+            TensorSpec(ndim=1, shape=("n",), dtype="float64", name="x"),
+            TensorSpec(ndim=1, shape=("n",), dtype="float64", name="y"),
+            TensorSpec(ndim=1, shape=("n",), dtype="float64", name="out"),
+        ),
+    )
+
+    with pytest.raises(ValueError, match="only FP16, BF16, and FP32 elementwise SSA"):
+        emit(kernel, Target.ASCEND)

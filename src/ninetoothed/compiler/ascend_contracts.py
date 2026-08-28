@@ -4,6 +4,41 @@ from typing import Any
 
 from ninetoothed.ir import IndexExpr
 
+ASCEND_ELEMENTWISE_DTYPES = frozenset({"float16", "bfloat16", "float32"})
+
+
+def normalize_ascend_dtype(dtype: str | None) -> str | None:
+    """Return a canonical dtype spelling without defaulting an absent dtype."""
+    if dtype is None:
+        return None
+
+    value = str(dtype).strip().lower()
+
+    if "." in value:
+        value = value.rsplit(".", 1)[-1]
+
+    return {
+        "fp16": "float16",
+        "fp32": "float32",
+        "fp64": "float64",
+        "bf16": "bfloat16",
+    }.get(value, value)
+
+
+def unsupported_ascend_elementwise_dtypes(
+    dtypes: tuple[str | None, ...],
+) -> tuple[str, ...]:
+    """Return canonical dtype names outside the verified Ascend tier."""
+    return tuple(
+        sorted(
+            {
+                "unspecified" if dtype is None else normalize_ascend_dtype(dtype)
+                for dtype in dtypes
+                if normalize_ascend_dtype(dtype) not in ASCEND_ELEMENTWISE_DTYPES
+            }
+        )
+    )
+
 
 def static_forward_view_offset(value: Any) -> int:
     """Resolve the supported one-dimensional logical-view offset to an integer."""

@@ -6,10 +6,10 @@ Status
 
 Accepted. The initial source-emission and source-only materialization
 milestones are implemented. On Ascend 910B3 with CANN 9.0.0, the capability-
-gated integration test verifies contiguous FP32 elementwise JIT launch,
+gated integration tests verify contiguous FP16, BF16, and FP32 elementwise JIT launch,
 tail-mask numerical output including NaN and signed-infinity add semantics,
 source reload, dynamic grid, a non-default NPU stream, and one-dimensional
-singleton broadcast (``N + 1 -> N``). Other devices, operations, dtypes,
+singleton broadcast (``N + 1 -> N``). Other devices, operations, mixed dtypes,
 layouts, and broadcast forms remain unverified.
 
 Context
@@ -36,7 +36,7 @@ The initial backend will use these boundaries:
   SSA and does not import Ascend APIs or apply Ascend AST rewrites.
 * AscendBackend lowers SSA through an Ascend-specific pass bundle and emits
   one Triton Ascend Python source module per artifact. The current emitter is
-  restricted to the verified FP32 elementwise operation set and emits CANN's
+  restricted to the verified FP16, BF16, and FP32 elementwise operation set and emits CANN's
   ``triton.language.extra.cann`` import path.
 * AscendMaterializer owns source caching, import/loading, NPU
   stream selection, runtime argument binding, and error reporting through the
@@ -59,14 +59,14 @@ passes and runtime launch validation. The historical SDPA AST rewrite is not
 ported initially; unsupported patterns must fail explicitly until an
 SSA-semantic replacement is designed and tested.
 
-The initial supported scope is contiguous FP32 elementwise kernels, including
+The supported scope is contiguous FP16, BF16, and FP32 elementwise kernels, including
 only one-dimensional singleton input broadcast (``N + 1 -> N``), load/store,
 and tail masks. The output defines the launch domain and core limit; every
 input must be a contiguous one-dimensional tensor of length ``N`` or ``1``.
 Other broadcast forms remain rejected. Ascend build uses only the
-``fp32-elementwise-256`` SSA schedule and records no runtime tuning candidates;
+``fp16-bf16-fp32-elementwise-256`` SSA schedule and records no runtime tuning candidates;
 ``num_warps``, ``num_stages``, and multiple build candidates for one runtime
-configuration are rejected. Reduction, lower-precision types, non-contiguous
+configuration are rejected. Reduction, mixed-dtype arithmetic, non-contiguous
 views, dot, autotuning, attention, and jagged layouts are enabled only after
 their individual runtime and numerical tests exist. Ascend autotuning must use
 validated dynamic grid/core checks and NPU event (or official synchronization)
@@ -85,10 +85,11 @@ Ascend-only dependencies remain lazy: importing NineToothed and using another
 backend does not import torch_npu or CANN APIs. Loading an Ascend source module
 reports a missing Triton Ascend/CANN dependency with its package name; launch
 reports a missing torch_npu runtime or unavailable NPU stream with backend
-context. Tensor inputs must be on one NPU device, contiguous, FP32, rank and
+context. Tensor inputs must be on one NPU device, contiguous, use the compiled
+FP16/BF16/FP32 dtype, and be rank and
 shape compatible with the ABI, and within their storage span. The only
 broadcast contract is one-dimensional ``N + 1 -> N``; output broadcasting,
 multi-dimensional broadcast, scalar ABI extensions, and views are not enabled.
 Empty tensors return their output without a zero-grid launch. Jagged tensors,
-non-contiguous views, additional dtypes, reductions, and matmul remain
+non-contiguous views, unsupported dtypes, reductions, and matmul remain
 explicitly unsupported in this first tier.

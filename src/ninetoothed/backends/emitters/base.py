@@ -48,8 +48,6 @@ class EmitterTarget(ABC):
     vector_value_semantics: bool = False
     tir_value_semantics: bool = False
     native_block_matmul: bool = False
-    contiguous_1d_fast_path: bool = True
-    explicit_broadcast_coordinates: bool = False
     max_vector_numel: int | None = None
 
     def symbol(self, name: str) -> str:

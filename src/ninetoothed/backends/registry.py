@@ -1,11 +1,11 @@
 """Fan out backend-specific SSA pass registrations."""
 
-from typing import TYPE_CHECKING, Sequence
+from typing import TYPE_CHECKING
 
 from ninetoothed.backends.core import Target
 
 if TYPE_CHECKING:
-    from ninetoothed.compiler.passes import OptimizeSchedule, Pass, Registry
+    from ninetoothed.compiler.passes import OptimizeSchedule, Registry
 
 
 def register_pass_bundle(
@@ -13,15 +13,8 @@ def register_pass_bundle(
     *,
     backend: Target,
     optimize_schedule: type["OptimizeSchedule"],
-    analysis_passes: Sequence[type["Pass"]] = (),
 ) -> None:
-    """Register the default backend-specific analysis and schedule passes."""
-    for analysis_pass in analysis_passes:
-        registry.register(
-            analysis_pass,
-            tags=("analysis", backend.value),
-        )
-
+    """Register the schedule pass implemented by one backend."""
     registry.register(
         optimize_schedule,
         tags=("optimization", backend.value),

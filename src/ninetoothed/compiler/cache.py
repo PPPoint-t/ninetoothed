@@ -198,8 +198,6 @@ def _architecture(compilation) -> Mapping[str, Any]:
         "machine": platform.machine(),
         "cuda_arch": os.environ.get("TORCH_CUDA_ARCH_LIST"),
         "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
-        "ascend_arch": os.environ.get("TRITON_ASCEND_ARCH"),
-        "ascend_visible_devices": os.environ.get("ASCEND_VISIBLE_DEVICES"),
     }
 
     if backend == "cuda":
@@ -211,12 +209,6 @@ def _architecture(compilation) -> Mapping[str, Any]:
 
     if backend in {"cuda", "tilelang", "triton"}:
         architecture.update(_runtime_cuda_architecture())
-
-    if backend == "ascend":
-        architecture["ascend_target"] = str(
-            backend_options.get("soc_version", os.environ.get("TRITON_ASCEND_ARCH", ""))
-        )
-
     return architecture
 
 

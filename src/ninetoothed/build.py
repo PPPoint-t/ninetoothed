@@ -209,14 +209,6 @@ def build(
     if not grouped:
         raise ValueError("At least one build configuration is required.")
 
-    if getattr(backend, "value", backend) == "ascend" and any(
-        len(group["handles"]) != 1 for group in grouped.values()
-    ):
-        raise NotImplementedError(
-            "Ascend build does not support multiple tuning candidates for one "
-            "runtime configuration yet."
-        )
-
     variants = tuple(
         _Variant(
             key=key,

@@ -1,6 +1,10 @@
-"""Ascend backend registration and SSA scheduling contracts."""
+"""Ascend backend policy, contracts, and private launch metadata."""
 
+import hashlib
+import json
+import os
 from dataclasses import replace
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Mapping
 
 from ninetoothed.backends.core import (
@@ -9,21 +13,12 @@ from ninetoothed.backends.core import (
     Capability,
     Target,
 )
-from ninetoothed.backends.emitters.ascend import emit
-from ninetoothed.compiler.ascend_contracts import (
-    ASCEND_ELEMENTWISE_DTYPES,
-    is_static_forward_view_offset,
-    unsupported_ascend_elementwise_dtypes,
-)
-from ninetoothed.compiler.effects import tensor_access_modes
 from ninetoothed.compiler.passes import (
-    BACKEND_SPECIFIC,
     Context,
     OptimizeSchedule,
-    Pass,
     ScheduleCandidate,
 )
-from ninetoothed.ir import IndexExpr, Kernel, ssa
+from ninetoothed.ir import IndexExpr, Kernel, LaunchABI, LaunchBinding, ssa
 
 if TYPE_CHECKING:
     from ninetoothed.compiler.passes import Registry
@@ -75,7 +70,284 @@ class AscendBackend(Backend):
         return normalized
 
     def emit(self, kernel: Kernel) -> Artifact:
+        # Delay the emitter import because it consumes this module's private
+        # contracts.  The registry can then import the backend without a cycle.
+        from ninetoothed.backends.emitters.ascend import emit
+
         return emit(kernel)
+
+
+ASCEND_ELEMENTWISE_DTYPES = frozenset({"float16", "bfloat16", "float32"})
+_SIDECAR_SCHEMA = 1
+
+
+def normalize_ascend_dtype(dtype: str | None) -> str | None:
+    """Return the canonical dtype spelling used by Ascend validation."""
+    if dtype is None:
+        return None
+
+    value = str(dtype).strip().lower()
+
+    if "." in value:
+        value = value.rsplit(".", 1)[-1]
+
+    return {
+        "fp16": "float16",
+        "fp32": "float32",
+        "fp64": "float64",
+        "bf16": "bfloat16",
+    }.get(value, value)
+
+
+def unsupported_ascend_elementwise_dtypes(
+    dtypes: tuple[str | None, ...],
+) -> tuple[str, ...]:
+    """Return dtype names outside the verified Ascend capability tier."""
+    return tuple(
+        sorted(
+            {
+                "unspecified" if dtype is None else normalize_ascend_dtype(dtype)
+                for dtype in dtypes
+                if normalize_ascend_dtype(dtype) not in ASCEND_ELEMENTWISE_DTYPES
+            }
+        )
+    )
+
+
+def static_forward_view_offset(value: Any) -> int:
+    """Resolve the private static-forward logical-view offset contract."""
+    expression = IndexExpr.parse(value)
+
+    if expression.op == "constant" and _is_nonnegative_int(expression.value):
+        return expression.value
+
+    if expression.op == "symbol" and expression.value == "index":
+        return 0
+
+    if (
+        expression.op == "add"
+        and _is_index(expression.operands[0])
+        and _is_nonnegative_int(expression.operands[1].value)
+    ):
+        return expression.operands[1].value
+
+    raise ValueError(
+        "Ascend logical views require a static forward offset: a non-negative "
+        "constant, `index`, or `index + k`."
+    )
+
+
+def is_static_forward_view_offset(value: Any) -> bool:
+    """Return whether a value satisfies the Ascend static-view contract."""
+    try:
+        static_forward_view_offset(value)
+    except (SyntaxError, ValueError):
+        return False
+
+    return True
+
+
+def validate_build_policy(metadata: Mapping[str, Any], request: Any) -> None:
+    """Validate the currently verified private Ascend schedule contract."""
+    schedule = dict(metadata.get("ssa_schedule", {}))
+
+    if (
+        schedule.get("tile", {}).get("elements") != 256
+        or schedule.get("vector_width") != 1
+    ):
+        raise ValueError(
+            "Ascend build requires the deterministic BLOCK=256 scalar SSA schedule."
+        )
+
+    if request.num_warps is not None or request.num_stages is not None:
+        raise ValueError(
+            "Ascend build does not accept runtime warp or stage configuration."
+        )
+
+
+def ascend_cache_key(base_key: str, metadata: Mapping[str, Any]) -> str:
+    """Namespace source cache entries by the selected Ascend runtime target."""
+    identity = {
+        "base": base_key,
+        "soc_version": dict(metadata.get("ssa_schedule", {})).get("soc_version", ""),
+        "triton_ascend_arch": os.environ.get("TRITON_ASCEND_ARCH", ""),
+        "ascend_visible_devices": os.environ.get("ASCEND_VISIBLE_DEVICES", ""),
+    }
+
+    return hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
+
+
+def private_launch_abi(abi: LaunchABI, specs, outputs: tuple[str, ...]) -> LaunchABI:
+    """Adapt the public ABI to Ascend's pointer-output overlap contract."""
+    spec_by_name = {spec.name: spec for spec in specs}
+    bindings = []
+
+    for binding in abi.kernel_args:
+        kind = binding.kind
+
+        if (
+            binding.source in outputs
+            and getattr(spec_by_name.get(binding.source), "ndim", None) == 0
+            and kind == "scalar"
+        ):
+            kind = "tensor"
+
+        access = (
+            "write"
+            if binding.source in outputs
+            else "read"
+            if kind in {"tensor", "jagged_values"}
+            else binding.access
+        )
+        bindings.append(
+            LaunchBinding(
+                name=binding.name,
+                source=binding.source,
+                kind=kind,
+                dim=binding.dim,
+                value=binding.value,
+                access=access,
+            )
+        )
+
+    return LaunchABI(
+        public_args=abi.public_args,
+        kernel_args=tuple(bindings),
+        outputs=abi.outputs,
+        shape_params=abi.shape_params,
+    )
+
+
+def ascend_logical_domain(specs, outputs: tuple[str, ...]) -> str:
+    """Build the private logical-domain expression for an Ascend artifact."""
+    by_name = {spec.name: spec for spec in specs}
+
+    if not outputs:
+        raise ValueError("Ascend launch planning requires at least one output tensor.")
+
+    output = by_name[outputs[0]]
+
+    if output.ndim == 0:
+        return "1"
+
+    dimensions = (
+        tuple(output.layout.application_shape) if output.layout else tuple(output.shape)
+    )
+    source_shape = tuple(output.attrs.get("source_shape", output.shape))
+
+    if len(dimensions) != len(source_shape):
+        raise ValueError(
+            "Ascend logical-domain requires matching output and source ranks."
+        )
+
+    offsets = tuple(output.attrs.get("view_offsets", ()))
+    offset = static_forward_view_offset(offsets[0]) if len(offsets) == 1 else 0
+
+    if len(offsets) > 1 and any(
+        static_forward_view_offset(value) != 0 for value in offsets
+    ):
+        raise ValueError("Ascend multidimensional logical views require zero offsets.")
+
+    if len(dimensions) == 1:
+        return f"min({IndexExpr.parse(dimensions[0]).render()}, ({source_shape[0]} - {offset}))"
+
+    def product(values) -> str:
+        return (
+            " * ".join(f"({IndexExpr.parse(value).render()})" for value in values)
+            or "1"
+        )
+
+    return f"min({product(dimensions)}, {product(source_shape)})"
+
+
+def write_ascend_sidecar(
+    source_path: Path,
+    *,
+    abi: LaunchABI,
+    specs,
+    outputs,
+    metadata: Mapping[str, Any],
+) -> Path:
+    """Persist private launch data without extending the common artifact schema."""
+    path = _sidecar_path(source_path)
+    payload = {
+        "schema": _SIDECAR_SCHEMA,
+        "abi": _ascend_abi_dict(abi),
+        "logical_domain": ascend_logical_domain(specs, tuple(outputs)),
+        "outputs": tuple(outputs),
+        "max_core_dim": dict(metadata.get("ssa_schedule", {})).get(
+            "core_dim_limit", 65535
+        ),
+        "reduction_schedule": dict(metadata.get("ssa_metadata", {}))
+        .get("schedule", {})
+        .get("reduction"),
+        "linalg_contract": dict(metadata.get("ssa_metadata", {}))
+        .get("schedule", {})
+        .get("ascend_linalg"),
+    }
+    path.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+
+    return path
+
+
+def read_ascend_sidecar(source_path: Path) -> dict[str, Any]:
+    """Load and validate the private Ascend AOT sidecar."""
+    path = _sidecar_path(source_path)
+
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(
+            f"Ascend artifact sidecar does not exist: {path}."
+        ) from exc
+
+    if payload.get("schema") != _SIDECAR_SCHEMA:
+        raise ValueError(f"Unsupported Ascend artifact sidecar schema in {path}.")
+
+    return payload
+
+
+def ascend_abi_from_dict(value: Mapping[str, Any]) -> LaunchABI:
+    """Restore a private launch ABI from its sidecar representation."""
+    return LaunchABI(
+        public_args=tuple(value.get("public_args", ())),
+        kernel_args=tuple(
+            LaunchBinding(**dict(binding)) for binding in value.get("kernel_args", ())
+        ),
+        outputs=tuple(value.get("outputs", ())),
+        shape_params=tuple(value.get("shape_params", ())),
+    )
+
+
+def _sidecar_path(source_path: Path) -> Path:
+    return source_path.with_suffix(".ascend-launch.json")
+
+
+def _ascend_abi_dict(abi: LaunchABI) -> dict[str, Any]:
+    return {
+        "public_args": abi.public_args,
+        "kernel_args": tuple(
+            {
+                "name": binding.name,
+                "source": binding.source,
+                "kind": binding.kind,
+                "dim": binding.dim,
+                "value": binding.value,
+                "access": binding.access,
+            }
+            for binding in abi.kernel_args
+        ),
+        "outputs": abi.outputs,
+        "shape_params": abi.shape_params,
+    }
+
+
+def _is_index(expression: IndexExpr) -> bool:
+    return expression.op == "symbol" and expression.value == "index"
+
+
+def _is_nonnegative_int(value: Any) -> bool:
+    return type(value) is int and value >= 0
 
 
 class AscendOptimizeSchedule(OptimizeSchedule):
@@ -90,6 +362,10 @@ class AscendOptimizeSchedule(OptimizeSchedule):
         self._validate_supported_program(program, context)
         program = _bind_ascend_matmul_dimensions(program)
 
+        # Keep Ascend-only analysis adjacent to the backend schedule.  The
+        # shared pass registry intentionally has no target-injected analysis
+        # hook.
+        program = _attach_private_alias_contract(program, context)
         lowered = super().run(program, context)
         linalg = _ascend_linalg_contract(program)
 
@@ -100,7 +376,9 @@ class AscendOptimizeSchedule(OptimizeSchedule):
             "ascend_linalg": linalg
         }
 
-        return replace(lowered, metadata=dict(lowered.metadata) | {"schedule": schedule})
+        return replace(
+            lowered, metadata=dict(lowered.metadata) | {"schedule": schedule}
+        )
 
     def schedule_candidates(
         self,
@@ -227,7 +505,6 @@ class AscendOptimizeSchedule(OptimizeSchedule):
         if granularity == "blocked-linalg":
             _ascend_linalg_contract(program)
 
-
         if granularity == "parallel-reduction":
             reduction = analysis.get("reduction_schedule", {})
 
@@ -290,43 +567,34 @@ class AscendOptimizeSchedule(OptimizeSchedule):
             )
 
 
-class AscendAnalyzeAlias(Pass):
-    """Record the conservative runtime alias contract for Ascend launches."""
-
-    name = "ssa.ascend.analyze_alias"
-    category = BACKEND_SPECIFIC
-    phase = "analysis"
-    supported_backends = (Target.ASCEND,)
-
-    def run(self, program: ssa.Program, context: Context) -> ssa.Program:
-        views = {
-            tensor.name: _logical_view(tensor)
-            for tensor in context.tensors
-            if not tensor.constexpr
-        }
-        scalar_outputs = {
-            value.name
-            for value in program.outputs
-            if any(
-                tensor.name == value.name and not tensor.constexpr and tensor.ndim == 0
-                for tensor in context.tensors
-            )
-        }
-        access_modes = tensor_access_modes(
-            program, pointer_names=frozenset(scalar_outputs)
-        )
-
-        return replace(
-            program,
-            metadata=dict(program.metadata)
-            | {
-                "ascend_alias_analysis": {
-                    "policy": "reject-storage-overlap",
-                    "access_modes": access_modes,
-                    "logical_views": views,
-                }
-            },
-        )
+def _attach_private_alias_contract(
+    program: ssa.Program, context: Context
+) -> ssa.Program:
+    """Attach metadata consumed only by the Ascend emitter/materializer."""
+    views = {
+        tensor.name: _logical_view(tensor)
+        for tensor in context.tensors
+        if not tensor.constexpr
+    }
+    outputs = {value.name for value in program.outputs}
+    inputs = {value.name for value in program.inputs if value.type.kind == "tensor"}
+    # The materializer rejects every writer/reader storage overlap.  Marking
+    # declared outputs as writers here is deliberately conservative and avoids
+    # a shared effect-analysis dependency.
+    access_modes = {
+        name: ("write" if name in outputs else "read") for name in inputs | outputs
+    }
+    return replace(
+        program,
+        metadata=dict(program.metadata)
+        | {
+            "ascend_alias_analysis": {
+                "policy": "reject-storage-overlap",
+                "access_modes": access_modes,
+                "logical_views": views,
+            }
+        },
+    )
 
 
 def _ascend_pass_options(context: Context) -> Mapping[str, Any]:
@@ -411,9 +679,7 @@ def _ascend_linalg_contract(program: ssa.Program) -> Mapping[str, Any] | None:
     result_m, result_n = (str(value) for value in result.shape)
 
     if (m, n) != (result_m, result_n) or k != rhs_k:
-        raise ValueError(
-            "Ascend matmul requires lhs[M,K] @ rhs[K,N] -> output[M,N]."
-        )
+        raise ValueError("Ascend matmul requires lhs[M,K] @ rhs[K,N] -> output[M,N].")
 
     extent = _static_reduction_extent(k)
 
@@ -452,9 +718,7 @@ def _bind_ascend_matmul_dimensions(program: ssa.Program) -> ssa.Program:
         "k": contract["reduction_extent"],
     }
     existing = {
-        value.name
-        for value in (*program.inputs, *program.outputs)
-        for _ in (0,)
+        value.name for value in (*program.inputs, *program.outputs) for _ in (0,)
     }
 
     for operation in _walk_operations(program.blocks):
@@ -602,5 +866,4 @@ def register_ssa_passes(registry: "Registry") -> None:
         registry,
         backend=Target.ASCEND,
         optimize_schedule=AscendOptimizeSchedule,
-        analysis_passes=(AscendAnalyzeAlias,),
     )

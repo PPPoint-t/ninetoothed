@@ -3,16 +3,16 @@
 from dataclasses import dataclass, replace
 from typing import Iterable
 
+from ninetoothed.backends.ascend import (
+    ASCEND_ELEMENTWISE_DTYPES,
+    normalize_ascend_dtype,
+    unsupported_ascend_elementwise_dtypes,
+)
 from ninetoothed.backends.core import Target
 from ninetoothed.backends.emitters import ssa as common
 from ninetoothed.backends.emitters.analysis import walk_ops
 from ninetoothed.backends.emitters.base import ModuleRenderContext
 from ninetoothed.backends.emitters.triton import TritonTarget
-from ninetoothed.compiler.ascend_contracts import (
-    ASCEND_ELEMENTWISE_DTYPES,
-    normalize_ascend_dtype,
-    unsupported_ascend_elementwise_dtypes,
-)
 from ninetoothed.ir import Kernel, ssa
 
 _SUPPORTED_OPCODES = frozenset(
@@ -62,8 +62,6 @@ class AscendTarget(TritonTarget):
     backend: Target = Target.ASCEND
     suffix: str = "ascend.py"
     source_route: str = "ssa-unified-ascend-triton-emitter"
-    contiguous_1d_fast_path: bool = False
-    explicit_broadcast_coordinates: bool = True
     default_load_mask: bool = False
 
     def cast(self, dtype: str, value: str) -> str:
@@ -168,7 +166,9 @@ def diagnose_opcode_coverage(kernel: Kernel) -> dict[str, tuple[str, ...]]:
 
     return {
         "observed": observed,
-        "supported": tuple(opcode for opcode in observed if opcode in _SUPPORTED_OPCODES),
+        "supported": tuple(
+            opcode for opcode in observed if opcode in _SUPPORTED_OPCODES
+        ),
         "unsupported": tuple(
             opcode for opcode in observed if opcode not in _SUPPORTED_OPCODES
         ),

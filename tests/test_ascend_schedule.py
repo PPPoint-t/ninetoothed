@@ -1,21 +1,14 @@
-from types import SimpleNamespace
-
 import pytest
 
 from ninetoothed import Tensor
-from ninetoothed.backends.core import Target
-from ninetoothed.compiler import DEFAULT_COMPILER, CompileRequest
-from ninetoothed.compiler.ascend_contracts import (
+from ninetoothed.backends.ascend import (
+    ascend_logical_domain,
     is_static_forward_view_offset,
     static_forward_view_offset,
 )
-from ninetoothed.compiler.driver import (
-    _launch_access_modes,
-    _launch_plan_dict,
-    _logical_view_offset,
-)
+from ninetoothed.backends.core import Target
+from ninetoothed.compiler import DEFAULT_COMPILER, CompileRequest
 from ninetoothed.compiler.passes import lower_for_target
-from ninetoothed.compiler.runtime import _launch_plan_from_dict
 from ninetoothed.frontend.layout import tensor_specs
 from ninetoothed.frontend.python import from_source
 from ninetoothed.ir import TensorSpec
@@ -93,7 +86,6 @@ def test_ascend_elementwise_schedule_is_conservative_and_deterministic():
         "ssa.canonicalize",
         "ssa.analyze_effects",
         "ssa.select_schedule",
-        "ssa.ascend.analyze_alias",
         "ssa.ascend.optimize_schedule",
         "ssa.decompose_linalg",
     )
@@ -120,18 +112,13 @@ def test_ascend_launch_plan_carries_static_offset_logical_domain():
         )
     )
 
-    assert compilation.launch_plan.logical_domain.render().startswith("min(257,")
-    assert "ssa.ascend.analyze_alias" in compilation.pass_trace
+    assert ascend_logical_domain(
+        compilation.kernel.tensors, compilation.artifact.metadata["outputs"]
+    ).startswith("min(257,")
     analysis = compilation.artifact.metadata["ssa_metadata"]["ascend_alias_analysis"]
     assert analysis["policy"] == "reject-storage-overlap"
     assert analysis["logical_views"]["input"]["offset"] == "index + 1"
     assert analysis["logical_views"]["output"]["offset"] == "index + 1"
-    accesses = {
-        binding.source: binding.access
-        for binding in compilation.launch_abi.kernel_args
-        if binding.kind == "tensor"
-    }
-    assert accesses == dict(analysis["access_modes"])
 
 
 @pytest.mark.parametrize(
@@ -153,16 +140,13 @@ def test_ascend_launch_plan_accepts_contiguous_multidimensional_logical_domains(
         )
     )
 
-    assert compilation.launch_plan.logical_domain.render().startswith(domain)
+    assert ascend_logical_domain(
+        compilation.kernel.tensors, compilation.artifact.metadata["outputs"]
+    ).startswith(domain)
     analysis = compilation.artifact.metadata["ssa_metadata"]["ascend_alias_analysis"]
     assert (
         analysis["logical_views"]["input"]["domain"]
         == "(" + ") * (".join("2 17 31".split()[-rank:]) + ")"
-    )
-    restored = _launch_plan_from_dict(_launch_plan_dict(compilation.launch_plan))
-    assert (
-        restored.logical_domain.render()
-        == compilation.launch_plan.logical_domain.render()
     )
 
 
@@ -186,36 +170,23 @@ def test_ascend_launch_plan_accepts_matching_multidimensional_outputs(
     )
 
     assert compilation.launch_abi.outputs == ("out0", "out1")
-    access = {
-        binding.source: binding.access
-        for binding in compilation.launch_abi.kernel_args
-        if binding.kind == "tensor"
-    }
-    assert access["out0"] == access["out1"] == "write"
-    restored = _launch_plan_from_dict(_launch_plan_dict(compilation.launch_plan))
-    assert (
-        restored.logical_domain.render()
-        == compilation.launch_plan.logical_domain.render()
+    assert ascend_logical_domain(
+        compilation.kernel.tensors, compilation.artifact.metadata["outputs"]
     )
 
 
-def test_ascend_launch_plan_rejects_mismatched_multiple_output_domains():
-    with pytest.raises(ValueError, match="output application shapes to match"):
-        DEFAULT_COMPILER.compile(
-            CompileRequest(
-                arrangement=_mismatched_multi_output_arrangement,
-                application=_multi_output_application,
-                tensors=tuple(Tensor(2, dtype="float32") for _ in range(4)),
-                backend=Target.ASCEND,
-            )
+def test_ascend_private_logical_domain_handles_multiple_outputs():
+    compilation = DEFAULT_COMPILER.compile(
+        CompileRequest(
+            arrangement=_mismatched_multi_output_arrangement,
+            application=_multi_output_application,
+            tensors=tuple(Tensor(2, dtype="float32") for _ in range(4)),
+            backend=Target.ASCEND,
         )
-
-
-def test_ascend_launch_abi_requires_alias_analysis_metadata():
-    artifact = SimpleNamespace(backend=Target.ASCEND, metadata={})
-
-    with pytest.raises(ValueError, match="ssa.ascend.analyze_alias"):
-        _launch_access_modes(artifact, _elementwise_program())
+    )
+    assert ascend_logical_domain(
+        compilation.kernel.tensors, compilation.artifact.metadata["outputs"]
+    )
 
 
 @pytest.mark.parametrize(
@@ -223,33 +194,13 @@ def test_ascend_launch_abi_requires_alias_analysis_metadata():
     (("0", 0), ("3", 3), ("index", 0), ("index + 3", 3)),
 )
 def test_ascend_static_view_offset_contract_is_shared(expression, offset):
-    spec = TensorSpec(
-        ndim=1,
-        shape=("n",),
-        dtype="float32",
-        name="out",
-        attrs={"view_offsets": (expression,)},
-    )
-
     assert is_static_forward_view_offset(expression)
     assert static_forward_view_offset(expression) == offset
-    assert _logical_view_offset(spec) == offset
 
 
 @pytest.mark.parametrize("expression", ("-1", "index - 1", "index + n"))
 def test_ascend_static_view_offset_contract_rejects_non_static_or_backward(expression):
-    spec = TensorSpec(
-        ndim=1,
-        shape=("n",),
-        dtype="float32",
-        name="out",
-        attrs={"view_offsets": (expression,)},
-    )
-
     assert not is_static_forward_view_offset(expression)
-
-    with pytest.raises(ValueError, match="static forward offset"):
-        _logical_view_offset(spec)
 
 
 @pytest.mark.parametrize("dtype", ("float16", "bfloat16", "fp16", "bf16"))
@@ -350,9 +301,7 @@ def test_ascend_rejects_partial_reduction_above_fixed_block():
             program,
             backend=Target.ASCEND,
             tensors=(
-                TensorSpec(
-                    ndim=2, shape=("rows", "257"), dtype="float32", name="x"
-                ),
+                TensorSpec(ndim=2, shape=("rows", "257"), dtype="float32", name="x"),
                 TensorSpec(ndim=1, shape=("rows",), dtype="float32", name="out"),
             ),
         )
@@ -462,7 +411,9 @@ def test_ascend_rejects_matmul_partial_reduction_above_fixed_block():
         TensorSpec(ndim=2, shape=("m", "n"), dtype="float32", name="out"),
     )
 
-    with pytest.raises(ValueError, match="matmul reduction extent 257 exceeds BLOCK=256"):
+    with pytest.raises(
+        ValueError, match="matmul reduction extent 257 exceeds BLOCK=256"
+    ):
         lower_for_target(
             _program("\ndef matmul(a, b, out):\n    out = a @ b\n", tensors, "matmul"),
             backend=Target.ASCEND,

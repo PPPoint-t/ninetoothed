@@ -592,9 +592,6 @@ def _with_contiguous_1d_fast_path(
     vector_program: bool,
     cooperative_reduction_program: bool,
 ) -> str:
-    if not target.contiguous_1d_fast_path:
-        return generic_body
-
     logical_infos = tuple(tensor_infos[tensor.name] for tensor in kernel.tensors)
 
     if vector_program or cooperative_reduction_program:
@@ -1324,9 +1321,6 @@ def _operation_expr(op: ssa.Operation, ctx: _EmitContext) -> str:
         operator = opcode[len("arith.") :]
         args = tuple(_emit_value(operand, ctx) for operand in op.operands)
 
-        if operator == "pos":
-            return args[0]
-
         if operator in _UNARY:
             return f"({_UNARY[operator]}{args[0]})"
 
@@ -1382,18 +1376,6 @@ def _operation_expr(op: ssa.Operation, ctx: _EmitContext) -> str:
 
 
 def _binary_expr(operator: str, op: ssa.Operation, ctx: _EmitContext) -> str:
-    if (
-        ctx.target.explicit_broadcast_coordinates
-        and op.results
-        and op.results[0].type.kind == "tensor"
-    ):
-        return _element_binary(
-            operator,
-            op,
-            _current_coords(_value_axes(op.results[0].name, ctx), ctx),
-            ctx,
-        )
-
     if (
         ctx.target.c_style_syntax
         and operator in {"mul", "multiply"}
@@ -1554,14 +1536,6 @@ def _emit_element(name: str, coords: tuple[str, ...], ctx: _EmitContext) -> str:
         return ctx.memo[name]
 
     if not name.startswith("%"):
-        value_type = ctx.value_types.get(name)
-
-        # Scalar ABI parameters are passed by value.  TensorInfo also carries
-        # their layout metadata, so membership alone must not turn them into
-        # a pointer load.
-        if value_type is not None and value_type.kind == "scalar":
-            return name
-
         if name not in ctx.tensor_infos:
             return name
         return _load_tensor_at(name, coords, ctx)
@@ -1643,9 +1617,6 @@ def _emit_element(name: str, coords: tuple[str, ...], ctx: _EmitContext) -> str:
 
     if op.opcode.startswith("arith."):
         operator = op.opcode[len("arith.") :]
-
-        if operator == "pos":
-            return _emit_element(op.operands[0], coords, ctx)
 
         if operator in _UNARY:
             return f"({_UNARY[operator]}{_emit_element(op.operands[0], coords, ctx)})"
@@ -3701,7 +3672,7 @@ def _tensor_axes(
 
     if info.ndim > 0:
         return tuple(f"dim{i}" for i in range(info.ndim))
-    return ("1",)
+    return fallback
 
 
 def _source_axes(

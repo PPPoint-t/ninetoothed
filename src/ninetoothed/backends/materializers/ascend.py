@@ -4,13 +4,20 @@ import types
 from pathlib import Path
 from typing import Any
 
-from ninetoothed.backends.core import BuiltArtifact, Target
-from ninetoothed.backends.materializers.base import Materializer
-from ninetoothed.compiler.ascend_contracts import (
+from ninetoothed.backends.ascend import (
+    ascend_abi_from_dict,
+    ascend_cache_key,
+    ascend_logical_domain,
     normalize_ascend_dtype,
+    private_launch_abi,
+    read_ascend_sidecar,
     static_forward_view_offset,
     unsupported_ascend_elementwise_dtypes,
+    validate_build_policy,
+    write_ascend_sidecar,
 )
+from ninetoothed.backends.core import BuiltArtifact, Target
+from ninetoothed.backends.materializers.base import Materializer
 from ninetoothed.compiler.cache import (
     atomic_write_text,
     cache_lock,
@@ -46,11 +53,7 @@ class AscendMaterializer(Materializer):
                 f"Ascend built artifact source does not exist: {source_path}."
             )
 
-        from ninetoothed.compiler.runtime import (
-            _launch_abi_from_dict,
-            _launch_plan_from_dict,
-            _runtime_specs,
-        )
+        from ninetoothed.compiler.runtime import _runtime_specs
 
         specs = _runtime_specs(built.source)
         _validate_ascend_dtype_specs(specs)
@@ -65,24 +68,18 @@ class AscendMaterializer(Materializer):
                 f"entrypoint `{built.source.entrypoint}`."
             ) from exc
 
+        sidecar = read_ascend_sidecar(source_path)
         return _ascend_wrapper(
             launch,
-            _launch_abi_from_dict(built.abi),
+            ascend_abi_from_dict(sidecar["abi"]),
             specs,
-            launch_plan=_launch_plan_from_dict(
-                built.source.metadata.get("launch_plan", {})
-            ),
             source_path=source_path,
             kernel_name=built.source.kernel_name,
-            max_core_dim=_max_core_dim(built.source.metadata),
+            max_core_dim=sidecar["max_core_dim"],
             module=module,
-            reduction_schedule=specs
-            and built.source.metadata.get("ssa_metadata", {})
-            .get("schedule", {})
-            .get("reduction"),
-            linalg_contract=built.source.metadata.get("ssa_metadata", {})
-            .get("schedule", {})
-            .get("ascend_linalg"),
+            logical_domain=sidecar["logical_domain"],
+            reduction_schedule=sidecar.get("reduction_schedule"),
+            linalg_contract=sidecar.get("linalg_contract"),
         )
 
 
@@ -91,7 +88,8 @@ def _materialize(compilation, *, output_dir: str | Path | None):
 
     artifact = compilation.artifact
     _validate_ascend_dtype_specs(compilation.kernel.tensors)
-    cache_key = compilation_cache_key(compilation)
+    validate_build_policy(artifact.metadata, compilation.request)
+    cache_key = ascend_cache_key(compilation_cache_key(compilation), artifact.metadata)
     source = write_source(
         artifact.kernel_name,
         artifact.primary_source,
@@ -106,6 +104,26 @@ def _materialize(compilation, *, output_dir: str | Path | None):
         )
 
     published_source = _publish_source(source, output_dir)
+    abi = private_launch_abi(
+        compilation.launch_abi,
+        compilation.kernel.tensors,
+        tuple(artifact.metadata.get("outputs", ())),
+    )
+    write_ascend_sidecar(
+        source,
+        abi=abi,
+        specs=compilation.kernel.tensors,
+        outputs=artifact.metadata.get("outputs", ()),
+        metadata=artifact.metadata,
+    )
+    if published_source != source:
+        write_ascend_sidecar(
+            published_source,
+            abi=abi,
+            specs=compilation.kernel.tensors,
+            outputs=artifact.metadata.get("outputs", ()),
+            metadata=artifact.metadata,
+        )
     module = _load_source_module(source, artifact.kernel_name)
 
     try:
@@ -120,13 +138,16 @@ def _materialize(compilation, *, output_dir: str | Path | None):
     kernel = getattr(module, f"{artifact.kernel_name}_kernel", None)
     wrapped = _ascend_wrapper(
         launch,
-        compilation.launch_abi,
+        abi,
         compilation.kernel.tensors,
-        launch_plan=compilation.launch_plan,
         source_path=published_source,
         kernel_name=artifact.kernel_name,
         max_core_dim=_max_core_dim(artifact.metadata),
         module=module,
+        logical_domain=ascend_logical_domain(
+            compilation.kernel.tensors,
+            tuple(artifact.metadata.get("outputs", ())),
+        ),
         reduction_schedule=artifact.metadata.get("ssa_metadata", {})
         .get("schedule", {})
         .get("reduction"),
@@ -176,37 +197,28 @@ def _ascend_wrapper(
     abi,
     specs,
     *,
-    launch_plan=None,
     source_path: Path,
     kernel_name: str,
     max_core_dim: int,
     module,
+    logical_domain=None,
     reduction_schedule=None,
     linalg_contract=None,
 ):
     from ninetoothed.compiler.runtime import (
         _bound_values,
         _empty_launch,
-        _public_values,
     )
 
     def launch(*args, **kwargs):
-        public = _public_values(
-            abi,
-            args,
-            kwargs,
-            specs=specs,
-            expected_device_type="npu",
-        )
+        public = _ascend_public_values(abi, args, kwargs, specs)
 
         _validate_ascend_bindings(
             abi,
             public,
             specs,
             max_core_dim,
-            logical_domain=(
-                launch_plan.logical_domain if launch_plan is not None else None
-            ),
+            logical_domain=logical_domain,
             reduction_schedule=reduction_schedule,
             linalg_contract=linalg_contract,
         )
@@ -232,6 +244,54 @@ def _ascend_wrapper(
         return _ascend_outputs(abi, public)
 
     return launch
+
+
+def _ascend_public_values(abi, args, kwargs, specs) -> dict[str, Any]:
+    """Bind public arguments with the NPU-only contract kept private."""
+    if len(args) > len(abi.public_args):
+        raise TypeError(f"Expected at most {len(abi.public_args)} arguments.")
+    values = dict(zip(abi.public_args, args))
+    unexpected = set(kwargs) - set(abi.public_args)
+    if unexpected:
+        raise TypeError(
+            f"Unexpected kernel arguments: {', '.join(sorted(unexpected))}."
+        )
+    duplicate = set(values) & set(kwargs)
+    if duplicate:
+        raise TypeError(
+            f"Multiple values for kernel arguments: {', '.join(sorted(duplicate))}."
+        )
+    values.update(kwargs)
+    missing = tuple(name for name in abi.public_args if name not in values)
+    if missing:
+        raise TypeError(f"Missing kernel arguments: {', '.join(missing)}.")
+
+    expected_device = None
+    for spec in specs:
+        if getattr(spec, "constexpr", False) or spec.name not in values:
+            continue
+        value = values[spec.name]
+        source_ndim = int(spec.attrs.get("source_ndim", spec.ndim))
+        if source_ndim == 0 and getattr(spec, "ndim", 0) == 0:
+            # Inputs may be scalar values; scalar outputs were made tensors by
+            # The private ABI makes scalar outputs device pointers.
+            if hasattr(value, "device"):
+                pass
+            else:
+                continue
+        if not hasattr(value, "device") or not hasattr(value, "is_contiguous"):
+            raise TypeError(
+                f"Ascend kernel argument `{spec.name}` must be a tensor on an NPU device."
+            )
+        device = value.device
+        if getattr(device, "type", str(device).split(":")[0]) != "npu":
+            raise TypeError(
+                f"Ascend kernel argument `{spec.name}` must be on an NPU device."
+            )
+        if expected_device is not None and device != expected_device:
+            raise TypeError("All Ascend tensor arguments must use the same NPU device.")
+        expected_device = device
+    return values
 
 
 def _validate_ascend_bindings(
@@ -512,8 +572,7 @@ def _matmul_inputs(tensors, output_names, output_shape, linalg_contract):
 
     if (m, n) != output_shape or k != rhs_k:
         raise ValueError(
-            "Ascend matmul requires runtime shapes lhs[M,K] @ rhs[K,N] -> "
-            "output[M,N]."
+            "Ascend matmul requires runtime shapes lhs[M,K] @ rhs[K,N] -> output[M,N]."
         )
 
     if k > 256:
@@ -524,7 +583,9 @@ def _matmul_inputs(tensors, output_names, output_shape, linalg_contract):
         )
 
     if lhs.dtype != rhs.dtype or lhs.dtype != tensors[output_names[0]].dtype:
-        raise TypeError("Ascend matmul currently requires matching input/output dtypes.")
+        raise TypeError(
+            "Ascend matmul currently requires matching input/output dtypes."
+        )
 
     return frozenset((lhs_name, rhs_name))
 

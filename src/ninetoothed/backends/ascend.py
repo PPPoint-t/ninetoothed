@@ -88,8 +88,19 @@ class AscendOptimizeSchedule(OptimizeSchedule):
         """Reject SSA features whose Ascend semantics are not verified yet."""
         self._validate_options(context)
         self._validate_supported_program(program, context)
+        program = _bind_ascend_matmul_dimensions(program)
 
-        return super().run(program, context)
+        lowered = super().run(program, context)
+        linalg = _ascend_linalg_contract(program)
+
+        if linalg is None:
+            return lowered
+
+        schedule = dict(lowered.metadata.get("schedule", {})) | {
+            "ascend_linalg": linalg
+        }
+
+        return replace(lowered, metadata=dict(lowered.metadata) | {"schedule": schedule})
 
     def schedule_candidates(
         self,
@@ -97,7 +108,53 @@ class AscendOptimizeSchedule(OptimizeSchedule):
         schedule: Mapping[str, Any],
         context: Context,
     ) -> tuple[ScheduleCandidate, ...]:
-        if schedule.get("granularity") != "elementwise-grid":
+        granularity = schedule.get("granularity")
+
+        if granularity == "parallel-reduction":
+            reduction = schedule.get("reduction", {})
+
+            if reduction.get("mode") != "row-vector":
+                return ()
+
+            extent = _static_reduction_extent(reduction.get("extent"))
+
+            if extent is not None and not 0 <= extent <= 256:
+                return ()
+
+            return (
+                ScheduleCandidate(
+                    name="ascend-row-reduction-256",
+                    schedule={
+                        "tile": {"elements": 256},
+                        "vector_width": 1,
+                        "core_dim_limit": _max_core_dim(context),
+                    },
+                    constraints={
+                        "dtypes": tuple(sorted(ASCEND_ELEMENTWISE_DTYPES)),
+                        "layout": "contiguous",
+                    },
+                    tags=("reduction", "row-vector", "tail-safe"),
+                ),
+            )
+
+        if granularity == "blocked-linalg" and analysis.get("has_dot"):
+            return (
+                ScheduleCandidate(
+                    name="ascend-matmul-scalar-loop-256",
+                    schedule={
+                        "tile": {"elements": 256},
+                        "vector_width": 1,
+                        "core_dim_limit": _max_core_dim(context),
+                    },
+                    constraints={
+                        "dtypes": tuple(sorted(ASCEND_ELEMENTWISE_DTYPES)),
+                        "layout": "contiguous",
+                    },
+                    tags=("linalg", "matmul", "scalar-loop", "tail-safe"),
+                ),
+            )
+
+        if granularity != "elementwise-grid":
             return ()
 
         max_core_dim = _max_core_dim(context)
@@ -156,12 +213,40 @@ class AscendOptimizeSchedule(OptimizeSchedule):
         if not granularity:
             granularity = _granularity_for_analysis(analysis)
 
-        if granularity != "elementwise-grid":
+        if granularity not in {
+            "elementwise-grid",
+            "parallel-reduction",
+            "blocked-linalg",
+        }:
             raise ValueError(
                 "Ascend backend currently supports only FP16, BF16, and FP32 "
-                "elementwise SSA; "
+                "elementwise or row-vector reduction SSA; "
                 f"received schedule granularity `{granularity}`."
             )
+
+        if granularity == "blocked-linalg":
+            _ascend_linalg_contract(program)
+
+
+        if granularity == "parallel-reduction":
+            reduction = analysis.get("reduction_schedule", {})
+
+            if reduction.get("mode") != "row-vector":
+                raise ValueError(
+                    "Ascend backend currently supports only FP16, BF16, and FP32 "
+                    "elementwise or row-vector reduction SSA; "
+                    "received schedule granularity `parallel-reduction` with "
+                    f"reduction mode `{reduction.get('mode')}`."
+                )
+
+            extent = _static_reduction_extent(reduction.get("extent"))
+
+            if extent is not None and not 0 <= extent <= 256:
+                raise ValueError(
+                    "Ascend row-vector reduction extent "
+                    f"{extent} exceeds BLOCK=256; hierarchical partial reduction "
+                    "is not implemented."
+                )
 
         tensor_dtypes = tuple(
             tensor.dtype for tensor in context.tensors if not tensor.constexpr
@@ -266,6 +351,181 @@ def _max_core_dim(context: Context) -> int:
         )
 
     return max_core_dim
+
+
+def _static_reduction_extent(value: Any) -> int | None:
+    try:
+        return int(str(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def _ascend_linalg_contract(program: ssa.Program) -> Mapping[str, Any] | None:
+    operations = tuple(_walk_operations(program.blocks))
+    linalg = tuple(
+        operation
+        for operation in operations
+        if operation.opcode in {"linalg.dot", "linalg.matmul"}
+    )
+
+    if not linalg:
+        return None
+
+    if len(linalg) != 1 or linalg[0].opcode != "linalg.matmul":
+        raise ValueError(
+            "Ascend basic linalg support requires exactly one `linalg.matmul` "
+            "operation."
+        )
+
+    operation = linalg[0]
+    value_types = {
+        value.name: value.type for value in (*program.inputs, *program.outputs)
+    }
+
+    for nested in operations:
+        value_types.update({result.name: result.type for result in nested.results})
+
+    if len(operation.operands) != 2 or len(operation.results) != 1:
+        raise ValueError("Ascend matmul requires two inputs and one result.")
+
+    lhs = value_types.get(operation.operands[0])
+    rhs = value_types.get(operation.operands[1])
+    result = operation.results[0].type
+
+    if (
+        lhs is None
+        or rhs is None
+        or lhs.kind != "tensor"
+        or rhs.kind != "tensor"
+        or result.kind != "tensor"
+        or len(lhs.shape) != 2
+        or len(rhs.shape) != 2
+        or len(result.shape) != 2
+    ):
+        raise ValueError(
+            "Ascend matmul supports only rank-2 contiguous matrix operands and output."
+        )
+
+    m, k = (str(value) for value in lhs.shape)
+    rhs_k, n = (str(value) for value in rhs.shape)
+    result_m, result_n = (str(value) for value in result.shape)
+
+    if (m, n) != (result_m, result_n) or k != rhs_k:
+        raise ValueError(
+            "Ascend matmul requires lhs[M,K] @ rhs[K,N] -> output[M,N]."
+        )
+
+    extent = _static_reduction_extent(k)
+
+    if extent is not None and not 0 <= extent <= 256:
+        raise ValueError(
+            "Ascend matmul reduction extent "
+            f"{extent} exceeds BLOCK=256; hierarchical partial reduction is not "
+            "implemented."
+        )
+
+    return {
+        "mode": "matrix-scalar-loop",
+        "lhs": operation.operands[0],
+        "rhs": operation.operands[1],
+        "output_shape": (m, n),
+        "reduction_extent": k,
+    }
+
+
+def _walk_operations(blocks):
+    for block in blocks:
+        for operation in block.operations:
+            yield operation
+            yield from _walk_operations(operation.regions)
+
+
+def _bind_ascend_matmul_dimensions(program: ssa.Program) -> ssa.Program:
+    contract = _ascend_linalg_contract(program)
+
+    if contract is None:
+        return program
+
+    dimensions = {
+        "m": contract["output_shape"][0],
+        "n": contract["output_shape"][1],
+        "k": contract["reduction_extent"],
+    }
+    existing = {
+        value.name
+        for value in (*program.inputs, *program.outputs)
+        for _ in (0,)
+    }
+
+    for operation in _walk_operations(program.blocks):
+        existing.update(result.name for result in operation.results)
+
+    bindings = {}
+    constants = []
+
+    for dimension, value in dimensions.items():
+        if str(value).isidentifier():
+            continue
+
+        extent = _static_reduction_extent(value)
+
+        if extent is None:
+            raise ValueError(
+                "Ascend matmul dimensions must be static integers or existing "
+                "shape symbols."
+            )
+
+        name = f"ascend_matmul_{dimension}"
+
+        if name in existing:
+            raise ValueError(f"Ascend matmul reserved SSA value `{name}` is in use.")
+
+        existing.add(name)
+        bindings[dimension] = name
+        constants.append(
+            ssa.Operation(
+                opcode="arith.constant",
+                results=(ssa.Value(name=name, type=ssa.Type(kind="index")),),
+                attrs={"value": extent, "ascend_linalg": True},
+            )
+        )
+
+    if not constants:
+        return program
+
+    def rewrite(block):
+        operations = []
+
+        for operation in block.operations:
+            regions = tuple(rewrite(region) for region in operation.regions)
+
+            if operation.opcode == "linalg.matmul":
+                attrs = dict(operation.attrs) | bindings
+                operations.extend(constants)
+                operations.append(
+                    ssa.Operation(
+                        opcode=operation.opcode,
+                        operands=operation.operands,
+                        results=operation.results,
+                        attrs=attrs,
+                        regions=regions,
+                    )
+                )
+                continue
+
+            operations.append(
+                ssa.Operation(
+                    opcode=operation.opcode,
+                    operands=operation.operands,
+                    results=operation.results,
+                    attrs=operation.attrs,
+                    regions=regions,
+                )
+            )
+
+        return ssa.Block(name=block.name, args=block.args, operations=tuple(operations))
+
+    return replace(program, blocks=tuple(rewrite(block) for block in program.blocks))
 
 
 def _granularity_for_analysis(analysis: Mapping[str, Any]) -> str:

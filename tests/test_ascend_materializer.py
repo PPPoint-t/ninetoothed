@@ -10,6 +10,7 @@ from ninetoothed.backends.materializers.ascend import (
     _current_npu_stream,
     _load_source_module,
     _logical_offset,
+    _matmul_inputs,
     _validate_ascend_bindings,
     _validate_ascend_dtype_specs,
 )
@@ -281,6 +282,7 @@ def test_ascend_binding_validator_rejects_multidimensional_noncontiguous_and_ali
             logical_domain=527,
         )
 
+
     with pytest.raises(ValueError, match="storage overlap"):
         _validate_ascend_bindings(
             _abi(with_access=True),
@@ -337,6 +339,123 @@ def test_ascend_binding_validator_accepts_scalar_output_pointer():
         max_core_dim=1,
         logical_domain=1,
     )
+
+
+@pytest.mark.parametrize(
+    ("input_shape", "output_shape", "axis"),
+    (
+        ((127,), (), 0),
+        ((127, 31), (31,), 0),
+        ((2, 127, 31), (2, 31), 1),
+    ),
+)
+def test_ascend_binding_validator_accepts_ranked_row_reduction_domains(
+    input_shape, output_shape, axis
+):
+    input_elements = 1
+
+    for extent in input_shape:
+        input_elements *= extent
+
+    output_elements = 1
+
+    for extent in output_shape:
+        output_elements *= extent
+
+    specs = (
+        TensorSpec(ndim=len(input_shape), shape=input_shape, dtype="float32", name="x"),
+        TensorSpec(ndim=len(output_shape), shape=output_shape, dtype="float32", name="out"),
+    )
+    _validate_ascend_bindings(
+        _abi(with_access=True),
+        {
+            "x": _Tensor(input_elements, shape=input_shape, data_ptr=1024),
+            "out": _Tensor(output_elements, shape=output_shape, data_ptr=1048576),
+        },
+        specs,
+        max_core_dim=max(1, (output_elements + 255) // 256),
+        logical_domain=output_elements,
+        reduction_schedule={"mode": "row-vector", "axis": axis},
+    )
+
+
+def test_ascend_binding_validator_rejects_unimplemented_partial_reduction():
+    with pytest.raises(ValueError, match="exceeds BLOCK=256"):
+        _validate_ascend_bindings(
+            _abi(with_access=True),
+            {
+                "x": _Tensor(257, shape=(257,)),
+                "out": _Tensor(1, shape=()),
+            },
+            (
+                TensorSpec(ndim=1, shape=("257",), dtype="float32", name="x"),
+                TensorSpec(ndim=0, shape=(), dtype="float32", name="out"),
+            ),
+            max_core_dim=1,
+            logical_domain=1,
+            reduction_schedule={"mode": "row-vector", "axis": 0},
+        )
+
+
+def test_ascend_binding_validator_accepts_contiguous_matmul_and_rejects_bad_k():
+    abi = LaunchABI(
+        public_args=("a", "b", "out"),
+        kernel_args=(
+            LaunchBinding(name="a", kind="tensor", source="a", access="read"),
+            LaunchBinding(name="b", kind="tensor", source="b", access="read"),
+            LaunchBinding(name="out", kind="tensor", source="out", access="write"),
+        ),
+        outputs=("out",),
+    )
+    specs = (
+        TensorSpec(ndim=2, shape=("m", "k"), dtype="float32", name="a"),
+        TensorSpec(ndim=2, shape=("k", "n"), dtype="float32", name="b"),
+        TensorSpec(ndim=2, shape=("m", "n"), dtype="float32", name="out"),
+    )
+    contract = {"mode": "matrix-scalar-loop", "lhs": "a", "rhs": "b"}
+    public = {
+        "a": _Tensor(2159, shape=(17, 127), data_ptr=1024),
+        "b": _Tensor(3937, shape=(127, 31), data_ptr=1048576),
+        "out": _Tensor(527, shape=(17, 31), data_ptr=2097152),
+    }
+
+    _validate_ascend_bindings(
+        abi,
+        public,
+        specs,
+        max_core_dim=3,
+        logical_domain=527,
+        linalg_contract=contract,
+    )
+
+    public["b"] = _Tensor(4064, shape=(128, 31), data_ptr=1048576)
+
+    with pytest.raises(ValueError, match=r"lhs\[M,K\] @ rhs\[K,N\]"):
+        _validate_ascend_bindings(
+            abi,
+            public,
+            specs,
+            max_core_dim=3,
+            logical_domain=527,
+            linalg_contract=contract,
+        )
+
+
+def test_ascend_matmul_contract_rejects_rank_and_dtype_mismatches():
+    contract = {"mode": "matrix-scalar-loop", "lhs": "a", "rhs": "b"}
+    tensors = {
+        "a": _Tensor(2159, shape=(17, 127), dtype="torch.float32"),
+        "b": _Tensor(3937, shape=(127, 31), dtype="torch.float16"),
+        "out": _Tensor(527, shape=(17, 31), dtype="torch.float32"),
+    }
+
+    with pytest.raises(TypeError, match="matching input/output dtypes"):
+        _matmul_inputs(tensors, ("out",), (17, 31), contract)
+
+    tensors["b"] = _Tensor(127, shape=(127,), dtype="torch.float32")
+
+    with pytest.raises(ValueError, match="rank-2 contiguous inputs"):
+        _matmul_inputs(tensors, ("out",), (17, 31), contract)
 
 
 def test_ascend_binding_validator_uses_output_for_core_limit():

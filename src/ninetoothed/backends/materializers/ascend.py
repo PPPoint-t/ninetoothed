@@ -76,6 +76,13 @@ class AscendMaterializer(Materializer):
             kernel_name=built.source.kernel_name,
             max_core_dim=_max_core_dim(built.source.metadata),
             module=module,
+            reduction_schedule=specs
+            and built.source.metadata.get("ssa_metadata", {})
+            .get("schedule", {})
+            .get("reduction"),
+            linalg_contract=built.source.metadata.get("ssa_metadata", {})
+            .get("schedule", {})
+            .get("ascend_linalg"),
         )
 
 
@@ -120,6 +127,12 @@ def _materialize(compilation, *, output_dir: str | Path | None):
         kernel_name=artifact.kernel_name,
         max_core_dim=_max_core_dim(artifact.metadata),
         module=module,
+        reduction_schedule=artifact.metadata.get("ssa_metadata", {})
+        .get("schedule", {})
+        .get("reduction"),
+        linalg_contract=artifact.metadata.get("ssa_metadata", {})
+        .get("schedule", {})
+        .get("ascend_linalg"),
     )
 
     return Handle(compilation, (module, kernel), wrapped, published_source)
@@ -168,6 +181,8 @@ def _ascend_wrapper(
     kernel_name: str,
     max_core_dim: int,
     module,
+    reduction_schedule=None,
+    linalg_contract=None,
 ):
     from ninetoothed.compiler.runtime import (
         _bound_values,
@@ -192,6 +207,8 @@ def _ascend_wrapper(
             logical_domain=(
                 launch_plan.logical_domain if launch_plan is not None else None
             ),
+            reduction_schedule=reduction_schedule,
+            linalg_contract=linalg_contract,
         )
 
         if _empty_launch(abi, public):
@@ -224,6 +241,8 @@ def _validate_ascend_bindings(
     max_core_dim: int,
     *,
     logical_domain=None,
+    reduction_schedule=None,
+    linalg_contract=None,
 ) -> None:
     spec_by_name = {spec.name: spec for spec in specs}
     _validate_ascend_dtype_specs(tuple(spec_by_name.values()))
@@ -292,6 +311,19 @@ def _validate_ascend_bindings(
     )
     output_shape = tuple(output.shape)
 
+    reduction_inputs = _row_reduction_inputs(
+        tensors,
+        output_names,
+        output_shape,
+        reduction_schedule,
+    )
+    linalg_inputs = _matmul_inputs(
+        tensors,
+        output_names,
+        output_shape,
+        linalg_contract,
+    )
+
     if not output_shape:
         if logical_elements != 1:
             raise ValueError("Ascend scalar output launch requires logical domain one.")
@@ -322,12 +354,18 @@ def _validate_ascend_bindings(
                     "to be scalar when its primary output is scalar."
                 )
 
+            if name in reduction_inputs or name in linalg_inputs:
+                continue
+
             if shape != (1,):
                 raise ValueError(
                     "Ascend scalar output launch accepts only scalar-compatible "
                     f"(1,) tensor inputs; `{name}` has shape {shape}."
                 )
 
+            continue
+
+        if name in reduction_inputs or name in linalg_inputs:
             continue
 
         if len(shape) != len(output_shape):
@@ -386,6 +424,109 @@ def _is_supported_broadcast_shape(shape, output_shape) -> bool:
         return shape == (1,)
 
     return len(output_shape) == 2 and shape == (1, output_shape[1])
+
+
+def _row_reduction_inputs(tensors, output_names, output_shape, reduction_schedule):
+    if not reduction_schedule or reduction_schedule.get("mode") != "row-vector":
+        return frozenset()
+
+    raw_axis = reduction_schedule.get("axis")
+
+    if isinstance(raw_axis, bool) or not isinstance(raw_axis, int):
+        raise ValueError("Ascend row-vector reduction requires an integer axis.")
+
+    inputs = set()
+
+    for name, value in tensors.items():
+        if name in output_names:
+            continue
+
+        shape = tuple(value.shape)
+
+        if len(shape) != len(output_shape) + 1:
+            continue
+
+        axis = raw_axis if raw_axis >= 0 else raw_axis + len(shape)
+
+        if not 0 <= axis < len(shape):
+            raise ValueError(
+                "Ascend row-vector reduction axis "
+                f"{raw_axis} is outside input rank {len(shape)}."
+            )
+
+        if tuple(shape[:axis] + shape[axis + 1 :]) != output_shape:
+            continue
+
+        extent = int(shape[axis])
+
+        if extent > 256:
+            raise ValueError(
+                "Ascend row-vector reduction extent "
+                f"{extent} exceeds BLOCK=256; hierarchical partial reduction "
+                "is not implemented."
+            )
+
+        inputs.add(name)
+
+    if not inputs:
+        raise ValueError(
+            "Ascend row-vector reduction requires a contiguous input whose shape "
+            "equals the output shape with the reduction axis inserted."
+        )
+
+    return frozenset(inputs)
+
+
+def _matmul_inputs(tensors, output_names, output_shape, linalg_contract):
+    if not linalg_contract:
+        return frozenset()
+
+    if linalg_contract.get("mode") != "matrix-scalar-loop":
+        raise ValueError("Ascend linalg launch has an unsupported contract mode.")
+
+    if len(output_names) != 1 or len(output_shape) != 2:
+        raise ValueError("Ascend matmul requires exactly one rank-2 output tensor.")
+
+    lhs_name = linalg_contract.get("lhs")
+    rhs_name = linalg_contract.get("rhs")
+
+    if not isinstance(lhs_name, str) or not isinstance(rhs_name, str):
+        raise ValueError("Ascend matmul launch is missing operand bindings.")
+
+    try:
+        lhs = tensors[lhs_name]
+        rhs = tensors[rhs_name]
+    except KeyError as exc:
+        raise ValueError(
+            f"Ascend matmul launch is missing operand `{exc.args[0]}`."
+        ) from exc
+
+    lhs_shape = tuple(lhs.shape)
+    rhs_shape = tuple(rhs.shape)
+
+    if len(lhs_shape) != 2 or len(rhs_shape) != 2:
+        raise ValueError("Ascend matmul requires rank-2 contiguous inputs.")
+
+    m, k = lhs_shape
+    rhs_k, n = rhs_shape
+
+    if (m, n) != output_shape or k != rhs_k:
+        raise ValueError(
+            "Ascend matmul requires runtime shapes lhs[M,K] @ rhs[K,N] -> "
+            "output[M,N]."
+        )
+
+    if k > 256:
+        raise ValueError(
+            "Ascend matmul reduction extent "
+            f"{k} exceeds BLOCK=256; hierarchical partial reduction is not "
+            "implemented."
+        )
+
+    if lhs.dtype != rhs.dtype or lhs.dtype != tensors[output_names[0]].dtype:
+        raise TypeError("Ascend matmul currently requires matching input/output dtypes.")
+
+    return frozenset((lhs_name, rhs_name))
 
 
 def _ascend_outputs(abi, public):

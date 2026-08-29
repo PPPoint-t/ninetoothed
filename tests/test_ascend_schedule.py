@@ -297,6 +297,67 @@ def test_ascend_rejects_layout_transfer_before_source_emission():
         lower_for_target(program, backend=Target.ASCEND)
 
 
+def test_ascend_accepts_emittable_row_vector_reduction_schedule():
+    program = _program(
+        "\ndef reduce(x, out):\n    out = sum(x, axis=1)\n",
+        (
+            TensorSpec(ndim=2, shape=("rows", "cols"), dtype="float32", name="x"),
+            TensorSpec(ndim=1, shape=("rows",), dtype="float32", name="out"),
+        ),
+        "reduce",
+    )
+
+    lowered = lower_for_target(
+        program,
+        backend=Target.ASCEND,
+        tensors=(
+            TensorSpec(ndim=2, shape=("rows", "cols"), dtype="float32", name="x"),
+            TensorSpec(ndim=1, shape=("rows",), dtype="float32", name="out"),
+        ),
+    )
+
+    assert lowered.metadata["schedule"]["granularity"] == "parallel-reduction"
+    assert lowered.metadata["schedule"]["reduction"]["mode"] == "row-vector"
+    assert lowered.metadata["selected_schedule_candidate"] == "ascend-row-reduction-256"
+
+
+def test_ascend_rejects_non_emittable_reduction_schedule():
+    program = _program(
+        "\ndef reduce(x, out):\n    out = sum(x)\n",
+        (
+            TensorSpec(ndim=2, shape=("rows", "cols"), dtype="float32", name="x"),
+            TensorSpec(ndim=1, shape=("rows",), dtype="float32", name="out"),
+        ),
+        "reduce",
+    )
+
+    with pytest.raises(ValueError, match="row-vector reduction"):
+        lower_for_target(program, backend=Target.ASCEND)
+
+
+def test_ascend_rejects_partial_reduction_above_fixed_block():
+    program = _program(
+        "\ndef reduce(x, out):\n    out = sum(x, axis=1)\n",
+        (
+            TensorSpec(ndim=2, shape=("rows", "257"), dtype="float32", name="x"),
+            TensorSpec(ndim=1, shape=("rows",), dtype="float32", name="out"),
+        ),
+        "reduce",
+    )
+
+    with pytest.raises(ValueError, match="exceeds BLOCK=256"):
+        lower_for_target(
+            program,
+            backend=Target.ASCEND,
+            tensors=(
+                TensorSpec(
+                    ndim=2, shape=("rows", "257"), dtype="float32", name="x"
+                ),
+                TensorSpec(ndim=1, shape=("rows",), dtype="float32", name="out"),
+            ),
+        )
+
+
 def test_ascend_accepts_structured_contiguous_tiled_layouts():
     tensors = tuple(Tensor(1, dtype="float32") for _ in range(3))
     arranged = tuple(tensor.tile((64,)) for tensor in tensors)
@@ -363,16 +424,6 @@ def test_ascend_rejects_invalid_core_limit_before_schedule_selection():
             "reduce",
             "parallel-reduction",
         ),
-        (
-            "\ndef matmul(a, b, out):\n    out = a @ b\n",
-            (
-                TensorSpec(ndim=2, shape=("m", "k"), dtype="float32", name="a"),
-                TensorSpec(ndim=2, shape=("k", "n"), dtype="float32", name="b"),
-                TensorSpec(ndim=2, shape=("m", "n"), dtype="float32", name="out"),
-            ),
-            "matmul",
-            "blocked-linalg",
-        ),
     ),
 )
 def test_ascend_rejects_unverified_schedule_granularity(
@@ -382,6 +433,41 @@ def test_ascend_rejects_unverified_schedule_granularity(
 
     with pytest.raises(ValueError, match=f"granularity `{granularity}`"):
         lower_for_target(program, backend=Target.ASCEND)
+
+
+def test_ascend_accepts_decomposed_contiguous_matmul_schedule():
+    tensors = (
+        TensorSpec(ndim=2, shape=("m", "k"), dtype="float32", name="a"),
+        TensorSpec(ndim=2, shape=("k", "n"), dtype="float32", name="b"),
+        TensorSpec(ndim=2, shape=("m", "n"), dtype="float32", name="out"),
+    )
+    lowered = lower_for_target(
+        _program("\ndef matmul(a, b, out):\n    out = a @ b\n", tensors, "matmul"),
+        backend=Target.ASCEND,
+        tensors=tensors,
+    )
+
+    assert lowered.metadata["schedule"]["granularity"] == "blocked-linalg"
+    assert (
+        lowered.metadata["selected_schedule_candidate"]
+        == "ascend-matmul-scalar-loop-256"
+    )
+    assert lowered.metadata["schedule"]["ascend_linalg"]["reduction_extent"] == "k"
+
+
+def test_ascend_rejects_matmul_partial_reduction_above_fixed_block():
+    tensors = (
+        TensorSpec(ndim=2, shape=("m", "257"), dtype="float32", name="a"),
+        TensorSpec(ndim=2, shape=("257", "n"), dtype="float32", name="b"),
+        TensorSpec(ndim=2, shape=("m", "n"), dtype="float32", name="out"),
+    )
+
+    with pytest.raises(ValueError, match="matmul reduction extent 257 exceeds BLOCK=256"):
+        lower_for_target(
+            _program("\ndef matmul(a, b, out):\n    out = a @ b\n", tensors, "matmul"),
+            backend=Target.ASCEND,
+            tensors=tensors,
+        )
 
 
 def test_ascend_rejects_cuda_schedule_parameters():

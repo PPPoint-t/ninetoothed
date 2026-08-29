@@ -1,5 +1,3 @@
-import pytest
-
 from ninetoothed.backends.core import Target
 from ninetoothed.compiler.passes import (
     BACKEND_SPECIFIC,
@@ -192,8 +190,13 @@ class TestPipeline:
             else:
                 assert lowered.metadata["selected_schedule_candidate"] is None
 
-        with pytest.raises(ValueError, match="granularity `blocked-linalg`"):
-            lower_for_target(program, backend=Target.ASCEND)
+        ascend = lower_for_target(program, backend=Target.ASCEND)
+        assert ascend.metadata["selected_schedule_candidate"] == (
+            "ascend-matmul-scalar-loop-256"
+        )
+        assert ascend.metadata["schedule"]["ascend_linalg"]["mode"] == (
+            "matrix-scalar-loop"
+        )
 
     def test_schedule_candidate_can_be_selected_by_pass_option(self):
         program = _program(

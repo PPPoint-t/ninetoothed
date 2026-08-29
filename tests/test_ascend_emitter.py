@@ -4,6 +4,8 @@ import pytest
 
 from ninetoothed.backends import emit
 from ninetoothed.backends.core import Target
+from ninetoothed.backends.emitters.ascend import diagnose_opcode_coverage
+from ninetoothed.compiler.passes import lower_for_target
 from ninetoothed.frontend.python import from_source
 from ninetoothed.ir import Kernel, TensorSpec
 
@@ -54,11 +56,171 @@ def test_ascend_emits_stable_elementwise_triton_source():
     ast.parse(first.primary_source)
 
 
-def test_ascend_rejects_unverified_elementwise_opcode_at_emission():
+def test_ascend_emits_pow_from_generic_ssa():
     kernel = _kernel("\ndef add(x, y, out):\n    out = x ** y\n")
 
-    with pytest.raises(ValueError, match=r"unsupported SSA opcode\(s\): `arith.pow`"):
-        emit(kernel, Target.ASCEND)
+    source = emit(kernel, Target.ASCEND).primary_source
+
+    assert "pow(" in source
+    ast.parse(source)
+
+
+def test_ascend_emits_fill_from_tensor_full():
+    kernel = _kernel("\ndef fill(out):\n    out = full((n,), 2.5)\n", name="fill", tensors=(
+        TensorSpec(ndim=1, shape=("n",), dtype="float32", name="out"),
+    ))
+
+    source = emit(kernel, Target.ASCEND).primary_source
+
+    assert "tl.store(out + index" in source
+    assert "2.5" in source
+    ast.parse(source)
+
+
+def test_ascend_emits_contiguous_view_and_index_offset():
+    kernel = _kernel(
+        "\ndef view_copy(x, out):\n    i = x.offsets(0)\n    out[i] = x\n",
+        name="view_copy",
+        tensors=(
+            TensorSpec(ndim=1, shape=("n",), dtype="float32", name="x"),
+            TensorSpec(ndim=1, shape=("n",), dtype="float32", name="out"),
+        ),
+    )
+
+    source = emit(kernel, Target.ASCEND).primary_source
+
+    assert "tl.load(x + index" in source
+    assert "tl.store(out + v0" in source
+    ast.parse(source)
+
+
+def test_ascend_emits_structured_loop_and_if():
+    kernel = _kernel(
+        "\ndef control(x, out):\n"
+        "    for i in range(n):\n"
+        "        out[i] = x[i] + 1.0\n",
+        name="control",
+        tensors=(
+            TensorSpec(ndim=1, shape=("n",), dtype="float32", name="x"),
+            TensorSpec(ndim=1, shape=("n",), dtype="float32", name="out"),
+        ),
+    )
+
+    source = emit(kernel, Target.ASCEND).primary_source
+
+    assert "for loop_i in range(0, n, 1):" in source
+    assert "tl.store(out + loop_i" in source
+    ast.parse(source)
+
+
+def test_ascend_emits_row_vector_reduction():
+    kernel = _kernel(
+        "\ndef reduce(x, out):\n    out = sum(x, axis=1)\n",
+        name="reduce",
+        tensors=(
+            TensorSpec(ndim=2, shape=("rows", "cols"), dtype="float32", name="x"),
+            TensorSpec(ndim=1, shape=("rows",), dtype="float32", name="out"),
+        ),
+    )
+    lowered = lower_for_target(kernel.ssa, backend=Target.ASCEND, tensors=kernel.tensors)
+    kernel = Kernel(
+        kernel_name=kernel.kernel_name,
+        source=kernel.source,
+        source_language=kernel.source_language,
+        entrypoint=kernel.entrypoint,
+        tensors=kernel.tensors,
+        ssa=lowered,
+    )
+    source = emit(kernel, Target.ASCEND).primary_source
+
+    assert "tl.sum(" in source
+    assert "offsets = tl.arange(0, BLOCK)" in source
+    ast.parse(source)
+
+
+def test_ascend_emits_decomposed_matmul_with_tail_safe_loads():
+    tensors = (
+        TensorSpec(ndim=2, shape=("m", "k"), dtype="float32", name="a"),
+        TensorSpec(ndim=2, shape=("k", "n"), dtype="float32", name="b"),
+        TensorSpec(ndim=2, shape=("m", "n"), dtype="float32", name="out"),
+    )
+    kernel = _kernel(
+        "\ndef matmul(a, b, out):\n    out = a @ b\n",
+        name="matmul",
+        tensors=tensors,
+    )
+    lowered = lower_for_target(kernel.ssa, backend=Target.ASCEND, tensors=tensors)
+    kernel = Kernel(
+        kernel_name=kernel.kernel_name,
+        source=kernel.source,
+        source_language=kernel.source_language,
+        entrypoint=kernel.entrypoint,
+        tensors=tensors,
+        ssa=lowered,
+    )
+    source = emit(kernel, Target.ASCEND).primary_source
+
+    assert "linalg.matmul" not in source
+    assert "for v10_i in range(0, k, 1):" in source
+    assert source.count("mask=mask, other=0.0") >= 2
+    assert diagnose_opcode_coverage(kernel)["unsupported"] == ()
+    ast.parse(source)
+
+
+@pytest.mark.parametrize(
+    ("source", "tensors", "opcode"),
+    (
+        (
+            "\ndef reduce(x, out):\n    out = sum(x)\n",
+            (
+                TensorSpec(ndim=1, shape=("cols",), dtype="float32", name="x"),
+                TensorSpec(ndim=0, shape=(), dtype="float32", name="out"),
+            ),
+            "tl.sum(",
+        ),
+        (
+            "\ndef reduce(x, out):\n    out = max(x, axis=0)\n",
+            (
+                TensorSpec(
+                    ndim=2, shape=("rows", "cols"), dtype="float32", name="x"
+                ),
+                TensorSpec(ndim=1, shape=("cols",), dtype="float32", name="out"),
+            ),
+            "tl.max(",
+        ),
+        (
+            "\ndef reduce(x, out):\n    out = min(x, axis=1)\n",
+            (
+                TensorSpec(
+                    ndim=3,
+                    shape=("depth", "rows", "cols"),
+                    dtype="float32",
+                    name="x",
+                ),
+                TensorSpec(
+                    ndim=2, shape=("depth", "cols"), dtype="float32", name="out"
+                ),
+            ),
+            "tl.min(",
+        ),
+    ),
+)
+def test_ascend_emits_ranked_row_vector_reductions(source, tensors, opcode):
+    kernel = _kernel(source, name="reduce", tensors=tensors)
+    lowered = lower_for_target(kernel.ssa, backend=Target.ASCEND, tensors=tensors)
+    kernel = Kernel(
+        kernel_name=kernel.kernel_name,
+        source=kernel.source,
+        source_language=kernel.source_language,
+        entrypoint=kernel.entrypoint,
+        tensors=tensors,
+        ssa=lowered,
+    )
+    artifact = emit(kernel, Target.ASCEND)
+
+    assert opcode in artifact.primary_source
+    assert diagnose_opcode_coverage(kernel)["unsupported"] == ()
+    ast.parse(artifact.primary_source)
 
 
 def test_ascend_canonicalizes_unary_positive_to_its_operand():

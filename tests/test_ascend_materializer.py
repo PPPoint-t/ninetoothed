@@ -1,8 +1,10 @@
+import json
 import sys
 from types import SimpleNamespace
 
 import pytest
 
+from ninetoothed.backends.ascend import read_ascend_sidecar, write_ascend_sidecar
 from ninetoothed.backends.core import Artifact, BuiltArtifact, Target
 from ninetoothed.backends.materializers.ascend import (
     AscendMaterializer,
@@ -46,7 +48,7 @@ class _Tensor:
         self._contiguous = contiguous
         self._storage_elements = storage_elements or elements
         self._storage_offset = storage_offset
-        self._data_ptr = data_ptr if data_ptr is not None else id(self) * 8
+        self._data_ptr = data_ptr if data_ptr is not None else id(self) * 4096
         self.dtype = dtype
         default_strides = []
         stride = 1
@@ -107,7 +109,27 @@ def _specs():
     )
 
 
-def test_ascend_binding_validator_requires_contiguous_broadcastable_tensors():
+def test_ascend_sidecar_round_trips_dot_loop_schedule(tmp_path):
+    source = tmp_path / "dot_loop.ascend.py"
+    source.write_text("def launch_dot_loop():\n    return None\n", encoding="utf-8")
+    contract = {
+        "version": 1,
+        "mode": "generic-dot-loop",
+        "loop_carried": True,
+        "layout": "public-access-template",
+        "tile": {"m": 16, "n": 16, "k": 64},
+    }
+    write_ascend_sidecar(
+        source,
+        abi=_abi(),
+        specs=_specs(),
+        outputs=("out",),
+        metadata={"ssa_metadata": {"schedule": {"ascend_dot_loop": contract}}},
+    )
+    assert read_ascend_sidecar(source)["dot_loop"] == contract
+
+
+def test_ascend_binding_validator_accepts_offset_contiguous_and_rejects_unlowered_strides():
     abi = _abi()
     specs = _specs()
 
@@ -118,10 +140,20 @@ def test_ascend_binding_validator_requires_contiguous_broadcastable_tensors():
         max_core_dim=1,
     )
 
-    with pytest.raises(TypeError, match="must be contiguous"):
+    _validate_ascend_bindings(
+        abi,
+        {"x": _Tensor(storage_offset=1, storage_elements=257), "out": _Tensor()},
+        specs,
+        max_core_dim=1,
+    )
+
+    with pytest.raises(TypeError, match="non-contiguous stride addressing"):
         _validate_ascend_bindings(
             abi,
-            {"x": _Tensor(contiguous=False), "out": _Tensor()},
+            {
+                "x": _Tensor(contiguous=False, strides=(2,), storage_elements=511),
+                "out": _Tensor(),
+            },
             specs,
             max_core_dim=1,
         )
@@ -249,7 +281,13 @@ def test_ascend_binding_validator_accepts_multiple_outputs_and_rejects_output_al
 
     _validate_ascend_bindings(abi, public, specs, max_core_dim=3, logical_domain=527)
 
-    public["out1"] = _Tensor(0, shape=(17, 31), strides=(31, 1), data_ptr=8192)
+    public["out1"] = _Tensor(
+        0,
+        shape=(17, 31),
+        strides=(31, 1),
+        storage_elements=527,
+        data_ptr=8192,
+    )
 
     with pytest.raises(ValueError, match="requires every output to contain"):
         _validate_ascend_bindings(
@@ -270,7 +308,7 @@ def test_ascend_binding_validator_rejects_multidimensional_noncontiguous_and_ali
         for name in ("x", "out")
     )
 
-    with pytest.raises(TypeError, match="must be contiguous"):
+    with pytest.raises(TypeError, match="non-contiguous stride addressing"):
         _validate_ascend_bindings(
             _abi(),
             {
@@ -281,7 +319,6 @@ def test_ascend_binding_validator_rejects_multidimensional_noncontiguous_and_ali
             max_core_dim=3,
             logical_domain=527,
         )
-
 
     with pytest.raises(ValueError, match="storage overlap"):
         _validate_ascend_bindings(
@@ -309,7 +346,11 @@ def test_ascend_binding_validator_rejects_unsupported_multidimensional_broadcast
         _validate_ascend_bindings(
             _abi(),
             {
-                "x": _Tensor(17, shape=shape),
+                "x": _Tensor(
+                    17,
+                    shape=shape,
+                    storage_elements=1054 if len(shape) == 3 else None,
+                ),
                 "out": _Tensor(527, shape=(17, 31)),
             },
             specs,
@@ -364,7 +405,9 @@ def test_ascend_binding_validator_accepts_ranked_row_reduction_domains(
 
     specs = (
         TensorSpec(ndim=len(input_shape), shape=input_shape, dtype="float32", name="x"),
-        TensorSpec(ndim=len(output_shape), shape=output_shape, dtype="float32", name="out"),
+        TensorSpec(
+            ndim=len(output_shape), shape=output_shape, dtype="float32", name="out"
+        ),
     )
     _validate_ascend_bindings(
         _abi(with_access=True),
@@ -379,22 +422,25 @@ def test_ascend_binding_validator_accepts_ranked_row_reduction_domains(
     )
 
 
-def test_ascend_binding_validator_rejects_unimplemented_partial_reduction():
-    with pytest.raises(ValueError, match="exceeds BLOCK=256"):
-        _validate_ascend_bindings(
-            _abi(with_access=True),
-            {
-                "x": _Tensor(257, shape=(257,)),
-                "out": _Tensor(1, shape=()),
-            },
-            (
-                TensorSpec(ndim=1, shape=("257",), dtype="float32", name="x"),
-                TensorSpec(ndim=0, shape=(), dtype="float32", name="out"),
+def test_ascend_binding_validator_accepts_private_partial_reduction():
+    _validate_ascend_bindings(
+        _abi(with_access=True),
+        {"x": _Tensor(257, shape=(257,)), "out": _Tensor(1, shape=())},
+        (
+            TensorSpec(ndim=1, shape=("257",), dtype="float32", name="x"),
+            TensorSpec(ndim=0, shape=(), dtype="float32", name="out"),
+        ),
+        max_core_dim=1,
+        logical_domain=1,
+        reduction_schedule={"mode": "row-vector", "axis": 0},
+        partial_reduction={
+            "strategy": "hierarchical-private-stages",
+            "stages": (
+                {"block": 256, "input_extent": 257, "output_extent": 2},
+                {"block": 256, "input_extent": 2, "output_extent": 1},
             ),
-            max_core_dim=1,
-            logical_domain=1,
-            reduction_schedule={"mode": "row-vector", "axis": 0},
-        )
+        },
+    )
 
 
 def test_ascend_binding_validator_accepts_contiguous_matmul_and_rejects_bad_k():
@@ -412,7 +458,7 @@ def test_ascend_binding_validator_accepts_contiguous_matmul_and_rejects_bad_k():
         TensorSpec(ndim=2, shape=("k", "n"), dtype="float32", name="b"),
         TensorSpec(ndim=2, shape=("m", "n"), dtype="float32", name="out"),
     )
-    contract = {"mode": "matrix-scalar-loop", "lhs": "a", "rhs": "b"}
+    contract = {"mode": "tiled-matmul", "lhs": "a", "rhs": "b"}
     public = {
         "a": _Tensor(2159, shape=(17, 127), data_ptr=1024),
         "b": _Tensor(3937, shape=(127, 31), data_ptr=1048576),
@@ -530,6 +576,27 @@ def test_ascend_built_source_artifact_reloads_without_a_binary(tmp_path):
         manifest_path=str(tmp_path / "reload.manifest.json"),
         abi={},
     )
+    source_path.with_suffix(".ascend-launch.json").write_text(
+        json.dumps(
+            {
+                "schema": 2,
+                "abi": {
+                    "public_args": [],
+                    "kernel_args": [],
+                    "outputs": [],
+                    "shape_params": [],
+                },
+                "logical_domain": "1",
+                "outputs": [],
+                "max_core_dim": 1,
+                "reduction_schedule": None,
+                "linalg_contract": None,
+                "layout_contract": None,
+                "block_meta": {},
+            }
+        ),
+        encoding="utf-8",
+    )
 
     assert AscendMaterializer().load_built_artifact(built)() is None
 
@@ -588,7 +655,7 @@ def test_ascend_empty_tensor_returns_without_launch_or_stream_lookup():
 
 
 def test_ascend_binding_validator_rejects_invalid_storage_offset():
-    with pytest.raises(ValueError, match="storage span"):
+    with pytest.raises(TypeError, match="negative storage offsets"):
         _validate_ascend_bindings(
             _abi(),
             {"x": _Tensor(storage_offset=-1), "out": _Tensor()},
@@ -617,16 +684,22 @@ def test_ascend_binding_validator_uses_logical_domain_for_offset_view():
 
     _validate_ascend_bindings(
         _abi(),
-        {"x": _Tensor(258), "out": _Tensor(258)},
+        {
+            "x": _Tensor(257, storage_offset=1, storage_elements=258),
+            "out": _Tensor(257, storage_offset=1, storage_elements=258),
+        },
         specs,
         max_core_dim=2,
         logical_domain=257,
     )
 
-    with pytest.raises(ValueError, match="requires 258 elements"):
+    with pytest.raises(ValueError, match="requires 257 elements"):
         _validate_ascend_bindings(
             _abi(),
-            {"x": _Tensor(257), "out": _Tensor(258)},
+            {
+                "x": _Tensor(256, storage_offset=1, storage_elements=257),
+                "out": _Tensor(257),
+            },
             specs,
             max_core_dim=2,
             logical_domain=257,

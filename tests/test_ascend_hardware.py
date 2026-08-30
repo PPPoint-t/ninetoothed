@@ -47,6 +47,46 @@ def _copy_application(input, output):
     output = input  # noqa: F841
 
 
+def _math_application(input, output):
+    output = input.exp() + input.log()  # noqa: F841
+
+
+def _mixed_scalar_application(input, alpha, output):
+    output = input + alpha  # noqa: F841
+
+
+def _nested_control_application(input, output):
+    for i in range(input.shape[0]):
+        if input[i] > 0.0:
+            output[i] = input[i].exp()
+        else:
+            output[i] = (input[i] + 2.0).log()
+
+
+def _transpose_arrangement(input, output):
+    return input.tile((17, 31)), output.tile((31, 17))
+
+
+def _transpose_application(input, output):
+    output = input.T  # noqa: F841
+
+
+def _rng_arrangement(output, seed, offset):
+    return output.tile((257,)), seed, offset.tile((257,))
+
+
+def _rng_application(output, seed, offset):
+    output = ntl.rand(seed, offset)  # noqa: F841
+
+
+def _atomic_arrangement(input, output):
+    return input.tile((257,)), output.tile((1,))
+
+
+def _atomic_application(input, output):
+    ntl.atomic_add(output.source.data_ptr(), input)
+
+
 def _fill_arrangement(output):
     return output.tile((513,))
 
@@ -69,6 +109,14 @@ def _reduction_volume_arrangement(input, output):
 
 
 def _reduction_application(input, output):
+    output = ntl.sum(input, axis=-1)  # noqa: F841
+
+
+def _large_reduction_arrangement(input, output):
+    return input.tile((1, 513)), output.tile((1,))
+
+
+def _large_reduction_application(input, output):
     output = ntl.sum(input, axis=-1)  # noqa: F841
 
 
@@ -110,6 +158,14 @@ def _matmul_small_arrangement(lhs, rhs, output):
 
 def _matmul_application(lhs, rhs, output):
     output = lhs @ rhs  # noqa: F841
+
+
+def _matmul_large_k_arrangement(lhs, rhs, output):
+    return lhs.tile((3, 513)), rhs.tile((513, 5)), output.tile((3, 5))
+
+
+def _matmul_batched_arrangement(lhs, rhs, output):
+    return lhs.tile((2, 3, 257)), rhs.tile((2, 257, 5)), output.tile((2, 3, 5))
 
 
 def _broadcast_arrangement(input, bias, output):
@@ -869,7 +925,12 @@ def test_ascend_row_reduction_jit_and_source_reload(tmp_path):
     import torch_npu  # noqa: F401
 
     assert torch.npu.is_available()
-    rank, arrangement, shape, output_shape = 2, _reduction_matrix_arrangement, (1, 127), (1,)
+    rank, arrangement, shape, output_shape = (
+        2,
+        _reduction_matrix_arrangement,
+        (1, 127),
+        (1,),
+    )
     tensors = (Tensor(rank, dtype="float32"), Tensor(rank - 1, dtype="float32"))
     compilation = DEFAULT_COMPILER.compile(
         CompileRequest(
@@ -890,6 +951,32 @@ def test_ascend_row_reduction_jit_and_source_reload(tmp_path):
         assert launch(input, output) is output
         torch.npu.synchronize()
         torch.testing.assert_close(output, input.sum(dim=-1))
+
+
+@pytest.mark.ascend_next_stage
+def test_ascend_hierarchical_reduction_jit_and_source_reload(tmp_path):
+    import torch
+    import torch_npu  # noqa: F401
+
+    assert torch.npu.is_available()
+    compilation = DEFAULT_COMPILER.compile(
+        CompileRequest(
+            arrangement=_large_reduction_arrangement,
+            application=_large_reduction_application,
+            tensors=(Tensor(2, dtype="float32"), Tensor(1, dtype="float32")),
+            backend="ascend",
+            backend_options={"soc_version": "Ascend910B3", "max_core_dim": 8},
+        )
+    )
+    jit = DEFAULT_COMPILER.materialize(compilation, output_dir=tmp_path, mode="jit")
+    aot = DEFAULT_COMPILER.materialize(compilation, output_dir=tmp_path, mode="aot")
+    reloaded = load_built_artifact(aot._built_artifact)
+    for launch in (jit, reloaded):
+        input = torch.randn((1, 513), device="npu", dtype=torch.float32)
+        output = torch.empty((1,), device="npu", dtype=torch.float32)
+        assert launch(input, output) is output
+        torch.npu.synchronize()
+        torch.testing.assert_close(output, input.sum(dim=-1), rtol=1e-4, atol=1e-4)
 
 
 @pytest.mark.parametrize(
@@ -1018,6 +1105,42 @@ def test_ascend_matmul_jit_and_source_reload_tail(
         torch.testing.assert_close(output, torch.matmul(lhs, rhs))
 
 
+@pytest.mark.ascend_next_stage
+@pytest.mark.parametrize(
+    ("arrangement", "lhs_shape", "rhs_shape", "output_shape", "rank"),
+    (
+        (_matmul_large_k_arrangement, (3, 513), (513, 5), (3, 5), 2),
+        (_matmul_batched_arrangement, (2, 3, 257), (2, 257, 5), (2, 3, 5), 3),
+    ),
+)
+def test_ascend_tiled_batched_matmul_jit_and_source_reload(
+    tmp_path, arrangement, lhs_shape, rhs_shape, output_shape, rank
+):
+    import torch
+    import torch_npu  # noqa: F401
+
+    assert torch.npu.is_available()
+    compilation = DEFAULT_COMPILER.compile(
+        CompileRequest(
+            arrangement=arrangement,
+            application=_matmul_application,
+            tensors=tuple(Tensor(rank, dtype="float32") for _ in range(3)),
+            backend="ascend",
+            backend_options={"soc_version": "Ascend910B3", "max_core_dim": 8},
+        )
+    )
+    jit = DEFAULT_COMPILER.materialize(compilation, output_dir=tmp_path, mode="jit")
+    aot = DEFAULT_COMPILER.materialize(compilation, output_dir=tmp_path, mode="aot")
+    reloaded = load_built_artifact(aot._built_artifact)
+    for launch in (jit, reloaded):
+        lhs = torch.randn(lhs_shape, device="npu", dtype=torch.float32)
+        rhs = torch.randn(rhs_shape, device="npu", dtype=torch.float32)
+        output = torch.empty(output_shape, device="npu", dtype=torch.float32)
+        assert launch(lhs, rhs, output) is output
+        torch.npu.synchronize()
+        torch.testing.assert_close(output, torch.matmul(lhs, rhs), rtol=1e-2, atol=1e-2)
+
+
 def test_ascend_jit_and_source_reload_execute_fp32_singleton_broadcast(tmp_path):
     import torch
     import torch_npu  # noqa: F401
@@ -1128,3 +1251,257 @@ def test_ascend_static_offset_logical_view_executes_and_rejects_alias(tmp_path):
 
     with pytest.raises(ValueError, match="storage overlap"):
         handle(source, source)
+
+
+def test_ascend_math_jit_and_source_reload_tail(tmp_path):
+    import torch
+    import torch_npu  # noqa: F401
+
+    tensors = (Tensor(1, dtype="float32"), Tensor(1, dtype="float32"))
+    jit = _compile_dtype(
+        _math_application,
+        tmp_path,
+        arrangement=_unary_arrangement,
+        tensors=tensors,
+        mode="jit",
+    )
+    aot = _compile_dtype(
+        _math_application,
+        tmp_path,
+        arrangement=_unary_arrangement,
+        tensors=tensors,
+        mode="aot",
+    )
+    reloaded = load_built_artifact(aot._built_artifact)
+    input = torch.linspace(0.25, 2.0, 513, device="npu", dtype=torch.float32)
+
+    for launch in (jit, reloaded):
+        output = torch.empty_like(input)
+        assert launch(input, output) is output
+        torch.npu.synchronize()
+        torch.testing.assert_close(
+            output, input.exp() + input.log(), rtol=1e-4, atol=1e-4
+        )
+
+
+def test_ascend_mixed_scalar_vector_promotion_jit_and_source_reload(tmp_path):
+    import torch
+    import torch_npu  # noqa: F401
+
+    tensors = (
+        Tensor(1, dtype="float16"),
+        Tensor(0, dtype="float32"),
+        Tensor(1, dtype="float32"),
+    )
+    jit = _compile_dtype(
+        _mixed_scalar_application,
+        tmp_path,
+        arrangement=_scalar_input_arrangement,
+        tensors=tensors,
+        mode="jit",
+    )
+    aot = _compile_dtype(
+        _mixed_scalar_application,
+        tmp_path,
+        arrangement=_scalar_input_arrangement,
+        tensors=tensors,
+        mode="aot",
+    )
+    reloaded = load_built_artifact(aot._built_artifact)
+    input = torch.linspace(-2.0, 2.0, 513, device="npu", dtype=torch.float16)
+
+    for launch in (jit, reloaded):
+        output = torch.empty(513, device="npu", dtype=torch.float32)
+        assert launch(input, 1.25, output) is output
+        torch.npu.synchronize()
+        torch.testing.assert_close(output, input.float() + 1.25, rtol=1e-3, atol=1e-3)
+
+
+def test_ascend_transpose_jit_and_source_reload(tmp_path):
+    import torch
+    import torch_npu  # noqa: F401
+
+    tensors = (Tensor(2, dtype="float32"), Tensor(2, dtype="float32"))
+    jit = _compile_dtype(
+        _transpose_application,
+        tmp_path,
+        arrangement=_transpose_arrangement,
+        tensors=tensors,
+        mode="jit",
+    )
+    aot = _compile_dtype(
+        _transpose_application,
+        tmp_path,
+        arrangement=_transpose_arrangement,
+        tensors=tensors,
+        mode="aot",
+    )
+    reloaded = load_built_artifact(aot._built_artifact)
+    input = torch.arange(17 * 31, device="npu", dtype=torch.float32).reshape(17, 31)
+
+    for launch in (jit, reloaded):
+        output = torch.empty((31, 17), device="npu", dtype=torch.float32)
+        assert launch(input, output) is output
+        torch.npu.synchronize()
+        torch.testing.assert_close(output, input.T)
+
+
+@pytest.mark.ascend_next_stage
+def test_ascend_rng_jit_and_aot_reload(tmp_path):
+    import torch
+    import torch_npu  # noqa: F401
+
+    assert torch.npu.is_available()
+    compilation = DEFAULT_COMPILER.compile(
+        CompileRequest(
+            arrangement=_rng_arrangement,
+            application=_rng_application,
+            tensors=(
+                Tensor(1, dtype="float32"),
+                Tensor(0, dtype="int32"),
+                Tensor(1, dtype="int32"),
+            ),
+            backend="ascend",
+            backend_options={"soc_version": "Ascend910B3", "max_core_dim": 8},
+        )
+    )
+    jit = DEFAULT_COMPILER.materialize(compilation, output_dir=tmp_path, mode="jit")
+    aot = DEFAULT_COMPILER.materialize(compilation, output_dir=tmp_path, mode="aot")
+    reloaded = load_built_artifact(aot._built_artifact)
+    offset = torch.arange(257, device="npu", dtype=torch.int32)
+
+    for launch in (jit, reloaded):
+        output = torch.empty(257, device="npu", dtype=torch.float32)
+        assert launch(output, 17, offset) is output
+        torch.npu.synchronize()
+        assert torch.isfinite(output).all()
+        assert bool(((output >= 0.0) & (output <= 1.0)).all())
+
+
+@pytest.mark.ascend_next_stage
+def test_ascend_fp32_atomic_add_jit_and_aot_reload(tmp_path):
+    import torch
+    import torch_npu  # noqa: F401
+
+    assert torch.npu.is_available()
+    compilation = DEFAULT_COMPILER.compile(
+        CompileRequest(
+            arrangement=_atomic_arrangement,
+            application=_atomic_application,
+            tensors=(Tensor(1, dtype="float32"), Tensor(1, dtype="float32")),
+            backend="ascend",
+            backend_options={"soc_version": "Ascend910B3", "max_core_dim": 8},
+        )
+    )
+    jit = DEFAULT_COMPILER.materialize(compilation, output_dir=tmp_path, mode="jit")
+    aot = DEFAULT_COMPILER.materialize(compilation, output_dir=tmp_path, mode="aot")
+    reloaded = load_built_artifact(aot._built_artifact)
+    input = torch.linspace(-2.0, 2.0, 257, device="npu", dtype=torch.float32)
+
+    for launch in (jit, reloaded):
+        output = torch.zeros(1, device="npu", dtype=torch.float32)
+        assert launch(input, output) is output
+        torch.npu.synchronize()
+        torch.testing.assert_close(output, input.sum().reshape(1), rtol=1e-4, atol=1e-4)
+
+
+@pytest.mark.ascend_next_stage
+def test_ascend_generic_dot_loop_jit_and_aot_reload(tmp_path):
+    import functools
+
+    import torch
+    import torch_npu  # noqa: F401
+
+    from tests import test_conv2d
+
+    assert torch.npu.is_available()
+    compilation = DEFAULT_COMPILER.compile(
+        CompileRequest(
+            arrangement=functools.partial(
+                test_conv2d.arrangement,
+                BLOCK_SIZE_M=16,
+                BLOCK_SIZE_N=16,
+                BLOCK_SIZE_K=16,
+            ),
+            application=test_conv2d.matmul.application,
+            tensors=(
+                Tensor(shape=(1, 2, 4, 4), dtype="float16"),
+                Tensor(shape=(3, 2, 3, 3), dtype="float16"),
+                Tensor(shape=(1, 3, 2, 2), dtype="float16"),
+            ),
+            backend="ascend",
+            tensor_dtypes={
+                "input": "float16",
+                "filter": "float16",
+                "output": "float16",
+            },
+            backend_options={"soc_version": "Ascend910B3", "max_core_dim": 65535},
+        )
+    )
+    assert (
+        compilation.artifact.metadata["ssa_metadata"]["schedule"]["ascend_dot_loop"][
+            "mode"
+        ]
+        == "generic-dot-loop"
+    )
+    jit = DEFAULT_COMPILER.materialize(compilation, output_dir=tmp_path, mode="jit")
+    aot = DEFAULT_COMPILER.materialize(compilation, output_dir=tmp_path, mode="aot")
+    reloaded = load_built_artifact(aot._built_artifact)
+    input = torch.randn((1, 2, 4, 4), device="npu", dtype=torch.float16)
+    filter = torch.randn((3, 2, 3, 3), device="npu", dtype=torch.float16)
+
+    for launch in (jit, reloaded):
+        output = torch.empty((1, 3, 2, 2), device="npu", dtype=torch.float16)
+        with pytest.raises(ValueError, match="generic dot-loop runtime is fail-closed"):
+            launch(input, filter, output)
+
+
+@pytest.mark.ascend_next_stage
+def test_ascend_online_softmax_attention_jit_and_aot_reload(tmp_path):
+    import torch
+    import torch.nn.functional as functional
+    import torch_npu  # noqa: F401
+
+    from ninetoothed.backends.materializers.ascend import AscendMaterializer
+    from tests import test_attention
+
+    assert torch.npu.is_available()
+    q, k, v, output = tuple(
+        Tensor(shape=(1, 1, 16, 16), dtype="float32") for _ in range(4)
+    )
+    compilation = DEFAULT_COMPILER.compile(
+        CompileRequest(
+            arrangement=test_attention.arrangement,
+            application=test_attention.application,
+            tensors=(q, k, v, Tensor(0, constexpr=True), output),
+            backend="ascend",
+            tensor_dtypes={
+                "q": "float32",
+                "k": "float32",
+                "v": "float32",
+                "o": "float32",
+            },
+            backend_options={"soc_version": "Ascend910B3", "max_core_dim": 65535},
+        )
+    )
+    attention = compilation.artifact.metadata["ssa_metadata"]["schedule"][
+        "ascend_attention_loop"
+    ]
+    assert attention["mode"] == "generic-online-softmax-loop"
+    assert attention["status"] == "source-generated-cann-not-executed"
+    materializer = AscendMaterializer()
+    jit = materializer.jit_materialize(compilation, output_dir=tmp_path)
+    aot = materializer.aot_build(compilation, output_dir=tmp_path)
+    reloaded = load_built_artifact(aot._built_artifact)
+    q_value, k_value, v_value = (
+        torch.randn((1, 1, 16, 16), device="npu", dtype=torch.float32) for _ in range(3)
+    )
+    expected = functional.scaled_dot_product_attention(
+        q_value, k_value, v_value, is_causal=False, scale=1
+    )
+
+    for launch in (jit, reloaded):
+        output_value = torch.empty_like(expected)
+        assert launch(q_value, k_value, v_value, False, output_value) is output_value
+        torch.npu.synchronize()
+        torch.testing.assert_close(output_value, expected, rtol=2.5e-2, atol=2.5e-2)

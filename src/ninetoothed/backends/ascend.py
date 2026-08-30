@@ -13,6 +13,7 @@ from ninetoothed.backends.core import (
     Capability,
     Target,
 )
+from ninetoothed.compiler.layout import analyze_layout_transfer
 from ninetoothed.compiler.passes import (
     Context,
     OptimizeSchedule,
@@ -78,7 +79,9 @@ class AscendBackend(Backend):
 
 
 ASCEND_ELEMENTWISE_DTYPES = frozenset({"float16", "bfloat16", "float32"})
-_SIDECAR_SCHEMA = 1
+ASCEND_RNG_DTYPES = frozenset({"float16", "bfloat16", "float32"})
+ASCEND_ATOMIC_DTYPES = frozenset({"float16", "bfloat16", "float32", "int32"})
+_SIDECAR_SCHEMA = 2
 
 
 def normalize_ascend_dtype(dtype: str | None) -> str | None:
@@ -101,6 +104,10 @@ def normalize_ascend_dtype(dtype: str | None) -> str | None:
 
 def unsupported_ascend_elementwise_dtypes(
     dtypes: tuple[str | None, ...],
+    *,
+    allow_rng_auxiliary: bool = False,
+    allow_atomic: bool = False,
+    allow_unspecified: bool = False,
 ) -> tuple[str, ...]:
     """Return dtype names outside the verified Ascend capability tier."""
     return tuple(
@@ -109,6 +116,14 @@ def unsupported_ascend_elementwise_dtypes(
                 "unspecified" if dtype is None else normalize_ascend_dtype(dtype)
                 for dtype in dtypes
                 if normalize_ascend_dtype(dtype) not in ASCEND_ELEMENTWISE_DTYPES
+                and not (
+                    allow_rng_auxiliary and normalize_ascend_dtype(dtype) == "int32"
+                )
+                and not (
+                    allow_atomic
+                    and normalize_ascend_dtype(dtype) in ASCEND_ATOMIC_DTYPES
+                )
+                and not (allow_unspecified and normalize_ascend_dtype(dtype) is None)
             }
         )
     )
@@ -218,7 +233,9 @@ def private_launch_abi(abi: LaunchABI, specs, outputs: tuple[str, ...]) -> Launc
     )
 
 
-def ascend_logical_domain(specs, outputs: tuple[str, ...]) -> str:
+def ascend_logical_domain(
+    specs, outputs: tuple[str, ...], *, allow_access_template: bool = False
+) -> str:
     """Build the private logical-domain expression for an Ascend artifact."""
     by_name = {spec.name: spec for spec in specs}
 
@@ -235,21 +252,13 @@ def ascend_logical_domain(specs, outputs: tuple[str, ...]) -> str:
     )
     source_shape = tuple(output.attrs.get("source_shape", output.shape))
 
-    if len(dimensions) != len(source_shape):
+    if len(dimensions) != len(source_shape) and not allow_access_template:
         raise ValueError(
             "Ascend logical-domain requires matching output and source ranks."
         )
 
-    offsets = tuple(output.attrs.get("view_offsets", ()))
-    offset = static_forward_view_offset(offsets[0]) if len(offsets) == 1 else 0
-
-    if len(offsets) > 1 and any(
-        static_forward_view_offset(value) != 0 for value in offsets
-    ):
-        raise ValueError("Ascend multidimensional logical views require zero offsets.")
-
     if len(dimensions) == 1:
-        return f"min({IndexExpr.parse(dimensions[0]).render()}, ({source_shape[0]} - {offset}))"
+        return f"min({IndexExpr.parse(dimensions[0]).render()}, ({source_shape[0]}))"
 
     def product(values) -> str:
         return (
@@ -257,7 +266,20 @@ def ascend_logical_domain(specs, outputs: tuple[str, ...]) -> str:
             or "1"
         )
 
+    if len(dimensions) != len(source_shape):
+        return product(dimensions)
+
     return f"min({product(dimensions)}, {product(source_shape)})"
+
+
+def ascend_uses_access_template(metadata: Mapping[str, Any]) -> bool:
+    """Identify private schedules that consume a public access template."""
+    schedule = dict(metadata.get("ssa_metadata", {})).get("schedule", {})
+
+    return bool(
+        dict(schedule).get("ascend_dot_loop")
+        or dict(schedule).get("ascend_attention_loop")
+    )
 
 
 def write_ascend_sidecar(
@@ -273,7 +295,11 @@ def write_ascend_sidecar(
     payload = {
         "schema": _SIDECAR_SCHEMA,
         "abi": _ascend_abi_dict(abi),
-        "logical_domain": ascend_logical_domain(specs, tuple(outputs)),
+        "logical_domain": ascend_logical_domain(
+            specs,
+            tuple(outputs),
+            allow_access_template=ascend_uses_access_template(metadata),
+        ),
         "outputs": tuple(outputs),
         "max_core_dim": dict(metadata.get("ssa_schedule", {})).get(
             "core_dim_limit", 65535
@@ -281,11 +307,27 @@ def write_ascend_sidecar(
         "reduction_schedule": dict(metadata.get("ssa_metadata", {}))
         .get("schedule", {})
         .get("reduction"),
+        "partial_reduction": dict(metadata.get("ssa_metadata", {}))
+        .get("schedule", {})
+        .get("ascend_partial_reduction"),
         "linalg_contract": dict(metadata.get("ssa_metadata", {}))
         .get("schedule", {})
         .get("ascend_linalg"),
+        "layout_contract": metadata.get("layout_transfer"),
+        "block_meta": dict(metadata.get("ssa_schedule", {})).get(
+            "ascend_block_meta", {}
+        ),
+        "advanced_contract": dict(metadata.get("ssa_metadata", {}))
+        .get("schedule", {})
+        .get("ascend_advanced"),
+        "dot_loop": dict(metadata.get("ssa_metadata", {}))
+        .get("schedule", {})
+        .get("ascend_dot_loop"),
+        "attention_loop": dict(metadata.get("ssa_metadata", {}))
+        .get("schedule", {})
+        .get("ascend_attention_loop"),
     }
-    path.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+    path.write_text(json.dumps(_json_value(payload), sort_keys=True), encoding="utf-8")
 
     return path
 
@@ -342,12 +384,237 @@ def _ascend_abi_dict(abi: LaunchABI) -> dict[str, Any]:
     }
 
 
+def _json_value(value: Any):
+    """Convert immutable IR metadata into sidecar-safe JSON primitives."""
+    if isinstance(value, Mapping):
+        return {str(key): _json_value(item) for key, item in value.items()}
+
+    if isinstance(value, (tuple, list)):
+        return [_json_value(item) for item in value]
+
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+
+    raise TypeError(
+        "Ascend private artifact sidecar contains unsupported metadata value "
+        f"of type `{type(value).__name__}`."
+    )
+
+
 def _is_index(expression: IndexExpr) -> bool:
     return expression.op == "symbol" and expression.value == "index"
 
 
 def _is_nonnegative_int(value: Any) -> bool:
     return type(value) is int and value >= 0
+
+
+def _recover_arrangement_layout_transfer(
+    program: ssa.Program, context: Context
+) -> ssa.Program:
+    """Recover the public transfer contract when arrangement metadata masks it."""
+    analysis = dict(program.metadata.get("analysis", {}))
+    if analysis.get("layout_transfer") is not None:
+        return program
+    if not any(
+        op.opcode == "linalg.transpose"
+        for block in program.blocks
+        for op in block.operations
+    ):
+        return program
+    logical_specs = tuple(replace(spec, layout=None) for spec in context.tensors)
+    transfer = analyze_layout_transfer(program, logical_specs)
+    if transfer is None or not transfer.schedulable:
+        return program
+    return replace(
+        program,
+        metadata=dict(program.metadata)
+        | {
+            "analysis": analysis | {"layout_transfer": transfer},
+            "schedule": dict(program.metadata.get("schedule", {}))
+            | {"granularity": "layout-transfer", "layout_transfer": transfer},
+        },
+    )
+
+
+def _attach_private_scan_schedule(program: ssa.Program) -> ssa.Program:
+    """Select a private scan schedule for explicit scan SSA operations."""
+    operations = tuple(_walk_operations(program.blocks))
+    scans = tuple(
+        op
+        for op in operations
+        if op.opcode in {"scan.cumsum", "scan.prefix_sum", "call.cumsum"}
+    )
+    if not scans:
+        return program
+    if len(scans) != 1 or not scans[0].results:
+        raise ValueError(
+            "Ascend prefix-scan currently requires one result-producing scan."
+        )
+    schedule = dict(program.metadata.get("schedule", {}))
+    result_shape = tuple(scans[0].results[0].type.shape)
+    extent = result_shape[0] if result_shape else "1"
+    schedule.update(
+        {
+            "granularity": "scan",
+            "scan": {"mode": "inclusive", "axis": 0, "extent": str(extent)},
+        }
+    )
+    return replace(program, metadata=dict(program.metadata) | {"schedule": schedule})
+
+
+def _ascend_advanced_contract(program: ssa.Program) -> Mapping[str, Any] | None:
+    """Validate and describe advanced operations without changing public IR."""
+    value_types = {
+        value.name: value.type for value in (*program.inputs, *program.outputs)
+    }
+    operations = tuple(_walk_operations(program.blocks))
+    for operation in operations:
+        value_types.update({value.name: value.type for value in operation.results})
+
+    rng = [op for op in operations if op.opcode == "math.rand"]
+    atomic = [op for op in operations if op.opcode == "mem.atomic_add"]
+    calls = [op for op in operations if op.opcode.startswith("call.")]
+    block_dot = [op for op in calls if op.opcode == "call.block_dot"]
+
+    if rng:
+        for operation in rng:
+            if len(operation.operands) != 2:
+                raise ValueError(
+                    "Ascend RNG requires exactly (seed, offset) operands; "
+                    "unsupported RNG ABI is fail-closed."
+                )
+            result = operation.results[0] if operation.results else None
+            dtype = (
+                normalize_ascend_dtype(getattr(result.type, "dtype", None))
+                if result
+                else None
+            )
+            if dtype not in ASCEND_RNG_DTYPES:
+                raise ValueError(
+                    f"Ascend RNG does not support dtype `{dtype}`; supported dtypes "
+                    "are float16, bfloat16, and float32."
+                )
+
+    if atomic:
+        for operation in atomic:
+            if len(operation.operands) < 2:
+                raise ValueError(
+                    "Ascend atomic_add requires destination and value operands."
+                )
+            dtype = normalize_ascend_dtype(
+                getattr(value_types.get(operation.operands[-1]), "dtype", None)
+            )
+            if dtype not in ASCEND_ATOMIC_DTYPES:
+                raise ValueError(
+                    f"Ascend atomic_add does not support dtype `{dtype}`; "
+                    "supported dtypes are float32 and int32."
+                )
+
+    for operation in calls:
+        name = operation.opcode.removeprefix("call.")
+        if name in {"flash_attention", "attention"}:
+            raise ValueError(
+                "Ascend attention requires the private block-dot contract; "
+                "generic attention calls are unsupported."
+            )
+        if name == "conv2d":
+            raise ValueError(
+                "Ascend conv2d is expressed as a generic dot-loop; standalone "
+                "call.conv2d is fail-closed."
+            )
+        if name in {"conv2d", "block_dot"} and not operation.results:
+            raise ValueError(f"Ascend {name} lowering requires one result value.")
+
+    if block_dot:
+        for operation in block_dot:
+            attrs = dict(operation.attrs)
+            if attrs.get("causal", False) and attrs.get("axis", -1) not in {-1, 1}:
+                raise ValueError(
+                    "Ascend block-dot attention supports causal masking only on the "
+                    "sequence axis."
+                )
+        return {
+            "kind": "block-dot-attention",
+            "causal": any(bool(op.attrs.get("causal", False)) for op in block_dot),
+            "online_softmax": True,
+            "count": len(block_dot),
+        }
+
+    if rng or atomic:
+        return {
+            "kind": "rng-atomic",
+            "rng": bool(rng),
+            "atomic": bool(atomic),
+            "seed_offset_abi": "seed,offset" if rng else None,
+        }
+    return None
+
+
+def _ascend_dot_loop_contract(program: ssa.Program) -> Mapping[str, Any] | None:
+    """Recognize the generic dot-reduction loop emitted by the public frontend."""
+    loops = [op for op in _walk_operations(program.blocks) if op.opcode == "scf.for"]
+    matched = []
+    for loop in loops:
+        body = loop.regions[0].operations if loop.regions else ()
+        opcodes = {op.opcode for op in body}
+        if {
+            "tensor.extract",
+            "linalg.dot",
+            "arith.add",
+            "scf.yield",
+        }.issubset(opcodes):
+            matched.append(loop)
+    if not matched:
+        return None
+    if len(matched) != 1:
+        raise ValueError(
+            "Ascend generic dot-loop lowering supports one reduction loop; "
+            "nested or multiple dot loops are not yet scheduled."
+        )
+    return {
+        "version": 1,
+        "mode": "generic-dot-loop",
+        "loop_carried": bool(dict(matched[0].attrs).get("iter_args")),
+        "layout": "public-access-template",
+        "tile": {"m": 16, "n": 16, "k": 64},
+    }
+
+
+def _ascend_attention_loop_contract(program: ssa.Program) -> Mapping[str, Any] | None:
+    """Recognize public loop-carried online-softmax SSA without new opcodes."""
+    loops = [
+        operation
+        for operation in _walk_operations(program.blocks)
+        if operation.opcode == "scf.for"
+    ]
+    candidates = []
+    for loop in loops:
+        body = tuple(_walk_operations(loop.regions))
+        opcodes = [operation.opcode for operation in body]
+        if (
+            opcodes.count("linalg.dot") == 2
+            and opcodes.count("math.exp2") >= 2
+            and "reduce.max" in opcodes
+            and "reduce.sum" in opcodes
+            and "scf.if" in opcodes
+            and len(tuple(dict(loop.attrs).get("iter_args", ()))) == 3
+        ):
+            candidates.append(loop)
+    if not candidates:
+        return None
+    if len(candidates) != 1:
+        raise ValueError(
+            "Ascend attention requires exactly one online-softmax loop; "
+            "multiple candidate loops are fail-closed."
+        )
+    return {
+        "version": 1,
+        "mode": "generic-online-softmax-loop",
+        "causal": "public-scf-if",
+        "layout": "public-access-template",
+        "status": "source-generated-cann-not-executed",
+    }
 
 
 class AscendOptimizeSchedule(OptimizeSchedule):
@@ -359,6 +626,38 @@ class AscendOptimizeSchedule(OptimizeSchedule):
     def run(self, program: ssa.Program, context: Context) -> ssa.Program:
         """Reject SSA features whose Ascend semantics are not verified yet."""
         self._validate_options(context)
+        program = _recover_arrangement_layout_transfer(program, context)
+        program = _attach_private_scan_schedule(program)
+        dot_loop = _ascend_dot_loop_contract(program)
+        if dot_loop is not None:
+            program = replace(
+                program,
+                metadata=dict(program.metadata)
+                | {
+                    "schedule": dict(program.metadata.get("schedule", {}))
+                    | {"ascend_dot_loop": dot_loop}
+                },
+            )
+        attention_loop = _ascend_attention_loop_contract(program)
+        if attention_loop is not None:
+            program = replace(
+                program,
+                metadata=dict(program.metadata)
+                | {
+                    "schedule": dict(program.metadata.get("schedule", {}))
+                    | {"ascend_attention_loop": attention_loop}
+                },
+            )
+        advanced = _ascend_advanced_contract(program)
+        if advanced is not None:
+            program = replace(
+                program,
+                metadata=dict(program.metadata)
+                | {
+                    "schedule": dict(program.metadata.get("schedule", {}))
+                    | {"ascend_advanced": advanced}
+                },
+            )
         self._validate_supported_program(program, context)
         program = _bind_ascend_matmul_dimensions(program)
 
@@ -366,15 +665,20 @@ class AscendOptimizeSchedule(OptimizeSchedule):
         # shared pass registry intentionally has no target-injected analysis
         # hook.
         program = _attach_private_alias_contract(program, context)
+        dot_loop_contract = dot_loop
         lowered = super().run(program, context)
+        lowered = _attach_partial_reduction_contract(lowered)
         linalg = _ascend_linalg_contract(program)
+        dot_loop = dot_loop_contract
 
-        if linalg is None:
+        if linalg is None and dot_loop is None:
             return lowered
 
-        schedule = dict(lowered.metadata.get("schedule", {})) | {
-            "ascend_linalg": linalg
-        }
+        schedule = dict(lowered.metadata.get("schedule", {}))
+        if linalg is not None:
+            schedule["ascend_linalg"] = linalg
+        if dot_loop is not None:
+            schedule["ascend_dot_loop"] = dot_loop
 
         return replace(
             lowered, metadata=dict(lowered.metadata) | {"schedule": schedule}
@@ -392,11 +696,6 @@ class AscendOptimizeSchedule(OptimizeSchedule):
             reduction = schedule.get("reduction", {})
 
             if reduction.get("mode") != "row-vector":
-                return ()
-
-            extent = _static_reduction_extent(reduction.get("extent"))
-
-            if extent is not None and not 0 <= extent <= 256:
                 return ()
 
             return (
@@ -418,7 +717,7 @@ class AscendOptimizeSchedule(OptimizeSchedule):
         if granularity == "blocked-linalg" and analysis.get("has_dot"):
             return (
                 ScheduleCandidate(
-                    name="ascend-matmul-scalar-loop-256",
+                    name="ascend-tiled-matmul-16x16x64",
                     schedule={
                         "tile": {"elements": 256},
                         "vector_width": 1,
@@ -428,7 +727,60 @@ class AscendOptimizeSchedule(OptimizeSchedule):
                         "dtypes": tuple(sorted(ASCEND_ELEMENTWISE_DTYPES)),
                         "layout": "contiguous",
                     },
-                    tags=("linalg", "matmul", "scalar-loop", "tail-safe"),
+                    tags=("linalg", "matmul", "tiled", "batched", "tail-safe"),
+                ),
+            )
+
+        if granularity == "layout-transfer":
+            transfer = analysis.get("layout_transfer")
+
+            if transfer is None or not transfer.schedulable:
+                return ()
+
+            return (
+                ScheduleCandidate(
+                    name="ascend-layout-transfer-16x16",
+                    schedule={
+                        "tile": {"elements": 256, "block_m": 16, "block_n": 16},
+                        "vector_width": 1,
+                        "core_dim_limit": _max_core_dim(context),
+                        "ascend_block_meta": {"TILE_M": 16, "TILE_N": 16},
+                    },
+                    constraints={"layout": "strided-non-overlapping"},
+                    tags=("layout", "transpose", "private-sidecar-meta"),
+                ),
+            )
+
+        if granularity == "scan":
+            return (
+                ScheduleCandidate(
+                    name="ascend-prefix-scan-256",
+                    schedule={
+                        "tile": {"elements": 256},
+                        "vector_width": 1,
+                        "core_dim_limit": _max_core_dim(context),
+                        "scan": {"mode": "inclusive", "axis": 0},
+                    },
+                    constraints={"layout": "contiguous", "rank": (1, 2, 3)},
+                    tags=("scan", "prefix-scan", "tail-safe"),
+                ),
+            )
+
+        if granularity == "exp-reduction-dot-region":
+            return (
+                ScheduleCandidate(
+                    name="ascend-generic-online-softmax-loop",
+                    schedule={
+                        "tile": {"elements": 256},
+                        "vector_width": 1,
+                        "core_dim_limit": _max_core_dim(context),
+                        "ascend_attention_loop": {
+                            "mode": "generic-online-softmax-loop",
+                            "status": "source-generated-cann-not-executed",
+                        },
+                    },
+                    constraints={"layout": "public-access-template"},
+                    tags=("attention", "online-softmax", "generic-ssa"),
                 ),
             )
 
@@ -495,6 +847,9 @@ class AscendOptimizeSchedule(OptimizeSchedule):
             "elementwise-grid",
             "parallel-reduction",
             "blocked-linalg",
+            "layout-transfer",
+            "scan",
+            "exp-reduction-dot-region",
         }:
             raise ValueError(
                 "Ascend backend currently supports only FP16, BF16, and FP32 "
@@ -516,21 +871,17 @@ class AscendOptimizeSchedule(OptimizeSchedule):
                     f"reduction mode `{reduction.get('mode')}`."
                 )
 
-            extent = _static_reduction_extent(reduction.get("extent"))
-
-            if extent is not None and not 0 <= extent <= 256:
-                raise ValueError(
-                    "Ascend row-vector reduction extent "
-                    f"{extent} exceeds BLOCK=256; hierarchical partial reduction "
-                    "is not implemented."
-                )
-
         tensor_dtypes = tuple(
             tensor.dtype for tensor in context.tensors if not tensor.constexpr
         ) or tuple(
             value.type.dtype for value in program.inputs if value.type.kind == "tensor"
         )
-        unsupported_dtypes = unsupported_ascend_elementwise_dtypes(tensor_dtypes)
+        advanced = dict(program.metadata.get("schedule", {})).get("ascend_advanced", {})
+        unsupported_dtypes = unsupported_ascend_elementwise_dtypes(
+            tensor_dtypes,
+            allow_rng_auxiliary=bool(advanced.get("rng")),
+            allow_atomic=bool(advanced.get("atomic")),
+        )
 
         if unsupported_dtypes:
             names = ", ".join(unsupported_dtypes)
@@ -551,20 +902,81 @@ class AscendOptimizeSchedule(OptimizeSchedule):
                 f"unsupported tensors: {names}."
             )
 
+        private_schedule = dict(program.metadata.get("schedule", {}))
+        allow_rank4_dot_loop = (
+            "ascend_dot_loop" in private_schedule
+            or "ascend_attention_loop" in private_schedule
+        )
         unsupported_views = [
             tensor.name
             for tensor in context.tensors
-            if not tensor.constexpr and not _is_supported_logical_view(tensor)
+            if not tensor.constexpr
+            and not _is_supported_logical_view(
+                tensor,
+                allow_rank4_dot_loop=allow_rank4_dot_loop,
+            )
         ]
 
         if unsupported_views:
             names = ", ".join(unsupported_views)
             raise ValueError(
-                "Ascend backend supports only contiguous base tensors, one-dimensional "
-                "static forward views, and zero-offset multidimensional views; "
-                "unsupported tensors: "
-                f"{names}."
+                "Ascend backend supports only rank 0 through 3 logical views; "
+                "concrete stride, overlap, and storage-span admission occurs in the "
+                f"Ascend materializer. Unsupported tensors: {names}."
             )
+
+
+def _partial_reduction_stages(
+    extent: Any, block: int = 256
+) -> tuple[Mapping[str, Any], ...]:
+    """Describe a bounded fan-in reduction tree for Ascend private metadata."""
+    value = _static_reduction_extent(extent)
+    if value is None or value <= block:
+        return ()
+    stages = []
+    current = value
+    stage = 0
+    while current > block:
+        outputs = (current + block - 1) // block
+        stages.append(
+            {
+                "stage": stage,
+                "input_extent": current,
+                "output_extent": outputs,
+                "block": block,
+            }
+        )
+        current = outputs
+        stage += 1
+    stages.append(
+        {"stage": stage, "input_extent": current, "output_extent": 1, "block": block}
+    )
+    return tuple(stages)
+
+
+def _attach_partial_reduction_contract(program: ssa.Program) -> ssa.Program:
+    schedule = dict(program.metadata.get("schedule", {}))
+    reduction = schedule.get("reduction")
+    if not isinstance(reduction, Mapping) or reduction.get("mode") != "row-vector":
+        return program
+    stages = _partial_reduction_stages(reduction.get("extent"))
+    if not stages:
+        return program
+    schedule["ascend_partial_reduction"] = {
+        "version": 1,
+        "block": 256,
+        "stages": stages,
+        "strategy": "hierarchical-private-stages",
+        "operator": _reduction_operator(program),
+    }
+    return replace(program, metadata=dict(program.metadata) | {"schedule": schedule})
+
+
+def _reduction_operator(program: ssa.Program) -> str:
+    for operation in _walk_operations(program.blocks):
+        if operation.opcode in {"reduce.sum", "reduce.min", "reduce.max"}:
+            return operation.opcode.removeprefix("reduce.")
+    return "sum"
 
 
 def _attach_private_alias_contract(
@@ -639,6 +1051,15 @@ def _ascend_linalg_contract(program: ssa.Program) -> Mapping[str, Any] | None:
     if not linalg:
         return None
 
+    if _ascend_attention_loop_contract(program) is not None or (
+        any(op.opcode in {"math.exp", "math.exp2"} for op in operations)
+        and any(op.opcode == "scf.for" for op in operations)
+    ):
+        return None
+
+    if len(linalg) == 1 and linalg[0].opcode == "linalg.dot":
+        if _ascend_dot_loop_contract(program) is not None:
+            return None
     if len(linalg) != 1 or linalg[0].opcode != "linalg.matmul":
         raise ValueError(
             "Ascend basic linalg support requires exactly one `linalg.matmul` "
@@ -666,36 +1087,41 @@ def _ascend_linalg_contract(program: ssa.Program) -> Mapping[str, Any] | None:
         or lhs.kind != "tensor"
         or rhs.kind != "tensor"
         or result.kind != "tensor"
-        or len(lhs.shape) != 2
-        or len(rhs.shape) != 2
-        or len(result.shape) != 2
+        or len(lhs.shape) not in {2, 3}
+        or len(rhs.shape) != len(lhs.shape)
+        or len(result.shape) != len(lhs.shape)
     ):
         raise ValueError(
-            "Ascend matmul supports only rank-2 contiguous matrix operands and output."
+            "Ascend matmul supports only rank-2 or rank-3 contiguous matrix operands and output."
         )
 
-    m, k = (str(value) for value in lhs.shape)
-    rhs_k, n = (str(value) for value in rhs.shape)
-    result_m, result_n = (str(value) for value in result.shape)
+    rank = len(lhs.shape)
+    if rank == 2:
+        m, k = (str(value) for value in lhs.shape)
+        rhs_k, n = (str(value) for value in rhs.shape)
+        result_m, result_n = (str(value) for value in result.shape)
+        batch = None
+    else:
+        batch, m, k = (str(value) for value in lhs.shape)
+        rhs_batch, rhs_k, n = (str(value) for value in rhs.shape)
+        result_batch, result_m, result_n = (str(value) for value in result.shape)
+        if batch != rhs_batch or batch != result_batch:
+            raise ValueError(
+                "Ascend batched matmul requires matching batch dimensions."
+            )
 
     if (m, n) != (result_m, result_n) or k != rhs_k:
         raise ValueError("Ascend matmul requires lhs[M,K] @ rhs[K,N] -> output[M,N].")
 
-    extent = _static_reduction_extent(k)
-
-    if extent is not None and not 0 <= extent <= 256:
-        raise ValueError(
-            "Ascend matmul reduction extent "
-            f"{extent} exceeds BLOCK=256; hierarchical partial reduction is not "
-            "implemented."
-        )
-
     return {
-        "mode": "matrix-scalar-loop",
+        "mode": "tiled-matmul",
         "lhs": operation.operands[0],
         "rhs": operation.operands[1],
-        "output_shape": (m, n),
+        "output_shape": (m, n) if rank == 2 else (batch, m, n),
         "reduction_extent": k,
+        "rank": rank,
+        "batch": batch,
+        "tile": {"m": 16, "n": 16, "k": 64},
     }
 
 
@@ -828,34 +1254,19 @@ def _logical_view(tensor) -> Mapping[str, str]:
     }
 
 
-def _is_supported_logical_view(tensor) -> bool:
-    if tensor.ndim == 0:
+def _is_supported_logical_view(tensor, *, allow_rank4_dot_loop: bool = False) -> bool:
+    # Recognized dot-loop contracts consume the public access template rather
+    # than the ordinary rank-preserving logical-view path.
+    if allow_rank4_dot_loop:
         return True
+
+    if tensor.ndim not in {0, 1, 2, 3}:
+        return False
 
     if tensor.layout is None:
         return True
 
-    rank = len(tensor.layout.application_shape)
-
-    if rank != tensor.ndim or rank == 0:
-        return False
-
-    attrs = dict(tensor.attrs)
-    offsets = tuple(attrs.get("view_offsets", ()))
-
-    if not offsets:
-        return True
-
-    if len(offsets) != rank:
-        return False
-
-    if rank == 1:
-        return is_static_forward_view_offset(offsets[0])
-
-    return all(
-        is_static_forward_view_offset(offset) and str(offset) == "0"
-        for offset in offsets
-    )
+    return len(tensor.layout.application_shape) == tensor.ndim
 
 
 def register_ssa_passes(registry: "Registry") -> None:

@@ -2,6 +2,8 @@ import pytest
 
 from ninetoothed import Tensor
 from ninetoothed.backends.ascend import (
+    _ascend_advanced_contract,
+    _ascend_attention_loop_contract,
     ascend_logical_domain,
     is_static_forward_view_offset,
     static_forward_view_offset,
@@ -11,7 +13,7 @@ from ninetoothed.compiler import DEFAULT_COMPILER, CompileRequest
 from ninetoothed.compiler.passes import lower_for_target
 from ninetoothed.frontend.layout import tensor_specs
 from ninetoothed.frontend.python import from_source
-from ninetoothed.ir import TensorSpec
+from ninetoothed.ir import TensorSpec, ssa
 
 
 def _program(source: str, tensors: tuple[TensorSpec, ...], kind: str):
@@ -30,6 +32,95 @@ def _elementwise_program(dtype: str = "float32"):
             TensorSpec(ndim=1, shape=("n",), dtype=dtype, name="out"),
         ),
         "add",
+    )
+
+
+def test_ascend_rng_contract_requires_seed_and_offset():
+    tensors = (
+        TensorSpec(ndim=1, shape=("128",), dtype="float32", name="out"),
+        TensorSpec(ndim=0, shape=(), dtype="int32", name="seed"),
+        TensorSpec(ndim=1, shape=("128",), dtype="int32", name="offset"),
+    )
+    program = _program(
+        "\ndef random(out, seed, offset):\n    out = rand(seed, offset)\n",
+        tensors,
+        "random",
+    )
+    contract = _ascend_advanced_contract(program)
+    assert contract["kind"] == "rng-atomic"
+    assert contract["seed_offset_abi"] == "seed,offset"
+
+
+def test_ascend_advanced_contract_rejects_unlowered_conv():
+    operation = ssa.Operation(
+        opcode="call.conv2d",
+        operands=("x",),
+        results=(
+            ssa.Value(
+                name="%0",
+                type=ssa.Type(kind="tensor", shape=("128",), dtype="float32"),
+            ),
+        ),
+    )
+    program = ssa.Program(
+        kind="conv",
+        inputs=(
+            ssa.Value(
+                name="x", type=ssa.Type(kind="tensor", shape=("128",), dtype="float32")
+            ),
+        ),
+        outputs=(
+            ssa.Value(
+                name="out",
+                type=ssa.Type(kind="tensor", shape=("128",), dtype="float32"),
+            ),
+        ),
+        blocks=(ssa.Block(operations=(operation,)),),
+    )
+    with pytest.raises(ValueError, match="generic dot-loop"):
+        _ascend_advanced_contract(program)
+
+
+def test_ascend_attention_contract_rejects_incomplete_loop_carried_ssa():
+    value = ssa.Value(name="%v", type=ssa.Type(kind="scalar", dtype="float32"))
+    loop = ssa.Operation(
+        opcode="scf.for",
+        operands=("%zero", "%extent", "%one", "%state"),
+        results=(value,),
+        attrs={"iter_args": ({"name": "state"},)},
+        regions=(
+            ssa.Block(
+                operations=(
+                    ssa.Operation(opcode="linalg.dot"),
+                    ssa.Operation(opcode="math.exp"),
+                    ssa.Operation(opcode="scf.yield", operands=("%state",)),
+                )
+            ),
+        ),
+    )
+    program = ssa.Program(kind="attention", blocks=(ssa.Block(operations=(loop,)),))
+    assert _ascend_attention_loop_contract(program) is None
+
+
+def test_ascend_attention_contract_rejects_unrelated_exp_dot_loop():
+    loop = ssa.Operation(
+        opcode="scf.for",
+        attrs={"iter_args": ({"name": "state"},)},
+        regions=(
+            ssa.Block(
+                operations=(
+                    ssa.Operation(opcode="linalg.dot"),
+                    ssa.Operation(opcode="math.exp2"),
+                    ssa.Operation(opcode="scf.yield"),
+                )
+            ),
+        ),
+    )
+    assert (
+        _ascend_attention_loop_contract(
+            ssa.Program(kind="unrelated", blocks=(ssa.Block(operations=(loop,)),))
+        )
+        is None
     )
 
 
@@ -122,14 +213,14 @@ def test_ascend_launch_plan_carries_static_offset_logical_domain():
 
 
 @pytest.mark.parametrize(
-    ("arrangement", "rank", "domain"),
+    ("arrangement", "rank", "dimensions"),
     (
-        (_matrix_arrangement, 2, "min(((1 * 17) * 31),"),
-        (_volume_arrangement, 3, "min((((1 * 2) * 17) * 31),"),
+        (_matrix_arrangement, 2, ("(17)", "(31)")),
+        (_volume_arrangement, 3, ("(2)", "(17)", "(31)")),
     ),
 )
 def test_ascend_launch_plan_accepts_contiguous_multidimensional_logical_domains(
-    arrangement, rank, domain
+    arrangement, rank, dimensions
 ):
     compilation = DEFAULT_COMPILER.compile(
         CompileRequest(
@@ -140,9 +231,11 @@ def test_ascend_launch_plan_accepts_contiguous_multidimensional_logical_domains(
         )
     )
 
-    assert ascend_logical_domain(
+    domain = ascend_logical_domain(
         compilation.kernel.tensors, compilation.artifact.metadata["outputs"]
-    ).startswith(domain)
+    )
+    assert domain.startswith("min(")
+    assert all(dimension in domain for dimension in dimensions)
     analysis = compilation.artifact.metadata["ssa_metadata"]["ascend_alias_analysis"]
     assert (
         analysis["logical_views"]["input"]["domain"]
@@ -234,7 +327,7 @@ def test_ascend_rejects_unspecified_runtime_dtype_before_source_emission():
         )
 
 
-def test_ascend_rejects_layout_transfer_before_source_emission():
+def test_ascend_emits_private_layout_transfer_schedule():
     program = _program(
         "\ndef transpose(x, out):\n    out = x.T\n",
         (
@@ -244,8 +337,13 @@ def test_ascend_rejects_layout_transfer_before_source_emission():
         "transpose",
     )
 
-    with pytest.raises(ValueError, match="granularity `layout-transfer`"):
-        lower_for_target(program, backend=Target.ASCEND)
+    lowered = lower_for_target(program, backend=Target.ASCEND)
+
+    assert lowered.metadata["schedule"]["granularity"] == "layout-transfer"
+    assert lowered.metadata["schedule"]["ascend_block_meta"] == {
+        "TILE_M": 16,
+        "TILE_N": 16,
+    }
 
 
 def test_ascend_accepts_emittable_row_vector_reduction_schedule():
@@ -286,7 +384,7 @@ def test_ascend_rejects_non_emittable_reduction_schedule():
         lower_for_target(program, backend=Target.ASCEND)
 
 
-def test_ascend_rejects_partial_reduction_above_fixed_block():
+def test_ascend_selects_private_partial_reduction_above_fixed_block():
     program = _program(
         "\ndef reduce(x, out):\n    out = sum(x, axis=1)\n",
         (
@@ -296,15 +394,40 @@ def test_ascend_rejects_partial_reduction_above_fixed_block():
         "reduce",
     )
 
-    with pytest.raises(ValueError, match="exceeds BLOCK=256"):
-        lower_for_target(
-            program,
-            backend=Target.ASCEND,
-            tensors=(
-                TensorSpec(ndim=2, shape=("rows", "257"), dtype="float32", name="x"),
-                TensorSpec(ndim=1, shape=("rows",), dtype="float32", name="out"),
-            ),
-        )
+    lowered = lower_for_target(
+        program,
+        backend=Target.ASCEND,
+        tensors=(
+            TensorSpec(ndim=2, shape=("rows", "257"), dtype="float32", name="x"),
+            TensorSpec(ndim=1, shape=("rows",), dtype="float32", name="out"),
+        ),
+    )
+    stages = lowered.metadata["schedule"]["ascend_partial_reduction"]["stages"]
+    assert stages[0]["input_extent"] == 257
+    assert stages[-1]["output_extent"] == 1
+
+
+@pytest.mark.ascend_next_stage
+def test_ascend_partial_reduction_metadata_has_bounded_stages():
+    program = _program(
+        "\ndef reduce(x, out):\n    out = sum(x, axis=1)\n",
+        (
+            TensorSpec(ndim=2, shape=("rows", "1025"), dtype="float32", name="x"),
+            TensorSpec(ndim=1, shape=("rows",), dtype="float32", name="out"),
+        ),
+        "reduce",
+    )
+    lowered = lower_for_target(
+        program,
+        backend=Target.ASCEND,
+        tensors=(
+            TensorSpec(ndim=2, shape=("rows", "1025"), dtype="float32", name="x"),
+            TensorSpec(ndim=1, shape=("rows",), dtype="float32", name="out"),
+        ),
+    )
+    contract = lowered.metadata["schedule"]["ascend_partial_reduction"]
+    assert contract["strategy"] == "hierarchical-private-stages"
+    assert [stage["output_extent"] for stage in contract["stages"]] == [5, 1]
 
 
 def test_ascend_accepts_structured_contiguous_tiled_layouts():
@@ -399,26 +522,24 @@ def test_ascend_accepts_decomposed_contiguous_matmul_schedule():
     assert lowered.metadata["schedule"]["granularity"] == "blocked-linalg"
     assert (
         lowered.metadata["selected_schedule_candidate"]
-        == "ascend-matmul-scalar-loop-256"
+        == "ascend-tiled-matmul-16x16x64"
     )
     assert lowered.metadata["schedule"]["ascend_linalg"]["reduction_extent"] == "k"
 
 
-def test_ascend_rejects_matmul_partial_reduction_above_fixed_block():
+def test_ascend_accepts_matmul_partial_reduction_above_fixed_block():
     tensors = (
         TensorSpec(ndim=2, shape=("m", "257"), dtype="float32", name="a"),
         TensorSpec(ndim=2, shape=("257", "n"), dtype="float32", name="b"),
         TensorSpec(ndim=2, shape=("m", "n"), dtype="float32", name="out"),
     )
 
-    with pytest.raises(
-        ValueError, match="matmul reduction extent 257 exceeds BLOCK=256"
-    ):
-        lower_for_target(
-            _program("\ndef matmul(a, b, out):\n    out = a @ b\n", tensors, "matmul"),
-            backend=Target.ASCEND,
-            tensors=tensors,
-        )
+    lowered = lower_for_target(
+        _program("\ndef matmul(a, b, out):\n    out = a @ b\n", tensors, "matmul"),
+        backend=Target.ASCEND,
+        tensors=tensors,
+    )
+    assert lowered.metadata["schedule"]["ascend_linalg"]["reduction_extent"] == "257"
 
 
 def test_ascend_rejects_cuda_schedule_parameters():

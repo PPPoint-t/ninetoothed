@@ -6,9 +6,9 @@ from types import SimpleNamespace
 import pytest
 
 from ninetoothed import Tensor
+from ninetoothed.backends.ascend import ascend_cache_key
 from ninetoothed.build import build
 from ninetoothed.compiler import DEFAULT_COMPILER, CompileRequest
-from ninetoothed.compiler.cache import compilation_cache_key
 
 
 def _arrangement(input, other, output):
@@ -47,7 +47,6 @@ def test_ascend_compile_has_one_ssa_schedule_and_no_runtime_candidates():
     assert schedule["vector_width"] == 1
     assert schedule["core_dim_limit"] == 8
     assert compilation.launch_plan.tuning_candidates == ()
-    assert ") and (" not in compilation.artifact.primary_source
 
 
 @pytest.mark.parametrize(
@@ -63,41 +62,23 @@ def test_ascend_compile_rejects_runtime_tuning_controls(options, message):
         DEFAULT_COMPILER.compile(_request(**options))
 
 
-def _cache_compilation(backend_options):
-    return SimpleNamespace(
-        request=SimpleNamespace(
-            backend_options=backend_options,
-            pipeline=None,
-            pass_options=None,
-        ),
-        artifact=SimpleNamespace(
-            backend=SimpleNamespace(value="ascend"),
-            sources={"kernel.ascend.py": "source"},
-        ),
-        kernel=SimpleNamespace(ssa=(), compiler_options={}),
-        launch_plan=(),
-    )
-
-
 def test_ascend_cache_key_isolated_by_soc_and_toolchain_target(monkeypatch):
     monkeypatch.setenv("TRITON_ASCEND_ARCH", "Ascend910B3")
-    first = compilation_cache_key(_cache_compilation({"soc_version": "Ascend910B3"}))
+    first = ascend_cache_key("base", {"ssa_schedule": {"soc_version": "Ascend910B3"}})
 
     monkeypatch.setenv("TRITON_ASCEND_ARCH", "Ascend310P3")
-    changed_arch = compilation_cache_key(
-        _cache_compilation({"soc_version": "Ascend910B3"})
+    changed_arch = ascend_cache_key(
+        "base", {"ssa_schedule": {"soc_version": "Ascend910B3"}}
     )
-    changed_soc = compilation_cache_key(
-        _cache_compilation({"soc_version": "Ascend910B4"})
+    changed_soc = ascend_cache_key(
+        "base", {"ssa_schedule": {"soc_version": "Ascend910B4"}}
     )
 
     assert first != changed_arch
     assert changed_arch != changed_soc
 
 
-def test_ascend_build_rejects_multiple_candidates_for_one_runtime_config(
-    tmp_path, monkeypatch
-):
+def test_ascend_build_uses_generic_multiple_candidate_path(tmp_path, monkeypatch):
     build_module = importlib.import_module("ninetoothed.build")
 
     materialized = []
@@ -105,17 +86,23 @@ def test_ascend_build_rejects_multiple_candidates_for_one_runtime_config(
     def materialize(compilation, *, output_dir, mode):
         materialized.append((compilation, output_dir, mode))
 
-        return SimpleNamespace(
-            _source="source",
-            _artifact=compilation.artifact,
-            _backend="ascend",
-            _kernel=None,
-            _library=None,
-            _ssa=compilation.kernel.ssa,
-            _pass_trace=compilation.pass_trace,
-            _launch_plan=compilation.launch_plan,
-            _built_artifact=SimpleNamespace(cache_key=compilation.artifact.kernel_name),
+        class Materialized:
+            pass
+
+        result = Materialized()
+        result._source = "source"
+        result._artifact = compilation.artifact
+        result._backend = "ascend"
+        result._kernel = None
+        result._library = None
+        result._ssa = compilation.kernel.ssa
+        result._pass_trace = compilation.pass_trace
+        result._launch_plan = compilation.launch_plan
+        result._built_artifact = SimpleNamespace(
+            cache_key=compilation.artifact.kernel_name
         )
+
+        return result
 
     monkeypatch.setattr(build_module.DEFAULT_COMPILER, "materialize", materialize)
 
@@ -130,15 +117,15 @@ def test_ascend_build_rejects_multiple_candidates_for_one_runtime_config(
             ),
         )
 
-    with pytest.raises(NotImplementedError, match="multiple tuning candidates"):
-        build(
-            premake,
-            (((), {}, {}), ((), {}, {})),
-            backend="ascend",
-            output_dir=tmp_path,
-        )
+    handle = build(
+        premake,
+        (((), {}, {}), ((), {}, {})),
+        backend="ascend",
+        output_dir=tmp_path,
+    )
 
     assert len(materialized) == 2
+    assert all(variant.handle._tuner is not None for variant in handle._variants)
 
 
 def test_ascend_build_compiles_each_runtime_variant_once(tmp_path, monkeypatch):

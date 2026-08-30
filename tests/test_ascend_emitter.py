@@ -7,7 +7,7 @@ from ninetoothed.backends.core import Target
 from ninetoothed.backends.emitters.ascend import diagnose_opcode_coverage
 from ninetoothed.compiler.passes import lower_for_target
 from ninetoothed.frontend.python import from_source
-from ninetoothed.ir import Kernel, TensorSpec
+from ninetoothed.ir import Kernel, TensorSpec, ssa
 
 
 def _kernel(
@@ -65,10 +65,103 @@ def test_ascend_emits_pow_from_generic_ssa():
     ast.parse(source)
 
 
+def test_ascend_emits_rand_with_seed_offset_abi():
+    tensors = (
+        TensorSpec(ndim=1, shape=("128",), dtype="float32", name="out"),
+        TensorSpec(ndim=0, shape=(), dtype="int32", name="seed"),
+        TensorSpec(ndim=1, shape=("128",), dtype="int32", name="offset"),
+    )
+    program = from_source(
+        "\ndef random(out, seed, offset):\n    out = rand(seed, offset)\n",
+        tensors,
+        kind="random",
+    )
+    kernel = Kernel(
+        kernel_name="random",
+        source="",
+        source_language="test",
+        entrypoint="random",
+        tensors=tensors,
+        ssa=program,
+    )
+    source = emit(kernel, Target.ASCEND).primary_source
+    assert "tl.rand(seed, tl.load(offset + index" in source
+    ast.parse(source)
+
+
+def test_ascend_emits_explicit_prefix_scan_ssa():
+    tensors = (
+        TensorSpec(ndim=1, shape=("128",), dtype="float32", name="x"),
+        TensorSpec(ndim=1, shape=("128",), dtype="float32", name="out"),
+    )
+    value = ssa.Value(
+        name="%scan", type=ssa.Type(kind="tensor", shape=("128",), dtype="float32")
+    )
+    program = ssa.Program(
+        kind="scan",
+        inputs=(
+            ssa.Value(
+                name="x", type=ssa.Type(kind="tensor", shape=("128",), dtype="float32")
+            ),
+            ssa.Value(
+                name="out",
+                type=ssa.Type(kind="tensor", shape=("128",), dtype="float32"),
+            ),
+        ),
+        blocks=(
+            ssa.Block(
+                operations=(
+                    ssa.Operation(
+                        opcode="call.cumsum", operands=("x",), results=(value,)
+                    ),
+                    ssa.Operation(opcode="mem.store", operands=("%scan", "out")),
+                )
+            ),
+        ),
+        metadata={
+            "schedule": {
+                "granularity": "scan",
+                "tile": {"elements": 256},
+                "scan": {"mode": "inclusive", "axis": 0, "extent": "128"},
+            }
+        },
+    )
+    kernel = Kernel(
+        kernel_name="scan",
+        source="",
+        source_language="test",
+        entrypoint="scan",
+        tensors=tensors,
+        ssa=program,
+    )
+    source = emit(kernel, Target.ASCEND).primary_source
+    assert "tl.cumsum" in source
+    ast.parse(source)
+
+
+@pytest.mark.parametrize("intrinsic", ("exp", "exp2", "log", "sqrt", "tanh"))
+def test_ascend_emits_math_intrinsics_from_generic_ssa(intrinsic):
+    kernel = _kernel(
+        f"\ndef math_op(x, out):\n    out = {intrinsic}(x)\n",
+        name="math_op",
+        tensors=(
+            TensorSpec(ndim=1, shape=("n",), dtype="float32", name="x"),
+            TensorSpec(ndim=1, shape=("n",), dtype="float32", name="out"),
+        ),
+    )
+
+    source = emit(kernel, Target.ASCEND).primary_source
+
+    assert f"tl.{intrinsic}(" in source
+    ast.parse(source)
+
+
 def test_ascend_emits_fill_from_tensor_full():
-    kernel = _kernel("\ndef fill(out):\n    out = full((n,), 2.5)\n", name="fill", tensors=(
-        TensorSpec(ndim=1, shape=("n",), dtype="float32", name="out"),
-    ))
+    kernel = _kernel(
+        "\ndef fill(out):\n    out = full((n,), 2.5)\n",
+        name="fill",
+        tensors=(TensorSpec(ndim=1, shape=("n",), dtype="float32", name="out"),),
+    )
 
     source = emit(kernel, Target.ASCEND).primary_source
 
@@ -94,11 +187,36 @@ def test_ascend_emits_contiguous_view_and_index_offset():
     ast.parse(source)
 
 
+def test_ascend_consumes_public_layout_transfer_coordinate_maps():
+    tensors = (
+        TensorSpec(ndim=2, shape=("m", "n"), dtype="float32", name="x"),
+        TensorSpec(ndim=2, shape=("n", "m"), dtype="float32", name="out"),
+    )
+    source = "\ndef transpose(x, out):\n    out = x.T\n"
+    program = from_source(source, tensors, kind="transpose")
+    assert program is not None
+    lowered = lower_for_target(program, backend=Target.ASCEND, tensors=tensors)
+
+    assert lowered.metadata["schedule"]["layout_transfer"] is not None
+    kernel = Kernel(
+        kernel_name="transpose",
+        source=source,
+        source_language="ninetoothed-python",
+        entrypoint="transpose",
+        tensors=tensors,
+        ssa=lowered,
+    )
+    artifact = emit(kernel, Target.ASCEND)
+
+    assert "tl.trans(" in artifact.primary_source
+    assert "source_value_0" in artifact.primary_source
+    assert "destination_value_0" in artifact.primary_source
+    ast.parse(artifact.primary_source)
+
+
 def test_ascend_emits_structured_loop_and_if():
     kernel = _kernel(
-        "\ndef control(x, out):\n"
-        "    for i in range(n):\n"
-        "        out[i] = x[i] + 1.0\n",
+        "\ndef control(x, out):\n    for i in range(n):\n        out[i] = x[i] + 1.0\n",
         name="control",
         tensors=(
             TensorSpec(ndim=1, shape=("n",), dtype="float32", name="x"),
@@ -113,6 +231,32 @@ def test_ascend_emits_structured_loop_and_if():
     ast.parse(source)
 
 
+def test_ascend_emits_nested_if_and_for_from_structured_ssa():
+    kernel = _kernel(
+        """
+def nested_control(x, out):
+    for i in range(n):
+        if x[i] > 0.0:
+            out[i] = exp(x[i])
+        else:
+            out[i] = log(x[i] + 1.0)
+""",
+        name="nested_control",
+        tensors=(
+            TensorSpec(ndim=1, shape=("n",), dtype="float32", name="x"),
+            TensorSpec(ndim=1, shape=("n",), dtype="float32", name="out"),
+        ),
+    )
+
+    source = emit(kernel, Target.ASCEND).primary_source
+
+    assert "for loop_i in range(0, n, 1):" in source
+    assert "if v4_loop_body:" in source
+    assert "tl.exp(" in source
+    assert "tl.log(" in source
+    ast.parse(source)
+
+
 def test_ascend_emits_row_vector_reduction():
     kernel = _kernel(
         "\ndef reduce(x, out):\n    out = sum(x, axis=1)\n",
@@ -122,7 +266,9 @@ def test_ascend_emits_row_vector_reduction():
             TensorSpec(ndim=1, shape=("rows",), dtype="float32", name="out"),
         ),
     )
-    lowered = lower_for_target(kernel.ssa, backend=Target.ASCEND, tensors=kernel.tensors)
+    lowered = lower_for_target(
+        kernel.ssa, backend=Target.ASCEND, tensors=kernel.tensors
+    )
     kernel = Kernel(
         kernel_name=kernel.kernel_name,
         source=kernel.source,
@@ -181,9 +327,7 @@ def test_ascend_emits_decomposed_matmul_with_tail_safe_loads():
         (
             "\ndef reduce(x, out):\n    out = max(x, axis=0)\n",
             (
-                TensorSpec(
-                    ndim=2, shape=("rows", "cols"), dtype="float32", name="x"
-                ),
+                TensorSpec(ndim=2, shape=("rows", "cols"), dtype="float32", name="x"),
                 TensorSpec(ndim=1, shape=("cols",), dtype="float32", name="out"),
             ),
             "tl.max(",
@@ -228,7 +372,7 @@ def test_ascend_canonicalizes_unary_positive_to_its_operand():
 
     source = emit(kernel, Target.ASCEND).primary_source
 
-    assert "v0 = tl.load(x + index, mask=mask, other=0.0)" in source
+    assert "v0 = (tl.load(x + index, mask=mask, other=0.0)" in source
     assert "+tl.load(" not in source
     ast.parse(source)
 
@@ -249,6 +393,24 @@ def test_ascend_emits_scalar_abi_input_by_value():
 
     assert "* alpha" in source
     assert "tl.load(alpha" not in source
+    ast.parse(source)
+
+
+def test_ascend_emits_mixed_scalar_vector_type_promotion():
+    source = emit(
+        _kernel(
+            "\ndef scale(x, alpha, out):\n    out = x + alpha\n",
+            name="scale",
+            tensors=(
+                TensorSpec(ndim=1, shape=("n",), dtype="float16", name="x"),
+                TensorSpec(ndim=0, shape=(), dtype="float32", name="alpha"),
+                TensorSpec(ndim=1, shape=("n",), dtype="float32", name="out"),
+            ),
+        ),
+        Target.ASCEND,
+    ).primary_source
+
+    assert " + alpha" in source
     ast.parse(source)
 
 

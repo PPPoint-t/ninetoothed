@@ -4,16 +4,12 @@ import types
 from pathlib import Path
 from typing import Any, Mapping
 
-import triton
-import triton.language as tl
-
 from ninetoothed.backends.ascend import (
     ascend_abi_from_dict,
     ascend_cache_key,
     ascend_logical_domain,
     ascend_uses_access_template,
     normalize_ascend_dtype,
-    private_launch_abi,
     read_ascend_sidecar,
     static_forward_view_offset,
     unsupported_ascend_elementwise_dtypes,
@@ -34,91 +30,6 @@ from ninetoothed.compiler.cache import (
     write_manifest,
     write_source,
 )
-
-
-@triton.jit
-def _ascend_partial_sum_kernel(
-    inp, out, input_extent, output_extent, BLOCK: tl.constexpr
-):
-    pid = tl.program_id(0)
-    row = pid // output_extent
-    chunk = pid % output_extent
-    offsets = chunk * BLOCK + tl.arange(0, BLOCK)
-    mask = offsets < input_extent
-    values = tl.load(inp + row * input_extent + offsets, mask=mask, other=0.0)
-    tl.store(
-        out + row * output_extent + chunk, tl.sum(tl.where(mask, values, 0.0), axis=0)
-    )
-
-
-@triton.jit
-def _ascend_partial_max_kernel(
-    inp, out, input_extent, output_extent, BLOCK: tl.constexpr
-):
-    pid = tl.program_id(0)
-    row = pid // output_extent
-    chunk = pid % output_extent
-    offsets = chunk * BLOCK + tl.arange(0, BLOCK)
-    mask = offsets < input_extent
-    values = tl.load(inp + row * input_extent + offsets, mask=mask, other=-float("inf"))
-    tl.store(
-        out + row * output_extent + chunk,
-        tl.max(tl.where(mask, values, -float("inf")), axis=0),
-    )
-
-
-@triton.jit
-def _ascend_partial_min_kernel(
-    inp, out, input_extent, output_extent, BLOCK: tl.constexpr
-):
-    pid = tl.program_id(0)
-    row = pid // output_extent
-    chunk = pid % output_extent
-    offsets = chunk * BLOCK + tl.arange(0, BLOCK)
-    mask = offsets < input_extent
-    values = tl.load(inp + row * input_extent + offsets, mask=mask, other=float("inf"))
-    tl.store(
-        out + row * output_extent + chunk,
-        tl.min(tl.where(mask, values, float("inf")), axis=0),
-    )
-
-
-@triton.jit
-def _ascend_tiled_matmul_kernel(
-    lhs,
-    rhs,
-    out,
-    m,
-    n,
-    k,
-    batch,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    BLOCK_K: tl.constexpr,
-):
-    pid = tl.program_id(0)
-    tiles_n = (n + BLOCK_N - 1) // BLOCK_N
-    tiles_m = (m + BLOCK_M - 1) // BLOCK_M
-    tile = pid % (tiles_m * tiles_n)
-    batch_id = pid // (tiles_m * tiles_n)
-    tile_m = tile // tiles_n
-    tile_n = tile % tiles_n
-    rows = tile_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    cols = tile_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-    for k0 in range(0, k, BLOCK_K):
-        kk = k0 + tl.arange(0, BLOCK_K)
-        lhs_ptrs = lhs + batch_id * m * k + rows[:, None] * k + kk[None, :]
-        rhs_ptrs = rhs + batch_id * k * n + kk[:, None] * n + cols[None, :]
-        lhs_vals = tl.load(
-            lhs_ptrs, mask=(rows[:, None] < m) & (kk[None, :] < k), other=0.0
-        )
-        rhs_vals = tl.load(
-            rhs_ptrs, mask=(kk[:, None] < k) & (cols[None, :] < n), other=0.0
-        )
-        acc += tl.dot(lhs_vals, rhs_vals, out_dtype=tl.float32)
-    out_ptrs = out + batch_id * m * n + rows[:, None] * n + cols[None, :]
-    tl.store(out_ptrs, acc, mask=(rows[:, None] < m) & (cols[None, :] < n))
 
 
 class AscendMaterializer(Materializer):
@@ -147,7 +58,7 @@ class AscendMaterializer(Materializer):
 
         specs = _runtime_specs(built.source)
         sidecar = read_ascend_sidecar(source_path)
-        abi = ascend_abi_from_dict(sidecar["abi"])
+        abi = ascend_abi_from_dict(sidecar["launch_abi"])
         tensor_sources = {
             binding.source for binding in abi.kernel_args if binding.kind == "tensor"
         }
@@ -173,15 +84,14 @@ class AscendMaterializer(Materializer):
         return _ascend_wrapper(
             launch,
             abi,
-            tensor_specs,
+            specs,
             source_path=source_path,
             kernel_name=built.source.kernel_name,
             max_core_dim=sidecar["max_core_dim"],
             module=module,
+            dtype_specs=tensor_specs,
             logical_domain=sidecar["logical_domain"],
             reduction_schedule=sidecar.get("reduction_schedule"),
-            partial_reduction=sidecar.get("partial_reduction"),
-            linalg_contract=sidecar.get("linalg_contract"),
             layout_contract=sidecar.get("layout_contract"),
             advanced_contract=sidecar.get("advanced_contract"),
             dot_loop=sidecar.get("dot_loop"),
@@ -215,11 +125,7 @@ def _materialize(compilation, *, output_dir: str | Path | None):
         )
 
     published_source = _publish_source(source, output_dir)
-    abi = private_launch_abi(
-        compilation.launch_abi,
-        compilation.kernel.tensors,
-        tuple(artifact.metadata.get("outputs", ())),
-    )
+    abi = compilation.launch_abi
     write_ascend_sidecar(
         source,
         abi=abi,
@@ -247,6 +153,7 @@ def _materialize(compilation, *, output_dir: str | Path | None):
         ) from exc
 
     kernel = getattr(module, f"{artifact.kernel_name}_kernel", None)
+    access_template = ascend_uses_access_template(artifact.metadata)
     wrapped = _ascend_wrapper(
         launch,
         abi,
@@ -255,20 +162,21 @@ def _materialize(compilation, *, output_dir: str | Path | None):
         kernel_name=artifact.kernel_name,
         max_core_dim=_max_core_dim(artifact.metadata),
         module=module,
-        logical_domain=ascend_logical_domain(
-            compilation.kernel.tensors,
-            tuple(artifact.metadata.get("outputs", ())),
-            allow_access_template=ascend_uses_access_template(artifact.metadata),
+        # Ordinary elementwise launch source already embeds its scheduled meta
+        # tile.  Its runtime validation must use the concrete output extent;
+        # only access-template schedules retain a symbolic private domain.
+        logical_domain=(
+            ascend_logical_domain(
+                compilation.kernel.tensors,
+                tuple(artifact.metadata.get("outputs", ())),
+                allow_access_template=True,
+            )
+            if access_template
+            else None
         ),
         reduction_schedule=artifact.metadata.get("ssa_metadata", {})
         .get("schedule", {})
         .get("reduction"),
-        partial_reduction=artifact.metadata.get("ssa_metadata", {})
-        .get("schedule", {})
-        .get("ascend_partial_reduction"),
-        linalg_contract=artifact.metadata.get("ssa_metadata", {})
-        .get("schedule", {})
-        .get("ascend_linalg"),
         layout_contract=_artifact_layout_contract(artifact.metadata),
         advanced_contract=schedule.get("ascend_advanced"),
         dot_loop=schedule.get("ascend_dot_loop"),
@@ -320,10 +228,9 @@ def _ascend_wrapper(
     kernel_name: str,
     max_core_dim: int,
     module,
+    dtype_specs=None,
     logical_domain=None,
     reduction_schedule=None,
-    partial_reduction=None,
-    linalg_contract=None,
     layout_contract=None,
     advanced_contract=None,
     dot_loop=None,
@@ -332,20 +239,20 @@ def _ascend_wrapper(
     from ninetoothed.compiler.runtime import (
         _bound_values,
         _empty_launch,
+        _public_values,
     )
 
     def launch(*args, **kwargs):
-        public = _ascend_public_values(abi, args, kwargs, specs)
+        public = _public_values(abi, args, kwargs, specs=specs, target=Target.ASCEND)
 
         _validate_ascend_bindings(
             abi,
             public,
             specs,
             max_core_dim,
+            dtype_specs=dtype_specs,
             logical_domain=logical_domain,
             reduction_schedule=reduction_schedule,
-            partial_reduction=partial_reduction,
-            linalg_contract=linalg_contract,
             layout_contract=layout_contract,
             advanced_contract=advanced_contract,
             dot_loop=dot_loop,
@@ -355,23 +262,15 @@ def _ascend_wrapper(
         if _empty_launch(abi, public):
             return _ascend_outputs(abi, public)
 
-        if partial_reduction:
-            return _launch_partial_reduction(
-                abi,
-                public,
-                specs,
-                reduction_schedule,
-                partial_reduction,
-            )
-
-        if linalg_contract:
-            return _launch_tiled_matmul(
-                abi,
-                public,
-                linalg_contract,
-            )
-
         values, keepalive = _bound_values(abi, public, scalar_mode="value")
+        # The public ABI correctly records a rank-0 value as ``scalar``.  The
+        # Ascend emitter still writes rank-0 outputs through a pointer, so this
+        # is the one platform calling-convention adaptation left at submission
+        # time.  It does not alter or serialize a second LaunchABI.
+        for index, binding in enumerate(abi.kernel_args):
+            if binding.kind == "scalar" and binding.source in abi.outputs:
+                values[index] = public[binding.source]
+                keepalive.append(public[binding.source])
         stream = _current_npu_stream(public)
         keepalive.extend((module, stream))
 
@@ -391,63 +290,12 @@ def _ascend_wrapper(
     return launch
 
 
-def _ascend_public_values(abi, args, kwargs, specs) -> dict[str, Any]:
-    """Bind public arguments with the NPU-only contract kept private."""
-    if len(args) > len(abi.public_args):
-        raise TypeError(f"Expected at most {len(abi.public_args)} arguments.")
-    values = dict(zip(abi.public_args, args))
-    unexpected = set(kwargs) - set(abi.public_args)
-    if unexpected:
-        raise TypeError(
-            f"Unexpected kernel arguments: {', '.join(sorted(unexpected))}."
-        )
-    duplicate = set(values) & set(kwargs)
-    if duplicate:
-        raise TypeError(
-            f"Multiple values for kernel arguments: {', '.join(sorted(duplicate))}."
-        )
-    values.update(kwargs)
-    missing = tuple(name for name in abi.public_args if name not in values)
-    if missing:
-        raise TypeError(f"Missing kernel arguments: {', '.join(missing)}.")
-
-    expected_device = None
-    for spec in specs:
-        if getattr(spec, "constexpr", False) or spec.name not in values:
-            continue
-        value = values[spec.name]
-        source_ndim = int(spec.attrs.get("source_ndim", spec.ndim))
-        if source_ndim == 0 and getattr(spec, "ndim", 0) == 0:
-            # Inputs may be scalar values; scalar outputs were made tensors by
-            # The private ABI makes scalar outputs device pointers.
-            if hasattr(value, "device"):
-                pass
-            else:
-                continue
-        if not hasattr(value, "device") or not hasattr(value, "is_contiguous"):
-            raise TypeError(
-                f"Ascend kernel argument `{spec.name}` must be a tensor on an NPU device."
-            )
-        device = value.device
-        if getattr(device, "type", str(device).split(":")[0]) != "npu":
-            raise TypeError(
-                f"Ascend kernel argument `{spec.name}` must be on an NPU device."
-            )
-        if expected_device is not None and device != expected_device:
-            raise TypeError("All Ascend tensor arguments must use the same NPU device.")
-        expected_device = device
-    return values
-
-
 def _validate_access_template_contract(dot_loop, attention_loop) -> bool:
     """Admit rank-4 storage only for recognized private generic-SSA schedules."""
     if attention_loop:
         contract = attention_loop
     elif dot_loop:
-        raise ValueError(
-            "Ascend generic dot-loop runtime is fail-closed: the public access "
-            "template source path is not numerically verified on Ascend910B3."
-        )
+        contract = dot_loop
     else:
         return False
 
@@ -464,16 +312,51 @@ def _validate_access_template_contract(dot_loop, attention_loop) -> bool:
     return True
 
 
+def _validate_dot_loop_runtime_shapes(spec_by_name, tensors, dot_loop) -> None:
+    """Keep generic dot-loop launches within the statically emitted ABI."""
+    if not dot_loop:
+        return
+
+    if (
+        dot_loop.get("mode") != "generic-dot-loop"
+        or dot_loop.get("layout") != "public-access-template"
+        or not dot_loop.get("loop_carried")
+    ):
+        raise ValueError("Ascend generic dot-loop contract is malformed.")
+
+    for name, value in tensors.items():
+        spec = spec_by_name[name]
+        source_shape = tuple(spec.attrs.get("source_shape", ()))
+
+        try:
+            expected_shape = tuple(int(dimension) for dimension in source_shape)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "Ascend generic dot-loop requires statically resolved source shapes."
+            ) from exc
+
+        if tuple(value.shape) != expected_shape:
+            raise ValueError(
+                f"Ascend generic dot-loop argument `{name}` has shape "
+                f"{tuple(value.shape)}; expected the compiled access-template "
+                f"shape {expected_shape}."
+            )
+
+        if value.storage_offset() != 0:
+            raise ValueError(
+                f"Ascend generic dot-loop argument `{name}` must have storage offset zero."
+            )
+
+
 def _validate_ascend_bindings(
     abi,
     public,
     specs,
     max_core_dim: int,
     *,
+    dtype_specs=None,
     logical_domain=None,
     reduction_schedule=None,
-    partial_reduction=None,
-    linalg_contract=None,
     layout_contract=None,
     advanced_contract=None,
     dot_loop=None,
@@ -481,7 +364,7 @@ def _validate_ascend_bindings(
 ) -> None:
     spec_by_name = {spec.name: spec for spec in specs}
     _validate_ascend_dtype_specs(
-        tuple(spec_by_name.values()),
+        tuple(dtype_specs) if dtype_specs is not None else tuple(spec_by_name.values()),
         allow_rng_auxiliary=bool((advanced_contract or {}).get("rng")),
         allow_atomic=bool((advanced_contract or {}).get("atomic")),
     )
@@ -489,7 +372,13 @@ def _validate_ascend_bindings(
     tensors = {}
 
     for binding in abi.kernel_args:
-        if binding.kind != "tensor" or binding.source not in public:
+        scalar_output = binding.kind == "scalar" and binding.source in abi.outputs
+
+        if (
+            binding.kind != "tensor"
+            and not scalar_output
+            or binding.source not in public
+        ):
             continue
 
         value = public[binding.source]
@@ -510,7 +399,7 @@ def _validate_ascend_bindings(
             layout = admit_tensor_layout(
                 binding.source,
                 value,
-                allow_rank4_access_template=access_template,
+                allow_rank4_access_template=True,
             )
         except AscendLayoutCapabilityError as exc:
             raise TypeError(str(exc)) from exc
@@ -522,10 +411,13 @@ def _validate_ascend_bindings(
                 "or use a verified direct layout-transfer kernel."
             )
 
+        _validate_storage_span(binding.source, value)
         tensors[binding.source] = value
 
     if not tensors:
         return
+
+    _validate_dot_loop_runtime_shapes(spec_by_name, tensors, dot_loop)
 
     if not abi.outputs:
         raise ValueError("Ascend elementwise launch requires an output tensor.")
@@ -559,13 +451,6 @@ def _validate_ascend_bindings(
         output_names,
         output_shape,
         reduction_schedule,
-    )
-    _validate_partial_reduction(partial_reduction, reduction_schedule)
-    linalg_inputs = _matmul_inputs(
-        tensors,
-        output_names,
-        output_shape,
-        linalg_contract,
     )
     layout_inputs = _layout_transfer_inputs(
         tensors,
@@ -619,7 +504,7 @@ def _validate_ascend_bindings(
                     "to be scalar when its primary output is scalar."
                 )
 
-            if name in reduction_inputs or name in linalg_inputs:
+            if name in reduction_inputs:
                 continue
 
             if shape != (1,):
@@ -630,12 +515,11 @@ def _validate_ascend_bindings(
 
             continue
 
-        if (
-            name in reduction_inputs
-            or name in linalg_inputs
-            or name in layout_inputs
-            or name in advanced_inputs
-        ):
+        if _uses_public_access_template(spec_by_name[name]):
+            _validate_binding_storage_span(name, value, spec_by_name[name])
+            continue
+
+        if name in reduction_inputs or name in layout_inputs or name in advanced_inputs:
             continue
 
         if len(shape) != len(output_shape):
@@ -694,6 +578,42 @@ def _is_supported_broadcast_shape(shape, output_shape) -> bool:
     return len(output_shape) == 2 and shape == (1, output_shape[1])
 
 
+def _uses_public_access_template(spec) -> bool:
+    """Return whether compiler-produced access metadata owns this binding span."""
+    return bool(getattr(spec, "attrs", {}).get("access_templates", ()))
+
+
+def _validate_binding_storage_span(name: str, value: Any, spec) -> None:
+    """Validate one binding against its public access-template contract.
+
+    The generated masks bound every template coordinate by the binding's source
+    dimensions.  For a contiguous runtime tensor, its own ``numel`` is
+    therefore the exact accessible element span; output shape is irrelevant.
+    """
+    source_ndim = int(spec.attrs.get("source_ndim", spec.ndim))
+    templates = tuple(spec.attrs.get("access_templates", ()))
+
+    if len(tuple(value.shape)) != source_ndim:
+        raise ValueError(
+            f"Ascend access-template binding `{name}` has rank {len(tuple(value.shape))}; "
+            f"expected source rank {source_ndim}."
+        )
+
+    for template in templates:
+        offsets = tuple(template.get("offsets", ()))
+
+        if (
+            len(offsets) != source_ndim
+            or not template.get("linear_offset")
+            or not template.get("mask")
+        ):
+            raise ValueError(
+                f"Ascend access-template binding `{name}` has malformed source offsets."
+            )
+
+    _validate_storage_span(name, value)
+
+
 def _row_reduction_inputs(tensors, output_names, output_shape, reduction_schedule):
     if not reduction_schedule or reduction_schedule.get("mode") != "row-vector":
         return frozenset()
@@ -734,207 +654,6 @@ def _row_reduction_inputs(tensors, output_names, output_shape, reduction_schedul
         )
 
     return frozenset(inputs)
-
-
-def _validate_partial_reduction(contract, reduction_schedule):
-    if not contract:
-        return
-    if (
-        not isinstance(contract, Mapping)
-        or contract.get("strategy") != "hierarchical-private-stages"
-    ):
-        raise ValueError("Ascend partial-reduction contract is malformed.")
-    if not reduction_schedule or reduction_schedule.get("mode") != "row-vector":
-        raise ValueError("Ascend partial reduction requires a row-vector reduction.")
-    stages = contract.get("stages", ())
-    if not stages or any(int(stage.get("block", 0)) != 256 for stage in stages):
-        raise ValueError("Ascend partial reduction stages require BLOCK=256.")
-
-
-def _launch_partial_reduction(abi, public, specs, reduction_schedule, contract):
-    """Launch the private bounded-fan-in reduction tree on one NPU stream."""
-    import torch
-
-    _validate_partial_reduction(contract, reduction_schedule)
-    if not reduction_schedule:
-        raise ValueError("Ascend partial reduction is missing its reduction schedule.")
-    input_name = next(
-        name
-        for name in public
-        if name not in abi.outputs and hasattr(public[name], "numel")
-    )
-    output_name = abi.outputs[0]
-    source = public[input_name]
-    output = public[output_name]
-    if not source.is_contiguous() or not output.is_contiguous():
-        raise ValueError("Ascend partial reduction requires contiguous tensors.")
-    axis = reduction_schedule.get("axis", source.ndim - 1)
-    if isinstance(axis, bool) or not isinstance(axis, int):
-        raise ValueError("Ascend partial reduction axis must be an integer.")
-    if axis < 0:
-        axis += source.ndim
-    if not 0 <= axis < source.ndim:
-        raise ValueError("Ascend partial reduction axis is outside the input rank.")
-    extent = int(reduction_schedule.get("extent", source.shape[axis]))
-    if extent != int(source.shape[axis]):
-        raise ValueError(
-            "Ascend partial reduction extent does not match the input shape."
-        )
-    source_for_reduce = (
-        source if axis == source.ndim - 1 else source.movedim(axis, -1).contiguous()
-    )
-    outer = source_for_reduce.numel() // extent if extent else 0
-    stages = tuple(contract["stages"])
-    operator = contract.get("operator", "sum")
-    if outer == 0:
-        return _ascend_outputs(abi, public)
-
-    if operator not in {"sum", "max", "min"}:
-        raise ValueError(
-            f"Ascend partial reduction operator `{operator}` is unsupported."
-        )
-
-    stage_kernel = {
-        "sum": _ascend_partial_sum_kernel,
-        "max": _ascend_partial_max_kernel,
-        "min": _ascend_partial_min_kernel,
-    }[operator]
-
-    current = source_for_reduce.reshape((outer, extent))
-    for index, stage in enumerate(stages):
-        input_extent = int(stage["input_extent"])
-        output_extent = int(stage["output_extent"])
-        if input_extent != current.shape[1]:
-            raise ValueError("Ascend partial reduction stage extents are inconsistent.")
-        is_final = index == len(stages) - 1
-        target = (
-            output.reshape((outer,))
-            if is_final
-            else torch.empty(
-                (outer, output_extent), device=source.device, dtype=source.dtype
-            )
-        )
-        stage_kernel[(outer * output_extent,)](
-            current,
-            target,
-            input_extent,
-            output_extent,
-            BLOCK=256,
-        )
-        if not is_final:
-            current = target
-            stream = getattr(torch.npu, "current_stream", lambda: None)()
-            if stream is not None and hasattr(stream, "synchronize"):
-                stream.synchronize()
-
-    return _ascend_outputs(abi, public)
-
-
-def _launch_tiled_matmul(abi, public, contract):
-    """Launch the private 16x16x64 tiled matmul kernel."""
-    lhs_name = contract.get("lhs")
-    rhs_name = contract.get("rhs")
-    output_name = abi.outputs[0]
-    lhs = public.get(lhs_name)
-    rhs = public.get(rhs_name)
-    output = public.get(output_name)
-    if lhs is None or rhs is None or output is None:
-        raise ValueError("Ascend tiled matmul launch is missing tensor arguments.")
-    if not lhs.is_contiguous() or not rhs.is_contiguous() or not output.is_contiguous():
-        raise ValueError("Ascend tiled matmul requires contiguous tensors.")
-    if lhs.ndim not in {2, 3} or rhs.ndim != lhs.ndim or output.ndim != lhs.ndim:
-        raise ValueError("Ascend tiled matmul supports only rank-2 or rank-3 tensors.")
-    if lhs.ndim == 2:
-        m, k = (int(value) for value in lhs.shape)
-        rhs_k, n = (int(value) for value in rhs.shape)
-        batch = 1
-    else:
-        batch, m, k = (int(value) for value in lhs.shape)
-        rhs_batch, rhs_k, n = (int(value) for value in rhs.shape)
-        if batch != rhs_batch or int(output.shape[0]) != batch:
-            raise ValueError(
-                "Ascend batched matmul requires matching batch dimensions."
-            )
-    if k != rhs_k or tuple(output.shape[-2:]) != (m, n):
-        raise ValueError("Ascend tiled matmul runtime shapes are inconsistent.")
-    if lhs.dtype != rhs.dtype or lhs.dtype != output.dtype:
-        raise TypeError("Ascend tiled matmul requires matching input/output dtypes.")
-    _ascend_tiled_matmul_kernel[(batch * ((m + 15) // 16) * ((n + 15) // 16),)](
-        lhs,
-        rhs,
-        output,
-        m,
-        n,
-        k,
-        batch,
-        BLOCK_M=16,
-        BLOCK_N=16,
-        BLOCK_K=64,
-    )
-    import torch
-
-    stream = getattr(torch.npu, "current_stream", lambda: None)()
-    if stream is not None and hasattr(stream, "synchronize"):
-        stream.synchronize()
-    return _ascend_outputs(abi, public)
-
-
-def _matmul_inputs(tensors, output_names, output_shape, linalg_contract):
-    if not linalg_contract:
-        return frozenset()
-
-    if linalg_contract.get("mode") not in {"matrix-scalar-loop", "tiled-matmul"}:
-        raise ValueError("Ascend linalg launch has an unsupported contract mode.")
-
-    if len(output_names) != 1 or len(output_shape) not in {2, 3}:
-        raise ValueError(
-            "Ascend matmul requires exactly one rank-2 or rank-3 output tensor."
-        )
-
-    lhs_name = linalg_contract.get("lhs")
-    rhs_name = linalg_contract.get("rhs")
-
-    if not isinstance(lhs_name, str) or not isinstance(rhs_name, str):
-        raise ValueError("Ascend matmul launch is missing operand bindings.")
-
-    try:
-        lhs = tensors[lhs_name]
-        rhs = tensors[rhs_name]
-    except KeyError as exc:
-        raise ValueError(
-            f"Ascend matmul launch is missing operand `{exc.args[0]}`."
-        ) from exc
-
-    lhs_shape = tuple(lhs.shape)
-    rhs_shape = tuple(rhs.shape)
-
-    if len(lhs_shape) not in {2, 3} or len(rhs_shape) != len(lhs_shape):
-        raise ValueError(
-            "Ascend matmul requires rank-2 contiguous inputs or matching rank-3 batched inputs."
-        )
-
-    if len(lhs_shape) == 2:
-        m, k = lhs_shape
-        rhs_k, n = rhs_shape
-    else:
-        batch, m, k = lhs_shape
-        rhs_batch, rhs_k, n = rhs_shape
-        if batch != rhs_batch or output_shape != (batch, m, n):
-            raise ValueError(
-                "Ascend batched matmul requires matching batch/output shapes."
-            )
-
-    if (m, n) != output_shape[-2:] or k != rhs_k:
-        raise ValueError(
-            "Ascend matmul requires runtime shapes lhs[M,K] @ rhs[K,N] -> output[M,N]."
-        )
-
-    if lhs.dtype != rhs.dtype or lhs.dtype != tensors[output_names[0]].dtype:
-        raise TypeError(
-            "Ascend matmul currently requires matching input/output dtypes."
-        )
-
-    return frozenset((lhs_name, rhs_name))
 
 
 def _layout_transfer_inputs(tensors, output_names, layout_contract):

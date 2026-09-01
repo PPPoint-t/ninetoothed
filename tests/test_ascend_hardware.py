@@ -1076,45 +1076,16 @@ def test_ascend_empty_scalar_reduction_jit_and_source_reload(tmp_path):
         (_matmul_small_arrangement, (3, 127), (127, 7), (3, 7)),
     ),
 )
-def test_ascend_matmul_jit_and_source_reload_tail(
-    tmp_path, arrangement, lhs_shape, rhs_shape, output_shape
-):
-    import torch
-    import torch_npu  # noqa: F401
-
-    assert torch.npu.is_available()
-    compilation = DEFAULT_COMPILER.compile(
-        CompileRequest(
-            arrangement=_matmul_arrangement,
-            application=_matmul_application,
-            tensors=tuple(Tensor(2, dtype="float32") for _ in range(3)),
-            backend="ascend",
-            backend_options={"soc_version": "Ascend910B3", "max_core_dim": 8},
-        )
-    )
-    jit = DEFAULT_COMPILER.materialize(compilation, output_dir=tmp_path, mode="jit")
-    aot = DEFAULT_COMPILER.materialize(compilation, output_dir=tmp_path, mode="aot")
-    reloaded = load_built_artifact(aot._built_artifact)
-
-    for launch in (jit, reloaded):
-        lhs = torch.randn(lhs_shape, device="npu", dtype=torch.float32)
-        rhs = torch.randn(rhs_shape, device="npu", dtype=torch.float32)
-        output = torch.empty(output_shape, device="npu", dtype=torch.float32)
-        assert launch(lhs, rhs, output) is output
-        torch.npu.synchronize()
-        torch.testing.assert_close(output, torch.matmul(lhs, rhs))
-
-
-@pytest.mark.ascend_next_stage
 @pytest.mark.parametrize(
-    ("arrangement", "lhs_shape", "rhs_shape", "output_shape", "rank"),
+    ("dtype", "rtol", "atol"),
     (
-        (_matmul_large_k_arrangement, (3, 513), (513, 5), (3, 5), 2),
-        (_matmul_batched_arrangement, (2, 3, 257), (2, 257, 5), (2, 3, 5), 3),
+        ("float16", 5e-2, 5e-2),
+        ("bfloat16", 1e-1, 1e-1),
+        ("float32", 1e-2, 1e-2),
     ),
 )
-def test_ascend_tiled_batched_matmul_jit_and_source_reload(
-    tmp_path, arrangement, lhs_shape, rhs_shape, output_shape, rank
+def test_ascend_matmul_jit_and_source_reload_tail(
+    tmp_path, arrangement, lhs_shape, rhs_shape, output_shape, dtype, rtol, atol
 ):
     import torch
     import torch_npu  # noqa: F401
@@ -1124,7 +1095,7 @@ def test_ascend_tiled_batched_matmul_jit_and_source_reload(
         CompileRequest(
             arrangement=arrangement,
             application=_matmul_application,
-            tensors=tuple(Tensor(rank, dtype="float32") for _ in range(3)),
+            tensors=tuple(Tensor(2, dtype=dtype) for _ in range(3)),
             backend="ascend",
             backend_options={"soc_version": "Ascend910B3", "max_core_dim": 8},
         )
@@ -1132,13 +1103,73 @@ def test_ascend_tiled_batched_matmul_jit_and_source_reload(
     jit = DEFAULT_COMPILER.materialize(compilation, output_dir=tmp_path, mode="jit")
     aot = DEFAULT_COMPILER.materialize(compilation, output_dir=tmp_path, mode="aot")
     reloaded = load_built_artifact(aot._built_artifact)
+    torch_dtype = getattr(torch, dtype)
+
     for launch in (jit, reloaded):
-        lhs = torch.randn(lhs_shape, device="npu", dtype=torch.float32)
-        rhs = torch.randn(rhs_shape, device="npu", dtype=torch.float32)
-        output = torch.empty(output_shape, device="npu", dtype=torch.float32)
+        lhs = torch.randn(lhs_shape, device="npu", dtype=torch_dtype)
+        rhs = torch.randn(rhs_shape, device="npu", dtype=torch_dtype)
+        output = torch.empty(output_shape, device="npu", dtype=torch_dtype)
         assert launch(lhs, rhs, output) is output
         torch.npu.synchronize()
-        torch.testing.assert_close(output, torch.matmul(lhs, rhs), rtol=1e-2, atol=1e-2)
+        torch.testing.assert_close(output, torch.matmul(lhs, rhs), rtol=rtol, atol=atol)
+
+
+@pytest.mark.ascend_next_stage
+@pytest.mark.parametrize(
+    ("arrangement", "lhs_shape", "rhs_shape", "output_shape", "rank", "verified"),
+    (
+        (_matmul_large_k_arrangement, (3, 513), (513, 5), (3, 5), 2, True),
+        (_matmul_batched_arrangement, (2, 3, 257), (2, 257, 5), (2, 3, 5), 3, True),
+    ),
+)
+@pytest.mark.parametrize(
+    ("dtype", "rtol", "atol"),
+    (
+        ("float16", 5e-2, 5e-2),
+        ("bfloat16", 1e-1, 1e-1),
+        ("float32", 1e-2, 1e-2),
+    ),
+)
+def test_ascend_tiled_batched_matmul_jit_and_source_reload(
+    tmp_path,
+    arrangement,
+    lhs_shape,
+    rhs_shape,
+    output_shape,
+    rank,
+    verified,
+    dtype,
+    rtol,
+    atol,
+):
+    import torch
+    import torch_npu  # noqa: F401
+
+    assert torch.npu.is_available()
+    request = CompileRequest(
+        arrangement=arrangement,
+        application=_matmul_application,
+        tensors=tuple(Tensor(rank, dtype=dtype) for _ in range(3)),
+        backend="ascend",
+        backend_options={"soc_version": "Ascend910B3", "max_core_dim": 8},
+    )
+    if not verified:
+        with pytest.raises(ValueError, match="batched matmul is fail-closed"):
+            DEFAULT_COMPILER.compile(request)
+        return
+
+    compilation = DEFAULT_COMPILER.compile(request)
+    jit = DEFAULT_COMPILER.materialize(compilation, output_dir=tmp_path, mode="jit")
+    aot = DEFAULT_COMPILER.materialize(compilation, output_dir=tmp_path, mode="aot")
+    reloaded = load_built_artifact(aot._built_artifact)
+    for launch in (jit, reloaded):
+        torch_dtype = getattr(torch, dtype)
+        lhs = torch.randn(lhs_shape, device="npu", dtype=torch_dtype)
+        rhs = torch.randn(rhs_shape, device="npu", dtype=torch_dtype)
+        output = torch.empty(output_shape, device="npu", dtype=torch_dtype)
+        assert launch(lhs, rhs, output) is output
+        torch.npu.synchronize()
+        torch.testing.assert_close(output, torch.matmul(lhs, rhs), rtol=rtol, atol=atol)
 
 
 def test_ascend_jit_and_source_reload_execute_fp32_singleton_broadcast(tmp_path):
@@ -1410,6 +1441,7 @@ def test_ascend_generic_dot_loop_jit_and_aot_reload(tmp_path):
     import functools
 
     import torch
+    import torch.nn.functional as functional
     import torch_npu  # noqa: F401
 
     from tests import test_conv2d
@@ -1449,11 +1481,13 @@ def test_ascend_generic_dot_loop_jit_and_aot_reload(tmp_path):
     reloaded = load_built_artifact(aot._built_artifact)
     input = torch.randn((1, 2, 4, 4), device="npu", dtype=torch.float16)
     filter = torch.randn((3, 2, 3, 3), device="npu", dtype=torch.float16)
+    expected = functional.conv2d(input, filter)
 
     for launch in (jit, reloaded):
         output = torch.empty((1, 3, 2, 2), device="npu", dtype=torch.float16)
-        with pytest.raises(ValueError, match="generic dot-loop runtime is fail-closed"):
-            launch(input, filter, output)
+        assert launch(input, filter, output) is output
+        torch.npu.synchronize()
+        torch.testing.assert_close(output, expected, rtol=1e-3, atol=1e-3)
 
 
 @pytest.mark.ascend_next_stage

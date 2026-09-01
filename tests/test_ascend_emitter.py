@@ -313,6 +313,34 @@ def test_ascend_emits_decomposed_matmul_with_tail_safe_loads():
     ast.parse(source)
 
 
+def test_ascend_rewrites_batched_matmul_access_templates_before_emission():
+    tensors = (
+        TensorSpec(ndim=3, shape=("2", "3", "257"), dtype="float32", name="a"),
+        TensorSpec(ndim=3, shape=("2", "257", "5"), dtype="float32", name="b"),
+        TensorSpec(ndim=3, shape=("2", "3", "5"), dtype="float32", name="out"),
+    )
+    kernel = _kernel(
+        "\ndef batched_matmul(a, b, out):\n    out = a @ b\n",
+        name="batched_matmul",
+        tensors=tensors,
+    )
+    artifact = emit(kernel, Target.ASCEND)
+    rewrite = artifact.metadata["ssa_metadata"]["schedule"][
+        "ascend_batched_access_rewrite"
+    ]
+    source = artifact.primary_source
+
+    assert rewrite["coordinates"] == {
+        "lhs": ("batch", "row", "k"),
+        "rhs": ("batch", "k", "col"),
+    }
+    assert "tl.load(a + (v1_v10_body) * (3 * 257)" in source
+    assert "(v2_v10_body) * (257) + (v10_i)" in source
+    assert "tl.load(b + (v1_v10_body) * (257 * 5)" in source
+    assert "(v10_i) * (5) + (vascend_matmul_col_v10_body)" in source
+    ast.parse(source)
+
+
 @pytest.mark.parametrize(
     ("source", "tensors", "opcode"),
     (

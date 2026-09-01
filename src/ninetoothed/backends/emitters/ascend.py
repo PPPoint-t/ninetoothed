@@ -375,6 +375,7 @@ def _validate_program(kernel: Kernel) -> None:
         tuple(tensor.dtype for tensor in kernel.tensors if not tensor.constexpr),
         allow_rng_auxiliary=bool(advanced.get("rng")),
         allow_atomic=bool(advanced.get("atomic")),
+        allow_unspecified=True,
     )
 
     if unsupported_dtypes:

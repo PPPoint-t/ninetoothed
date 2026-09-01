@@ -3,6 +3,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from ninetoothed.backends.core import Target
 from ninetoothed.backends.materializers.cuda import _cuda_wrapper
 from ninetoothed.compiler.cache import (
     compilation_cache_key,
@@ -76,6 +77,27 @@ def test_runtime_binding_validates_tensor_contract(value, message):
             (value, _Tensor((2, 3))),
             {},
             specs=_specs(),
+        )
+
+
+def test_runtime_binding_uses_target_device_contract():
+    values = _public_values(
+        _abi(),
+        (_Tensor((2, 3), device_type="npu"), _Tensor((2, 3), device_type="npu")),
+        {},
+        specs=_specs(),
+        target=Target.ASCEND,
+    )
+
+    assert set(values) == {"x", "out"}
+
+    with pytest.raises(TypeError, match="must be on a NPU device"):
+        _public_values(
+            _abi(),
+            (_Tensor((2, 3)), _Tensor((2, 3))),
+            {},
+            specs=_specs(),
+            target=Target.ASCEND,
         )
 
 

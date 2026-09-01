@@ -52,7 +52,7 @@ def admit_tensor_layout(
     allowed_ranks = {0, 1, 2, 3, 4} if allow_rank4_access_template else {0, 1, 2, 3}
     if len(shape) not in allowed_ranks:
         raise AscendLayoutCapabilityError(
-            f"Ascend layout for `{name}` supports only rank 0 through 3; received rank {len(shape)}."
+            f"Ascend layout for `{name}` supports only rank 0 through 4; received rank {len(shape)}."
         )
 
     if len(shape) != len(strides) or any(size < 0 for size in shape):

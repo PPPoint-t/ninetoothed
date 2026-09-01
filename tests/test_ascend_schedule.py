@@ -312,19 +312,18 @@ def test_ascend_rejects_unverified_dtype_before_source_emission(dtype):
         lower_for_target(_elementwise_program(dtype), backend=Target.ASCEND)
 
 
-def test_ascend_rejects_unspecified_runtime_dtype_before_source_emission():
-    with pytest.raises(
-        ValueError, match="only FP16, BF16, and FP32 elementwise SSA.*unspecified"
-    ):
-        lower_for_target(
-            _elementwise_program(),
-            backend=Target.ASCEND,
-            tensors=(
-                TensorSpec(ndim=1, shape=("n",), dtype=None, name="x"),
-                TensorSpec(ndim=1, shape=("n",), dtype=None, name="y"),
-                TensorSpec(ndim=1, shape=("n",), dtype=None, name="out"),
-            ),
-        )
+def test_ascend_accepts_unspecified_dtype_for_runtime_specialization():
+    lowered = lower_for_target(
+        _elementwise_program(),
+        backend=Target.ASCEND,
+        tensors=(
+            TensorSpec(ndim=1, shape=("n",), dtype=None, name="x"),
+            TensorSpec(ndim=1, shape=("n",), dtype=None, name="y"),
+            TensorSpec(ndim=1, shape=("n",), dtype=None, name="out"),
+        ),
+    )
+
+    assert lowered.metadata["target_backend"] == Target.ASCEND.value
 
 
 def test_ascend_emits_private_layout_transfer_schedule():
@@ -384,7 +383,7 @@ def test_ascend_rejects_non_emittable_reduction_schedule():
         lower_for_target(program, backend=Target.ASCEND)
 
 
-def test_ascend_selects_private_partial_reduction_above_fixed_block():
+def test_ascend_keeps_large_row_reduction_in_unified_ssa():
     program = _program(
         "\ndef reduce(x, out):\n    out = sum(x, axis=1)\n",
         (
@@ -402,13 +401,12 @@ def test_ascend_selects_private_partial_reduction_above_fixed_block():
             TensorSpec(ndim=1, shape=("rows",), dtype="float32", name="out"),
         ),
     )
-    stages = lowered.metadata["schedule"]["ascend_partial_reduction"]["stages"]
-    assert stages[0]["input_extent"] == 257
-    assert stages[-1]["output_extent"] == 1
+    assert "ascend_partial_reduction" not in lowered.metadata["schedule"]
+    assert lowered.metadata["selected_schedule_candidate"] == "ascend-row-reduction-256"
 
 
 @pytest.mark.ascend_next_stage
-def test_ascend_partial_reduction_metadata_has_bounded_stages():
+def test_ascend_large_row_reduction_has_no_materializer_contract():
     program = _program(
         "\ndef reduce(x, out):\n    out = sum(x, axis=1)\n",
         (
@@ -425,9 +423,7 @@ def test_ascend_partial_reduction_metadata_has_bounded_stages():
             TensorSpec(ndim=1, shape=("rows",), dtype="float32", name="out"),
         ),
     )
-    contract = lowered.metadata["schedule"]["ascend_partial_reduction"]
-    assert contract["strategy"] == "hierarchical-private-stages"
-    assert [stage["output_extent"] for stage in contract["stages"]] == [5, 1]
+    assert "ascend_partial_reduction" not in lowered.metadata["schedule"]
 
 
 def test_ascend_accepts_structured_contiguous_tiled_layouts():

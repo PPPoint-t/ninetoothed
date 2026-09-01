@@ -3,7 +3,7 @@
 import hashlib
 import json
 import os
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Mapping
 
@@ -77,11 +77,154 @@ class AscendBackend(Backend):
 
         return emit(kernel)
 
+    def prepare_for_emission(self, kernel: Kernel) -> Kernel:
+        """Finalize target schedule choices before Ascend source emission."""
+        from ninetoothed.compiler.specialization import specialize_schedule_tiles
+
+        kernel = specialize_schedule_tiles(kernel)
+
+        if kernel.ssa is None:
+            return kernel
+
+        contract = dict(kernel.ssa.metadata.get("schedule", {})).get(
+            "ascend_linalg", {}
+        )
+
+        schedule = dict(kernel.ssa.metadata.get("schedule", {}))
+
+        if contract.get("rank") != 3 or "ascend_batched_access_rewrite" in schedule:
+            return kernel
+
+        return replace(
+            kernel,
+            ssa=_rewrite_ascend_batched_matmul_access(kernel.ssa, contract),
+        )
+
 
 ASCEND_ELEMENTWISE_DTYPES = frozenset({"float16", "bfloat16", "float32"})
 ASCEND_RNG_DTYPES = frozenset({"float16", "bfloat16", "float32"})
 ASCEND_ATOMIC_DTYPES = frozenset({"float16", "bfloat16", "float32", "int32"})
-_SIDECAR_SCHEMA = 2
+_SIDECAR_SCHEMA = 3
+
+
+@dataclass(frozen=True)
+class AscendSocProfile:
+    """Compile-time resource contract for a verified Ascend SoC."""
+
+    name: str
+    cube_cores: int | None
+    vector_cores: int | None
+    l2_cache_bytes: int | None
+    ub_bytes: int | None = None
+    l1_bytes: int | None = None
+    l0a_bytes: int | None = None
+    l0b_bytes: int | None = None
+    l0c_bytes: int | None = None
+
+
+_ASCEND_SOC_PROFILES = {
+    "Ascend910B3": AscendSocProfile(
+        name="Ascend910B3",
+        cube_cores=20,
+        vector_cores=40,
+        l2_cache_bytes=192 * 1024 * 1024,
+    )
+}
+
+
+def ascend_soc_profile(soc_version: str | None = None) -> AscendSocProfile:
+    """Return the verified compile-time profile without initializing an NPU."""
+    return _ASCEND_SOC_PROFILES.get(
+        soc_version or "Ascend910B3",
+        AscendSocProfile(
+            name=soc_version or "unknown",
+            cube_cores=None,
+            vector_cores=None,
+            l2_cache_bytes=None,
+        ),
+    )
+
+
+def ascend_capability_matrix() -> Mapping[str, Any]:
+    """Return the stable, backend-private Ascend capability contract.
+
+    The result is data-only so callers can inspect admission policy without
+    importing or probing an NPU runtime during collection or lowering.
+    """
+    return {
+        "target": Target.ASCEND.value,
+        "devices": ("Ascend910B3",),
+        "soc_profiles": {
+            name: {
+                "cube_cores": profile.cube_cores,
+                "vector_cores": profile.vector_cores,
+                "l2_cache_bytes": profile.l2_cache_bytes,
+                "ub_bytes": profile.ub_bytes,
+                "l1_bytes": profile.l1_bytes,
+                "l0a_bytes": profile.l0a_bytes,
+                "l0b_bytes": profile.l0b_bytes,
+                "l0c_bytes": profile.l0c_bytes,
+            }
+            for name, profile in _ASCEND_SOC_PROFILES.items()
+        },
+        "dtypes": {
+            "elementwise": tuple(sorted(ASCEND_ELEMENTWISE_DTYPES)),
+            "rng": tuple(sorted(ASCEND_RNG_DTYPES)),
+            "atomic": tuple(sorted(ASCEND_ATOMIC_DTYPES)),
+        },
+        "layouts": {
+            "contiguous_ranks": (0, 1, 2, 3, 4),
+            "dynamic_shape": True,
+            "dynamic_stride": True,
+            "non_contiguous": False,
+            "jagged": False,
+            "negative_stride": False,
+            "storage_offset": "zero-only-for-generic-dot-loop",
+        },
+        "jit": {"runtime_specialization": True, "aot_reload": True},
+        "operations": {
+            "elementwise": "verified",
+            "matmul": "verified-contiguous-rank-2-fp16-bf16-fp32",
+            "batched_matmul": "verified-contiguous-rank-3-fp16-bf16-fp32-static-shape",
+            "dynamic_matmul_mnk": "fail-closed-pending-single-artifact-validation",
+            "row_vector_reduction": "verified-subset",
+            "cross_block_multi_axis_reduction": "fail-closed-pending-private-schedule",
+            "generic_dot_loop": "verified-static-shape-subset",
+            "attention": "verified-1x1x16x16-non-causal-subset",
+            "standalone_conv2d": "fail-closed",
+        },
+    }
+
+
+def ascend_toolchain_version() -> str:
+    """Return the configured CANN version without initializing an NPU."""
+    configured = os.environ.get("CANN_VERSION")
+
+    if configured:
+        return configured
+
+    toolkit = os.environ.get("ASCEND_TOOLKIT_HOME") or os.environ.get(
+        "ASCEND_HOME_PATH"
+    )
+    paths = (
+        *((Path(toolkit) / "share/info/asc-devkit/version.info",) if toolkit else ()),
+        Path(
+            "/usr/local/Ascend/ascend-toolkit/latest/share/info/asc-devkit/version.info"
+        ),
+        Path("/usr/local/Ascend/driver/version.info"),
+    )
+
+    for path in paths:
+        try:
+            for line in path.read_text(encoding="utf-8").splitlines():
+                key, separator, value = line.partition("=")
+
+                if separator and key.strip() in {"Version", "package_version"}:
+                    return value.strip()
+        except FileNotFoundError:
+            continue
+
+    return "unknown"
 
 
 def normalize_ascend_dtype(dtype: str | None) -> str | None:
@@ -179,58 +322,81 @@ def validate_build_policy(metadata: Mapping[str, Any], request: Any) -> None:
             "Ascend build does not accept runtime warp or stage configuration."
         )
 
+    validate_ascend_profile_admission(metadata, request)
+
+
+def validate_ascend_profile_admission(
+    metadata: Mapping[str, Any], request: Any
+) -> None:
+    """Require build admission to match the profile chosen by scheduling.
+
+    Unknown resource capacities deliberately remain unconstrained.  Every
+    known value is sourced from ``AscendSocProfile`` rather than duplicated in
+    the materializer or an ad-hoc hardware check.
+    """
+    options = dict(getattr(request, "backend_options", {}) or {})
+    profile = ascend_soc_profile(options.get("soc_version"))
+    matrix = ascend_capability_matrix()
+
+    if profile.name not in matrix["soc_profiles"]:
+        raise ValueError(
+            f"Ascend build requires a verified SoC profile; received `{profile.name}`."
+        )
+
+    selected = dict(metadata.get("ssa_metadata", {})).get("selected_schedule_candidate")
+    candidates = tuple(
+        dict(metadata.get("ssa_metadata", {})).get("schedule_candidates", ())
+    )
+
+    if selected is None or not candidates:
+        return
+
+    candidate = next(
+        (item for item in candidates if item.get("name") == selected), None
+    )
+
+    if candidate is None:
+        raise ValueError(
+            "Ascend build metadata does not contain its selected schedule candidate."
+        )
+
+    constraints = dict(candidate.get("constraints", {}))
+
+    for name, expected in _profile_constraints(profile).items():
+        actual = constraints.get(name)
+
+        if actual != expected:
+            raise ValueError(
+                "Ascend build profile does not match the selected schedule: "
+                f"`{name}` is {actual!r}, expected {expected!r} for {profile.name}."
+            )
+
 
 def ascend_cache_key(base_key: str, metadata: Mapping[str, Any]) -> str:
     """Namespace source cache entries by the selected Ascend runtime target."""
+    profile = ascend_soc_profile(
+        dict(metadata.get("ssa_schedule", {})).get("soc_version") or None
+    )
     identity = {
         "base": base_key,
         "soc_version": dict(metadata.get("ssa_schedule", {})).get("soc_version", ""),
         "triton_ascend_arch": os.environ.get("TRITON_ASCEND_ARCH", ""),
         "ascend_visible_devices": os.environ.get("ASCEND_VISIBLE_DEVICES", ""),
+        "soc_profile": {
+            "name": profile.name,
+            "cube_cores": profile.cube_cores,
+            "vector_cores": profile.vector_cores,
+            "l2_cache_bytes": profile.l2_cache_bytes,
+            "ub_bytes": profile.ub_bytes,
+            "l1_bytes": profile.l1_bytes,
+            "l0a_bytes": profile.l0a_bytes,
+            "l0b_bytes": profile.l0b_bytes,
+            "l0c_bytes": profile.l0c_bytes,
+        },
+        "cann_version": ascend_toolchain_version(),
     }
 
     return hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
-
-
-def private_launch_abi(abi: LaunchABI, specs, outputs: tuple[str, ...]) -> LaunchABI:
-    """Adapt the public ABI to Ascend's pointer-output overlap contract."""
-    spec_by_name = {spec.name: spec for spec in specs}
-    bindings = []
-
-    for binding in abi.kernel_args:
-        kind = binding.kind
-
-        if (
-            binding.source in outputs
-            and getattr(spec_by_name.get(binding.source), "ndim", None) == 0
-            and kind == "scalar"
-        ):
-            kind = "tensor"
-
-        access = (
-            "write"
-            if binding.source in outputs
-            else "read"
-            if kind in {"tensor", "jagged_values"}
-            else binding.access
-        )
-        bindings.append(
-            LaunchBinding(
-                name=binding.name,
-                source=binding.source,
-                kind=kind,
-                dim=binding.dim,
-                value=binding.value,
-                access=access,
-            )
-        )
-
-    return LaunchABI(
-        public_args=abi.public_args,
-        kernel_args=tuple(bindings),
-        outputs=abi.outputs,
-        shape_params=abi.shape_params,
-    )
 
 
 def ascend_logical_domain(
@@ -290,11 +456,13 @@ def write_ascend_sidecar(
     outputs,
     metadata: Mapping[str, Any],
 ) -> Path:
-    """Persist private launch data without extending the common artifact schema."""
+    """Persist public launch ABI plus Ascend AOT descriptive metadata."""
     path = _sidecar_path(source_path)
     payload = {
         "schema": _SIDECAR_SCHEMA,
-        "abi": _ascend_abi_dict(abi),
+        # This is the exact public LaunchABI from Compilation.  A sidecar must
+        # never contain a second ABI with backend-specific launch semantics.
+        "launch_abi": _ascend_abi_dict(abi),
         "logical_domain": ascend_logical_domain(
             specs,
             tuple(outputs),
@@ -307,9 +475,6 @@ def write_ascend_sidecar(
         "reduction_schedule": dict(metadata.get("ssa_metadata", {}))
         .get("schedule", {})
         .get("reduction"),
-        "partial_reduction": dict(metadata.get("ssa_metadata", {}))
-        .get("schedule", {})
-        .get("ascend_partial_reduction"),
         "linalg_contract": dict(metadata.get("ssa_metadata", {}))
         .get("schedule", {})
         .get("ascend_linalg"),
@@ -326,6 +491,7 @@ def write_ascend_sidecar(
         "attention_loop": dict(metadata.get("ssa_metadata", {}))
         .get("schedule", {})
         .get("ascend_attention_loop"),
+        "toolchain": {"cann_version": ascend_toolchain_version()},
     }
     path.write_text(json.dumps(_json_value(payload), sort_keys=True), encoding="utf-8")
 
@@ -350,7 +516,7 @@ def read_ascend_sidecar(source_path: Path) -> dict[str, Any]:
 
 
 def ascend_abi_from_dict(value: Mapping[str, Any]) -> LaunchABI:
-    """Restore a private launch ABI from its sidecar representation."""
+    """Restore the public LaunchABI from a sidecar representation."""
     return LaunchABI(
         public_args=tuple(value.get("public_args", ())),
         kernel_args=tuple(
@@ -659,6 +825,7 @@ class AscendOptimizeSchedule(OptimizeSchedule):
                 },
             )
         self._validate_supported_program(program, context)
+        linalg = _ascend_linalg_contract(program)
         program = _bind_ascend_matmul_dimensions(program)
 
         # Keep Ascend-only analysis adjacent to the backend schedule.  The
@@ -667,8 +834,6 @@ class AscendOptimizeSchedule(OptimizeSchedule):
         program = _attach_private_alias_contract(program, context)
         dot_loop_contract = dot_loop
         lowered = super().run(program, context)
-        lowered = _attach_partial_reduction_contract(lowered)
-        linalg = _ascend_linalg_contract(program)
         dot_loop = dot_loop_contract
 
         if linalg is None and dot_loop is None:
@@ -691,6 +856,7 @@ class AscendOptimizeSchedule(OptimizeSchedule):
         context: Context,
     ) -> tuple[ScheduleCandidate, ...]:
         granularity = schedule.get("granularity")
+        profile = _ascend_profile(context)
 
         if granularity == "parallel-reduction":
             reduction = schedule.get("reduction", {})
@@ -709,6 +875,7 @@ class AscendOptimizeSchedule(OptimizeSchedule):
                     constraints={
                         "dtypes": tuple(sorted(ASCEND_ELEMENTWISE_DTYPES)),
                         "layout": "contiguous",
+                        **_profile_constraints(profile),
                     },
                     tags=("reduction", "row-vector", "tail-safe"),
                 ),
@@ -726,6 +893,7 @@ class AscendOptimizeSchedule(OptimizeSchedule):
                     constraints={
                         "dtypes": tuple(sorted(ASCEND_ELEMENTWISE_DTYPES)),
                         "layout": "contiguous",
+                        **_profile_constraints(profile),
                     },
                     tags=("linalg", "matmul", "tiled", "batched", "tail-safe"),
                 ),
@@ -746,7 +914,10 @@ class AscendOptimizeSchedule(OptimizeSchedule):
                         "core_dim_limit": _max_core_dim(context),
                         "ascend_block_meta": {"TILE_M": 16, "TILE_N": 16},
                     },
-                    constraints={"layout": "strided-non-overlapping"},
+                    constraints={
+                        "layout": "strided-non-overlapping",
+                        **_profile_constraints(profile),
+                    },
                     tags=("layout", "transpose", "private-sidecar-meta"),
                 ),
             )
@@ -761,7 +932,11 @@ class AscendOptimizeSchedule(OptimizeSchedule):
                         "core_dim_limit": _max_core_dim(context),
                         "scan": {"mode": "inclusive", "axis": 0},
                     },
-                    constraints={"layout": "contiguous", "rank": (1, 2, 3)},
+                    constraints={
+                        "layout": "contiguous",
+                        "rank": (1, 2, 3),
+                        **_profile_constraints(profile),
+                    },
                     tags=("scan", "prefix-scan", "tail-safe"),
                 ),
             )
@@ -779,7 +954,10 @@ class AscendOptimizeSchedule(OptimizeSchedule):
                             "status": "source-generated-cann-not-executed",
                         },
                     },
-                    constraints={"layout": "public-access-template"},
+                    constraints={
+                        "layout": "public-access-template",
+                        **_profile_constraints(profile),
+                    },
                     tags=("attention", "online-softmax", "generic-ssa"),
                 ),
             )
@@ -801,6 +979,7 @@ class AscendOptimizeSchedule(OptimizeSchedule):
                     "dtypes": tuple(sorted(ASCEND_ELEMENTWISE_DTYPES)),
                     "layout": "contiguous",
                     "max_core_dim": max_core_dim,
+                    **_profile_constraints(profile),
                 },
                 tags=("default", "elementwise", "fp16", "bf16", "fp32"),
             ),
@@ -881,6 +1060,10 @@ class AscendOptimizeSchedule(OptimizeSchedule):
             tensor_dtypes,
             allow_rng_auxiliary=bool(advanced.get("rng")),
             allow_atomic=bool(advanced.get("atomic")),
+            # A missing annotation is a runtime-specialization marker.  The
+            # materializer still rejects concrete dtypes outside the verified
+            # Ascend capability set after the public lazy path resolves it.
+            allow_unspecified=True,
         )
 
         if unsupported_dtypes:
@@ -920,63 +1103,10 @@ class AscendOptimizeSchedule(OptimizeSchedule):
         if unsupported_views:
             names = ", ".join(unsupported_views)
             raise ValueError(
-                "Ascend backend supports only rank 0 through 3 logical views; "
+                "Ascend backend supports only rank 0 through 4 logical views; "
                 "concrete stride, overlap, and storage-span admission occurs in the "
                 f"Ascend materializer. Unsupported tensors: {names}."
             )
-
-
-def _partial_reduction_stages(
-    extent: Any, block: int = 256
-) -> tuple[Mapping[str, Any], ...]:
-    """Describe a bounded fan-in reduction tree for Ascend private metadata."""
-    value = _static_reduction_extent(extent)
-    if value is None or value <= block:
-        return ()
-    stages = []
-    current = value
-    stage = 0
-    while current > block:
-        outputs = (current + block - 1) // block
-        stages.append(
-            {
-                "stage": stage,
-                "input_extent": current,
-                "output_extent": outputs,
-                "block": block,
-            }
-        )
-        current = outputs
-        stage += 1
-    stages.append(
-        {"stage": stage, "input_extent": current, "output_extent": 1, "block": block}
-    )
-    return tuple(stages)
-
-
-def _attach_partial_reduction_contract(program: ssa.Program) -> ssa.Program:
-    schedule = dict(program.metadata.get("schedule", {}))
-    reduction = schedule.get("reduction")
-    if not isinstance(reduction, Mapping) or reduction.get("mode") != "row-vector":
-        return program
-    stages = _partial_reduction_stages(reduction.get("extent"))
-    if not stages:
-        return program
-    schedule["ascend_partial_reduction"] = {
-        "version": 1,
-        "block": 256,
-        "stages": stages,
-        "strategy": "hierarchical-private-stages",
-        "operator": _reduction_operator(program),
-    }
-    return replace(program, metadata=dict(program.metadata) | {"schedule": schedule})
-
-
-def _reduction_operator(program: ssa.Program) -> str:
-    for operation in _walk_operations(program.blocks):
-        if operation.opcode in {"reduce.sum", "reduce.min", "reduce.max"}:
-            return operation.opcode.removeprefix("reduce.")
-    return "sum"
 
 
 def _attach_private_alias_contract(
@@ -1031,6 +1161,25 @@ def _max_core_dim(context: Context) -> int:
         )
 
     return max_core_dim
+
+
+def _ascend_profile(context: Context) -> AscendSocProfile:
+    options = dict(context.compiler_options.get("backend_options", {}))
+    return ascend_soc_profile(options.get("soc_version"))
+
+
+def _profile_constraints(profile: AscendSocProfile) -> Mapping[str, Any]:
+    return {
+        "soc_version": profile.name,
+        "cube_cores": profile.cube_cores,
+        "vector_cores": profile.vector_cores,
+        "l2_cache_bytes": profile.l2_cache_bytes,
+        "ub_bytes": profile.ub_bytes,
+        "l1_bytes": profile.l1_bytes,
+        "l0a_bytes": profile.l0a_bytes,
+        "l0b_bytes": profile.l0b_bytes,
+        "l0c_bytes": profile.l0c_bytes,
+    }
 
 
 def _static_reduction_extent(value: Any) -> int | None:
@@ -1117,6 +1266,7 @@ def _ascend_linalg_contract(program: ssa.Program) -> Mapping[str, Any] | None:
         "mode": "tiled-matmul",
         "lhs": operation.operands[0],
         "rhs": operation.operands[1],
+        "output": program.outputs[0].name,
         "output_shape": (m, n) if rank == 2 else (batch, m, n),
         "reduction_extent": k,
         "rank": rank,
@@ -1138,9 +1288,10 @@ def _bind_ascend_matmul_dimensions(program: ssa.Program) -> ssa.Program:
     if contract is None:
         return program
 
+    output_shape = tuple(contract["output_shape"])
     dimensions = {
-        "m": contract["output_shape"][0],
-        "n": contract["output_shape"][1],
+        "m": output_shape[-2],
+        "n": output_shape[-1],
         "k": contract["reduction_extent"],
     }
     existing = {
@@ -1218,6 +1369,162 @@ def _bind_ascend_matmul_dimensions(program: ssa.Program) -> ssa.Program:
     return replace(program, blocks=tuple(rewrite(block) for block in program.blocks))
 
 
+def _rewrite_ascend_batched_matmul_access(
+    program: ssa.Program, contract: Mapping[str, Any]
+) -> ssa.Program:
+    """Restore rank-3 operands lost by generic scalar matmul decomposition.
+
+    The shared decomposition intentionally represents a matrix result with two
+    ``index.offset`` values.  For a batched public tile it therefore emits
+    ``lhs[batch, k]`` and ``rhs[k, row]``.  This Ascend-only post-decomposition
+    rewrite restores the public logical coordinates before source emission:
+    ``lhs[batch, row, k]`` and ``rhs[batch, k, col]``.
+    """
+    if contract.get("rank") != 3:
+        return program
+
+    lhs = str(contract["lhs"])
+    rhs = str(contract["rhs"])
+    operations = tuple(_walk_operations(program.blocks))
+    existing = {
+        value.name for operation in operations for value in operation.results
+    } | {value.name for value in (*program.inputs, *program.outputs)}
+    col = "%ascend_matmul_col"
+
+    if col in existing:
+        raise ValueError(
+            "Ascend matmul reserved SSA value `%ascend_matmul_col` is in use."
+        )
+
+    decomposed_offsets = tuple(
+        operation
+        for operation in operations
+        if operation.opcode == "index.offset"
+        and len(operation.operands) == 1
+        and len(operation.results) == 1
+        and operation.attrs.get("decomposition") == "matmul"
+    )
+    offset_outputs = {operation.operands[0] for operation in decomposed_offsets}
+
+    if len(offset_outputs) != 1:
+        raise ValueError(
+            "Ascend rank-3 matmul rewrite requires one decomposed output access template."
+        )
+
+    output = offset_outputs.pop()
+    offsets = {
+        int(operation.attrs.get("dim", -1)): operation.results[0].name
+        for operation in decomposed_offsets
+    }
+    batch = offsets.get(0)
+    row = offsets.get(1)
+
+    if batch is None or row is None:
+        raise ValueError(
+            "Ascend rank-3 matmul rewrite requires decomposed output batch and row offsets."
+        )
+
+    inserted = False
+
+    def rewrite(block: ssa.Block) -> ssa.Block:
+        nonlocal inserted
+        rewritten = []
+
+        for operation in block.operations:
+            regions = tuple(rewrite(region) for region in operation.regions)
+            attrs = dict(operation.attrs)
+            operands = operation.operands
+
+            if (
+                operation.opcode == "index.offset"
+                and operation.operands == (output,)
+                and attrs.get("dim") == 1
+                and attrs.get("decomposition") == "matmul"
+                and not inserted
+            ):
+                rewritten.append(
+                    ssa.Operation(
+                        opcode=operation.opcode,
+                        operands=operands,
+                        results=operation.results,
+                        attrs=attrs,
+                        regions=regions,
+                    )
+                )
+                rewritten.append(
+                    ssa.Operation(
+                        opcode="index.offset",
+                        operands=(output,),
+                        results=(ssa.Value(name=col, type=ssa.Type(kind="index")),),
+                        attrs={
+                            "dim": 2,
+                            "decomposition": "matmul",
+                            "ascend_access_template": "batch-row-col",
+                        },
+                    )
+                )
+                inserted = True
+                continue
+
+            if (
+                operation.opcode == "tensor.extract"
+                and attrs.get("decomposition") == "matmul"
+                and len(operands) == 3
+            ):
+                operand_role = attrs.get("operand")
+                induction = operands[-1] if operand_role == "lhs" else operands[1]
+
+                if operand_role == "lhs" and operands[0] == lhs:
+                    operands = (lhs, batch, row, induction)
+                elif operand_role == "rhs" and operands[0] == rhs:
+                    operands = (rhs, batch, induction, col)
+                else:
+                    raise ValueError(
+                        "Ascend rank-3 matmul rewrite encountered an unexpected "
+                        "decomposed tensor.extract operand."
+                    )
+
+                attrs["ascend_access_template"] = (
+                    "batch-row-k" if operand_role == "lhs" else "batch-k-col"
+                )
+
+            rewritten.append(
+                ssa.Operation(
+                    opcode=operation.opcode,
+                    operands=operands,
+                    results=operation.results,
+                    attrs=attrs,
+                    regions=regions,
+                )
+            )
+
+        return ssa.Block(name=block.name, args=block.args, operations=tuple(rewritten))
+
+    rewritten = replace(
+        program, blocks=tuple(rewrite(block) for block in program.blocks)
+    )
+
+    if not inserted:
+        raise ValueError(
+            "Ascend rank-3 matmul rewrite could not locate the decomposed output column offset."
+        )
+
+    schedule = dict(rewritten.metadata.get("schedule", {}))
+    schedule["ascend_batched_access_rewrite"] = {
+        "version": 1,
+        "mode": "public-access-template",
+        "coordinates": {"lhs": ("batch", "row", "k"), "rhs": ("batch", "k", "col")},
+        "output": ("batch", "row", "col"),
+    }
+    metadata = dict(rewritten.metadata)
+    metadata["schedule"] = schedule
+    metadata["pass_trace"] = tuple(metadata.get("pass_trace", ())) + (
+        "ssa.ascend.rewrite_batched_matmul_access",
+    )
+
+    return replace(rewritten, metadata=metadata)
+
+
 def _granularity_for_analysis(analysis: Mapping[str, Any]) -> str:
     if analysis.get("layout_transfer") is not None:
         return "layout-transfer"
@@ -1260,7 +1567,7 @@ def _is_supported_logical_view(tensor, *, allow_rank4_dot_loop: bool = False) ->
     if allow_rank4_dot_loop:
         return True
 
-    if tensor.ndim not in {0, 1, 2, 3}:
+    if tensor.ndim not in {0, 1, 2, 3, 4}:
         return False
 
     if tensor.layout is None:

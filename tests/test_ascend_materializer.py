@@ -12,7 +12,6 @@ from ninetoothed.backends.materializers.ascend import (
     _current_npu_stream,
     _load_source_module,
     _logical_offset,
-    _matmul_inputs,
     _validate_ascend_bindings,
     _validate_ascend_dtype_specs,
 )
@@ -422,28 +421,7 @@ def test_ascend_binding_validator_accepts_ranked_row_reduction_domains(
     )
 
 
-def test_ascend_binding_validator_accepts_private_partial_reduction():
-    _validate_ascend_bindings(
-        _abi(with_access=True),
-        {"x": _Tensor(257, shape=(257,)), "out": _Tensor(1, shape=())},
-        (
-            TensorSpec(ndim=1, shape=("257",), dtype="float32", name="x"),
-            TensorSpec(ndim=0, shape=(), dtype="float32", name="out"),
-        ),
-        max_core_dim=1,
-        logical_domain=1,
-        reduction_schedule={"mode": "row-vector", "axis": 0},
-        partial_reduction={
-            "strategy": "hierarchical-private-stages",
-            "stages": (
-                {"block": 256, "input_extent": 257, "output_extent": 2},
-                {"block": 256, "input_extent": 2, "output_extent": 1},
-            ),
-        },
-    )
-
-
-def test_ascend_binding_validator_accepts_contiguous_matmul_and_rejects_bad_k():
+def test_ascend_binding_validator_uses_per_binding_access_templates():
     abi = LaunchABI(
         public_args=("a", "b", "out"),
         kernel_args=(
@@ -453,12 +431,34 @@ def test_ascend_binding_validator_accepts_contiguous_matmul_and_rejects_bad_k():
         ),
         outputs=("out",),
     )
+    template = {
+        "offsets": ("value_0", "value_1"),
+        "linear_offset": "value_0 * 127 + value_1",
+        "mask": "True",
+    }
     specs = (
-        TensorSpec(ndim=2, shape=("m", "k"), dtype="float32", name="a"),
-        TensorSpec(ndim=2, shape=("k", "n"), dtype="float32", name="b"),
-        TensorSpec(ndim=2, shape=("m", "n"), dtype="float32", name="out"),
+        TensorSpec(
+            ndim=2,
+            shape=("m", "k"),
+            dtype="float32",
+            name="a",
+            attrs={"source_ndim": 2, "access_templates": (template,)},
+        ),
+        TensorSpec(
+            ndim=2,
+            shape=("k", "n"),
+            dtype="float32",
+            name="b",
+            attrs={"source_ndim": 2, "access_templates": (template,)},
+        ),
+        TensorSpec(
+            ndim=2,
+            shape=("m", "n"),
+            dtype="float32",
+            name="out",
+            attrs={"source_ndim": 2, "access_templates": (template,)},
+        ),
     )
-    contract = {"mode": "tiled-matmul", "lhs": "a", "rhs": "b"}
     public = {
         "a": _Tensor(2159, shape=(17, 127), data_ptr=1024),
         "b": _Tensor(3937, shape=(127, 31), data_ptr=1048576),
@@ -471,37 +471,22 @@ def test_ascend_binding_validator_accepts_contiguous_matmul_and_rejects_bad_k():
         specs,
         max_core_dim=3,
         logical_domain=527,
-        linalg_contract=contract,
     )
 
-    public["b"] = _Tensor(4064, shape=(128, 31), data_ptr=1048576)
-
-    with pytest.raises(ValueError, match=r"lhs\[M,K\] @ rhs\[K,N\]"):
+    public["a"] = _Tensor(
+        2159,
+        shape=(17, 127),
+        storage_elements=2158,
+        data_ptr=1024,
+    )
+    with pytest.raises(TypeError, match="exceeds its underlying storage span"):
         _validate_ascend_bindings(
             abi,
             public,
             specs,
             max_core_dim=3,
             logical_domain=527,
-            linalg_contract=contract,
         )
-
-
-def test_ascend_matmul_contract_rejects_rank_and_dtype_mismatches():
-    contract = {"mode": "matrix-scalar-loop", "lhs": "a", "rhs": "b"}
-    tensors = {
-        "a": _Tensor(2159, shape=(17, 127), dtype="torch.float32"),
-        "b": _Tensor(3937, shape=(127, 31), dtype="torch.float16"),
-        "out": _Tensor(527, shape=(17, 31), dtype="torch.float32"),
-    }
-
-    with pytest.raises(TypeError, match="matching input/output dtypes"):
-        _matmul_inputs(tensors, ("out",), (17, 31), contract)
-
-    tensors["b"] = _Tensor(127, shape=(127,), dtype="torch.float32")
-
-    with pytest.raises(ValueError, match="rank-2 contiguous inputs"):
-        _matmul_inputs(tensors, ("out",), (17, 31), contract)
 
 
 def test_ascend_binding_validator_uses_output_for_core_limit():
@@ -579,8 +564,8 @@ def test_ascend_built_source_artifact_reloads_without_a_binary(tmp_path):
     source_path.with_suffix(".ascend-launch.json").write_text(
         json.dumps(
             {
-                "schema": 2,
-                "abi": {
+                "schema": 3,
+                "launch_abi": {
                     "public_args": [],
                     "kernel_args": [],
                     "outputs": [],

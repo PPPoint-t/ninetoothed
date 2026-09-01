@@ -167,6 +167,7 @@ def _materialize_lazy(compilation, *, output_dir=None, mode="jit") -> Handle:
     suffix = {
         Target.CUDA: "cu",
         Target.TILELANG: "tilelang.py",
+        Target.ASCEND: "ascend.py",
     }[artifact.backend]
     cache_key = compilation_cache_key(compilation)
     source = write_source(
@@ -185,6 +186,7 @@ def _materialize_lazy(compilation, *, output_dir=None, mode="jit") -> Handle:
             args,
             kwargs,
             specs=compilation.kernel.tensors,
+            target=artifact.backend,
         )
         dtypes = _runtime_dtypes(compilation, public)
         specialization_values = _runtime_specialization_values(compilation, public)
@@ -1118,7 +1120,10 @@ def _runtime_wrapper(
     return launch
 
 
-def _public_values(abi: LaunchABI, args, kwargs, *, specs=()) -> dict[str, Any]:
+def _public_values(
+    abi: LaunchABI, args, kwargs, *, specs=(), target: Target = Target.CUDA
+) -> dict[str, Any]:
+    """Bind public arguments using the target's common tensor-device contract."""
     if len(args) > len(abi.public_args):
         raise TypeError(f"Expected at most {len(abi.public_args)} arguments.")
 
@@ -1147,7 +1152,7 @@ def _public_values(abi: LaunchABI, args, kwargs, *, specs=()) -> dict[str, Any]:
     if missing:
         raise TypeError(f"Missing kernel arguments: {', '.join(missing)}.")
 
-    _validate_runtime_values(values, specs)
+    _validate_runtime_values(values, specs, target=target)
 
     return values
 
@@ -1162,7 +1167,7 @@ def _filter_runtime_kwargs(abi: LaunchABI, kwargs) -> dict[str, Any]:
     return {name: value for name, value in kwargs.items() if name in accepted}
 
 
-def _validate_runtime_values(values, specs) -> None:
+def _validate_runtime_values(values, specs, *, target: Target) -> None:
     expected_device = None
 
     for spec in specs:
@@ -1170,11 +1175,13 @@ def _validate_runtime_values(values, specs) -> None:
             continue
 
         value = values[spec.name]
-        expected_device = _validate_tensor_contract(spec, value, expected_device)
+        expected_device = _validate_tensor_contract(
+            spec, value, expected_device, target=target
+        )
         _validate_dtype_contract(spec, value)
 
 
-def _validate_tensor_contract(spec, value, expected_device):
+def _validate_tensor_contract(spec, value, expected_device, *, target: Target):
     source_ndim = int(spec.attrs.get("source_ndim", spec.ndim))
 
     if source_ndim == 0:
@@ -1210,14 +1217,36 @@ def _validate_tensor_contract(spec, value, expected_device):
     if device is None:
         return expected_device
 
-    device_type = getattr(device, "type", str(device).split(":")[0])
+    expected_device_type = _device_type_for_target(target)
+    expected_device_label = _device_label_for_target(target)
+    actual_device_type = getattr(device, "type", str(device).split(":")[0])
 
-    if device_type != "cuda":
-        raise TypeError(f"Kernel argument `{spec.name}` must be on a CUDA device.")
+    if actual_device_type != expected_device_type:
+        raise TypeError(
+            f"Kernel argument `{spec.name}` must be on a {expected_device_label} device."
+        )
 
     if expected_device is not None and device != expected_device:
-        raise TypeError("All tensor arguments must use the same CUDA device.")
+        raise TypeError(
+            f"All tensor arguments must use the same {expected_device_label} device."
+        )
     return device if expected_device is None else expected_device
+
+
+def _device_type_for_target(target: Target) -> str:
+    """Return the PyTorch device type required by a materialization target."""
+    if target == Target.ASCEND:
+        return "npu"
+
+    return "cuda"
+
+
+def _device_label_for_target(target: Target) -> str:
+    """Return the user-facing PyTorch device label for a backend target."""
+    if target == Target.ASCEND:
+        return "NPU"
+
+    return "CUDA"
 
 
 def _validate_dtype_contract(spec, value) -> None:

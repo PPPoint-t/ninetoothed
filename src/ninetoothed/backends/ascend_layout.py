@@ -7,6 +7,7 @@ NPU-specific decision about whether a concrete strided view can be launched.
 from dataclasses import dataclass
 from typing import Any
 
+from ninetoothed.backends.ascend import UnsupportedBackendOpError
 from ninetoothed.compiler.layout_runtime import (
     _tensor_has_non_overlapping_strides,
     memory_spans_overlap,
@@ -14,7 +15,7 @@ from ninetoothed.compiler.layout_runtime import (
 )
 
 
-class AscendLayoutCapabilityError(ValueError):
+class AscendLayoutCapabilityError(UnsupportedBackendOpError):
     """Raised when a concrete layout is outside the verified NPU contract."""
 
 
@@ -37,7 +38,11 @@ class AscendLayout:
 
 
 def admit_tensor_layout(
-    name: str, value: Any, *, allow_rank4_access_template: bool = False
+    name: str,
+    value: Any,
+    *,
+    allow_rank4_access_template: bool = False,
+    allow_zero_stride_read: bool = False,
 ) -> AscendLayout:
     """Validate rank, positive strides, span, and non-overlapping elements."""
     try:
@@ -62,12 +67,19 @@ def admit_tensor_layout(
 
     if storage_offset < 0 or any(stride < 0 for stride in strides):
         raise AscendLayoutCapabilityError(
-            f"Ascend layout for `{name}` does not support negative storage offsets or strides."
+            f"Ascend layout for `{name}` does not support negative storage offsets or strides.",
+            reason="negative stride or storage offset cannot be represented safely by the verified Ascend load contract.",
+            suggestion="materialize a contiguous tensor or use a positive-stride view before launching on Ascend.",
         )
 
-    if not _tensor_has_non_overlapping_strides(value):
+    zero_stride_expand = allow_zero_stride_read and any(
+        stride == 0 and size > 1 for size, stride in zip(shape, strides)
+    )
+    if not zero_stride_expand and not _tensor_has_non_overlapping_strides(value):
         raise AscendLayoutCapabilityError(
-            f"Ascend layout for `{name}` has overlapping strides unsupported by Triton-Ascend."
+            f"Ascend layout for `{name}` has overlapping strides unsupported by Triton-Ascend.",
+            reason="the view aliases storage and writes or ambiguous reads are outside the verified layout contract.",
+            suggestion="pass a non-overlapping positive-stride view or explicitly clone the tensor.",
         )
 
     _validate_storage_span(name, value, shape, strides)

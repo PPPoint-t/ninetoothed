@@ -21,6 +21,22 @@ from ninetoothed.compiler.passes import (
 )
 from ninetoothed.ir import IndexExpr, Kernel, LaunchABI, LaunchBinding, ssa
 
+
+class UnsupportedBackendOpError(ValueError):
+    """Ascend legality rejection with an actionable remediation hint."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        reason: str = "the requested operation is outside the verified Ascend backend contract.",
+        suggestion: str = "use a supported layout or select another backend.",
+    ):
+        self.reason = reason
+        self.suggestion = suggestion
+        super().__init__(f"{message} Reason: {reason} Suggestion: {suggestion}")
+
+
 if TYPE_CHECKING:
     from ninetoothed.compiler.passes import Registry
 
@@ -101,7 +117,7 @@ class AscendBackend(Backend):
         )
 
 
-ASCEND_ELEMENTWISE_DTYPES = frozenset({"float16", "bfloat16", "float32"})
+ASCEND_ELEMENTWISE_DTYPES = frozenset({"float16", "bfloat16", "float32", "int32"})
 ASCEND_RNG_DTYPES = frozenset({"float16", "bfloat16", "float32"})
 ASCEND_ATOMIC_DTYPES = frozenset({"float16", "bfloat16", "float32", "int32"})
 _SIDECAR_SCHEMA = 3
@@ -171,26 +187,53 @@ def ascend_capability_matrix() -> Mapping[str, Any]:
             "elementwise": tuple(sorted(ASCEND_ELEMENTWISE_DTYPES)),
             "rng": tuple(sorted(ASCEND_RNG_DTYPES)),
             "atomic": tuple(sorted(ASCEND_ATOMIC_DTYPES)),
+            "fail_closed": {
+                "float64": "no-verified-ascend-triton-execution-path",
+                "int8": "no-verified-weight-only-dequant-gemm-contract",
+                "int4": "no-native-tensor-dtype-or-dequant-lowering-contract",
+                "float8_e4m3fn": "CANN-910B3-vector-and-matrix-op-not-supported",
+                "float8_e5m2": "CANN-910B3-vector-and-matrix-op-not-supported",
+            },
         },
         "layouts": {
             "contiguous_ranks": (0, 1, 2, 3, 4),
             "dynamic_shape": True,
             "dynamic_stride": True,
-            "non_contiguous": False,
+            "non_contiguous": "verified-positive-stride-non-overlapping",
+            "broadcast": "verified-rank1-row-and-column-singleton",
             "jagged": False,
             "negative_stride": False,
             "storage_offset": "zero-only-for-generic-dot-loop",
         },
         "jit": {"runtime_specialization": True, "aot_reload": True},
+        "aot": {
+            "package": "source-sidecar-manifest",
+            "sidecar_schema": _SIDECAR_SCHEMA,
+            "native_binary": "not-produced-by-triton-ascend",
+            "independent_reload": True,
+        },
+        "microarchitecture": {
+            "double_buffering": "not-emittable-by-triton-ascend-contract",
+            "async_hbm_l1_ub_l0": "not-verified",
+            "tile_autotuning": "fail-closed-deterministic-tiles-only",
+            "verified_gemm_tile": {"m": 16, "n": 16, "k": 64},
+        },
         "operations": {
-            "elementwise": "verified",
+            "elementwise": "verified-fp16-bf16-fp32-int32-positive-stride",
             "matmul": "verified-contiguous-rank-2-fp16-bf16-fp32",
-            "batched_matmul": "verified-contiguous-rank-3-fp16-bf16-fp32-static-shape",
-            "dynamic_matmul_mnk": "fail-closed-pending-single-artifact-validation",
-            "row_vector_reduction": "verified-subset",
+            "batched_matmul": "verified-contiguous-rank-3-fp16-bf16-fp32-static-and-dynamic-shape",
+            "dynamic_matmul_mnk": "verified-single-artifact-runtime-specialization-mnk",
+            "row_vector_reduction": "verified-static-single-block-axis-sum-min-max-keepdim-and-fused-elementwise",
+            "softmax": "verified-last-axis-static-fp16-fp32-block-lte-256",
+            "rmsnorm": "verified-last-axis-static-fp16-fp32-fp32-accumulator-block-lte-256",
             "cross_block_multi_axis_reduction": "fail-closed-pending-private-schedule",
             "generic_dot_loop": "verified-static-shape-subset",
-            "attention": "verified-1x1x16x16-non-causal-subset",
+            "gemm_epilogue": "verified-silu; source-verified-gelu-leaky-relu-scale-bias-residual-same-kernel",
+            "weight_only_matmul": "fail-closed-pending-w8a16-w4a16-dequant-contract",
+            "attention": "verified-static-fp32-batch2-head2-seq32-causal-and-noncausal",
+            "paged_attention": "fail-closed-pending-block-table-indirect-addressing",
+            "varlen_attention": "fail-closed-pending-cu-seqlens-prefix-sum-contract",
+            "gqa_mqa": "fail-closed-pending-kv-head-broadcast-contract",
             "standalone_conv2d": "fail-closed",
         },
     }
@@ -779,7 +822,7 @@ def _ascend_attention_loop_contract(program: ssa.Program) -> Mapping[str, Any] |
         "mode": "generic-online-softmax-loop",
         "causal": "public-scf-if",
         "layout": "public-access-template",
-        "status": "source-generated-cann-not-executed",
+        "status": "verified-static-public-online-softmax",
     }
 
 
@@ -951,7 +994,7 @@ class AscendOptimizeSchedule(OptimizeSchedule):
                         "core_dim_limit": _max_core_dim(context),
                         "ascend_attention_loop": {
                             "mode": "generic-online-softmax-loop",
-                            "status": "source-generated-cann-not-executed",
+                            "status": "verified-static-public-online-softmax",
                         },
                     },
                     constraints={

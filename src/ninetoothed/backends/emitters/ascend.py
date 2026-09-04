@@ -6,6 +6,7 @@ from typing import Iterable
 
 from ninetoothed.backends.ascend import (
     ASCEND_ELEMENTWISE_DTYPES,
+    UnsupportedBackendOpError,
     normalize_ascend_dtype,
     unsupported_ascend_elementwise_dtypes,
 )
@@ -52,6 +53,31 @@ _ASCEND_MATH_INTRINSICS = frozenset(
     }
 )
 
+_ASCEND_FP32_UNARY_INTRINSICS = frozenset(
+    {
+        "abs",
+        "acos",
+        "asin",
+        "atan",
+        "atan2",
+        "cos",
+        "cosh",
+        "erf",
+        "exp",
+        "exp2",
+        "expm1",
+        "log",
+        "log1p",
+        "log2",
+        "log10",
+        "rsqrt",
+        "sin",
+        "sinh",
+        "sqrt",
+        "tanh",
+    }
+)
+
 _GENERIC_SSA_PREFIXES = (
     "arith.",
     "cmp.",
@@ -84,6 +110,16 @@ class AscendTarget(TritonTarget):
         if mask is None and self.default_load_mask:
             mask = "mask"
 
+        if mask is not None and ("padding_" in index or "padding_" in str(mask)):
+            # Triton-Ascend must not receive a negative physical pointer even
+            # for a masked lane.  Padding views express invalid logical window
+            # positions with the same predicate used by the load, so clamp only
+            # those lanes to the tensor base and retain ``other`` as their value.
+            # This is the target spelling of the public access-template contract;
+            # it does not change its coordinates or introduce a copied im2col.
+            safe_index = f"tl.where(({mask}), ({index}), 0)"
+            return super().load(tensor, safe_index, mask=f"({mask})", other=other)
+
         return super().load(tensor, index, mask=mask, other=other)
 
     def call(self, name, args):
@@ -97,7 +133,40 @@ class AscendTarget(TritonTarget):
                     "Ascend RNG lowering requires seed and offset operands."
                 )
             return f"tl.rand({args[0]}, {args[1]})"
+
+        if name in _ASCEND_FP32_UNARY_INTRINSICS and args:
+            # Ascend Vector math is most stable when low-precision operands are
+            # promoted in UB.  The result is still written through the public
+            # tensor dtype at the store boundary.
+            args = tuple(self._upcast_fp32(arg) for arg in args)
+
         return super().call(name, args)
+
+    @staticmethod
+    def _upcast_fp32(value: str) -> str:
+        text = str(value)
+        if re.fullmatch(r"[-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?", text):
+            return text
+        if ".to(tl.float32)" in text:
+            return text
+        return f"({text}).to(tl.float32)"
+
+    def coerce_binary_args(self, operation, args, context):
+        if operation.opcode.startswith(("arith.", "math.")):
+            low_precision = any(
+                getattr(context.value_types.get(operand), "dtype", None)
+                in {"float16", "bfloat16", "fp16", "bf16"}
+                for operand in operation.operands
+            )
+            if low_precision:
+                return tuple(
+                    self._upcast_fp32(arg)
+                    if getattr(context.value_types.get(operand), "dtype", None)
+                    in {"float16", "bfloat16", "fp16", "bf16"}
+                    else arg
+                    for operand, arg in zip(operation.operands, args)
+                )
+        return args
 
     def atomic_add(self, operands: tuple[str, ...], dtype: str) -> str:
         """Broadcast a scalar destination pointer across the current block."""
@@ -387,6 +456,15 @@ def _validate_program(kernel: Kernel) -> None:
 
     schedule = kernel.ssa.metadata.get("schedule", {})
 
+    reduction = schedule.get("reduction", {})
+    axis = reduction.get("axis")
+    if isinstance(axis, (tuple, list)) or (isinstance(axis, str) and "," in axis):
+        raise UnsupportedBackendOpError(
+            "Ascend reduction does not support multi-axis reduction.",
+            reason="the verified Ascend reduction schedule has one-axis row-vector semantics and no multi-axis workspace contract.",
+            suggestion="reduce one axis at a time or lower the operation to a supported single-axis schedule.",
+        )
+
     if schedule.get("granularity") not in {
         "elementwise-grid",
         "parallel-reduction",
@@ -408,6 +486,22 @@ def _validate_program(kernel: Kernel) -> None:
                 "Ascend emitter requires the verified row-vector reduction "
                 f"contract; received mode `{reduction.get('mode')}`."
             )
+
+    if schedule.get("granularity") == "blocked-linalg":
+        tile = schedule.get("tile", {})
+        for field, alignment in (("block_m", 16), ("block_n", 16), ("block_k", 16)):
+            value = tile.get(field)
+            if value is not None:
+                try:
+                    aligned = int(value) % alignment == 0
+                except (TypeError, ValueError):
+                    aligned = False
+                if not aligned:
+                    raise UnsupportedBackendOpError(
+                        f"Ascend tile `{field}`={value!r} is not aligned.",
+                        reason=f"Ascend Cube tile dimension `{field}` must be a multiple of {alignment}.",
+                        suggestion=f"choose a {alignment}-aligned tile or let the Ascend schedule select the verified 16x16x64 tile.",
+                    )
 
     if schedule.get("granularity") == "scan":
         scan = schedule.get("scan", {})

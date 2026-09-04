@@ -13,7 +13,12 @@ import tests.test_matmul as matmul
 from ninetoothed import Tensor
 from ninetoothed.compiler.cache import CACHE_DIR
 from ninetoothed.compiler.runtime import overflow_terms
-from tests.utils import get_available_devices
+from tests.utils import (
+    assert_artifact_ready,
+    device_count,
+    get_available_devices,
+    get_stream,
+)
 
 
 @pytest.mark.parametrize("device", get_available_devices())
@@ -48,7 +53,7 @@ def test_add(test_multi_device, size, dtype, device, ninetoothed_dtype):
     shape = (size,)
 
     if test_multi_device:
-        if torch.cuda.device_count() < 2:
+        if device_count(device) < 2:
             pytest.skip("multi-device testing requires at least 2 devices")
 
         devices = (f"{device}:0", f"{device}:1")
@@ -56,14 +61,15 @@ def test_add(test_multi_device, size, dtype, device, ninetoothed_dtype):
         devices = (device,)
 
     for device in devices:
-        with torch.cuda.Stream(device=device):
+        with get_stream(device):
             input = torch.randn(shape, dtype=dtype, device=device)
             other = torch.randn(shape, dtype=dtype, device=device)
             output = torch.empty_like(input)
 
             kernel(input, other, output)
-            assert kernel._library is not None
-            assert Path(kernel._library).is_file()
+            assert_artifact_ready(kernel, device)
+            if kernel._library is not None:
+                assert Path(kernel._library).is_file()
 
             expected = torch.add(input, other)
 

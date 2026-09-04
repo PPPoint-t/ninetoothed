@@ -4,7 +4,10 @@ import pytest
 
 from ninetoothed.backends import emit
 from ninetoothed.backends.core import Target
-from ninetoothed.backends.emitters.ascend import diagnose_opcode_coverage
+from ninetoothed.backends.emitters.ascend import (
+    UnsupportedBackendOpError,
+    diagnose_opcode_coverage,
+)
 from ninetoothed.compiler.passes import lower_for_target
 from ninetoothed.frontend.python import from_source
 from ninetoothed.ir import Kernel, TensorSpec, ssa
@@ -63,6 +66,45 @@ def test_ascend_emits_pow_from_generic_ssa():
 
     assert "pow(" in source
     ast.parse(source)
+
+
+def test_ascend_promotes_low_precision_vector_math_to_fp32():
+    kernel = _kernel(
+        "\ndef exp_add(x, y, out):\n    out = x.exp() + y\n",
+        name="exp_add",
+        tensors=(
+            TensorSpec(ndim=1, shape=("n",), dtype="float16", name="x"),
+            TensorSpec(ndim=1, shape=("n",), dtype="float16", name="y"),
+            TensorSpec(ndim=1, shape=("n",), dtype="float16", name="out"),
+        ),
+    )
+    source = emit(kernel, Target.ASCEND).primary_source
+    assert ".to(tl.float32)" in source
+    assert "tl.exp(" in source
+    ast.parse(source)
+
+
+def test_ascend_legality_reports_multi_axis_reduction():
+    kernel = _kernel("\ndef add(x, y, out):\n    out = x + y\n")
+    program = ssa.Program(
+        kind=kernel.ssa.kind,
+        inputs=kernel.ssa.inputs,
+        outputs=kernel.ssa.outputs,
+        blocks=kernel.ssa.blocks,
+        metadata={"schedule": {"reduction": {"axis": (1, 2)}}},
+    )
+    guarded = Kernel(
+        kernel_name="multi_axis",
+        source="",
+        source_language="test",
+        entrypoint="multi_axis",
+        tensors=kernel.tensors,
+        ssa=program,
+    )
+    with pytest.raises(UnsupportedBackendOpError, match="multi-axis reduction"):
+        from ninetoothed.backends.emitters.ascend import _validate_program
+
+        _validate_program(guarded)
 
 
 def test_ascend_emits_rand_with_seed_offset_abi():
@@ -284,6 +326,62 @@ def test_ascend_emits_row_vector_reduction():
     ast.parse(source)
 
 
+def test_ascend_emits_fused_softmax_and_fp32_rmsnorm_reductions():
+    softmax_tensors = tuple(
+        TensorSpec(ndim=2, shape=("rows", "cols"), dtype="float32", name=name)
+        for name in ("input", "output")
+    )
+    rmsnorm_tensors = tuple(
+        TensorSpec(ndim=2, shape=("rows", "cols"), dtype="float16", name=name)
+        for name in ("input", "output")
+    )
+    sources = (
+        (
+            """
+def normalized(input, output):
+    maximum = max(input, axis=-1)
+    numerator = (input - maximum[:, None]).exp()
+    denominator = sum(numerator, axis=-1)
+    output = numerator / denominator[:, None]
+""",
+            softmax_tensors,
+            ("tl.max(", "tl.exp(", "tl.sum("),
+        ),
+        (
+            """
+def normalized(input, output):
+    input_fp32 = input.to(float32)
+    mean_square = sum(input_fp32 * input_fp32, axis=-1) / input.shape[-1]
+    inverse_rms = (mean_square + 1e-5).rsqrt()
+    output = input * inverse_rms[:, None]
+""",
+            rmsnorm_tensors,
+            (".to(tl.float32)", "tl.sum(", "tl.rsqrt("),
+        ),
+    )
+
+    for source, tensors, expected in sources:
+        kernel = _kernel(source, name="normalized", tensors=tensors)
+        lowered = lower_for_target(
+            kernel.ssa, backend=Target.ASCEND, tensors=kernel.tensors
+        )
+        artifact = emit(
+            Kernel(
+                kernel_name=kernel.kernel_name,
+                source=kernel.source,
+                source_language=kernel.source_language,
+                entrypoint=kernel.entrypoint,
+                tensors=kernel.tensors,
+                ssa=lowered,
+            ),
+            Target.ASCEND,
+        )
+
+        assert all(token in artifact.primary_source for token in expected)
+        assert artifact.metadata["ssa_schedule"]["reduction"]["mode"] == "row-vector"
+        ast.parse(artifact.primary_source)
+
+
 def test_ascend_emits_decomposed_matmul_with_tail_safe_loads():
     tensors = (
         TensorSpec(ndim=2, shape=("m", "k"), dtype="float32", name="a"),
@@ -464,6 +562,34 @@ def test_ascend_emits_singleton_broadcast_coordinates():
     source = emit(kernel, Target.ASCEND).primary_source
 
     assert "tl.load(bias + 0)" in source
+    ast.parse(source)
+
+
+@pytest.mark.parametrize(
+    ("bias_shape", "expected_coordinate"),
+    (
+        (("m", "1"), "((index // (n))) + (0)"),
+        (("1", "n"), "(0) * (n) + ((index % n))"),
+        (("1", "1"), "tl.load(bias + (0) + (0))"),
+    ),
+)
+def test_ascend_emits_multidimensional_singleton_broadcast_coordinates(
+    bias_shape, expected_coordinate
+):
+    tensors = (
+        TensorSpec(ndim=2, shape=("m", "n"), dtype="float32", name="x"),
+        TensorSpec(ndim=2, shape=bias_shape, dtype="float32", name="bias"),
+        TensorSpec(ndim=2, shape=("m", "n"), dtype="float32", name="out"),
+    )
+    source = emit(
+        _kernel(
+            "\ndef add(x, bias, out):\n    out = x + bias\n",
+            tensors=tensors,
+        ),
+        Target.ASCEND,
+    ).primary_source
+
+    assert expected_coordinate in source
     ast.parse(source)
 
 

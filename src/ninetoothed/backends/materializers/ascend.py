@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from ninetoothed.backends.ascend import (
+    UnsupportedBackendOpError,
     ascend_abi_from_dict,
     ascend_cache_key,
     ascend_logical_domain,
@@ -96,6 +97,7 @@ class AscendMaterializer(Materializer):
             advanced_contract=sidecar.get("advanced_contract"),
             dot_loop=sidecar.get("dot_loop"),
             attention_loop=sidecar.get("attention_loop"),
+            linalg_contract=sidecar.get("linalg_contract"),
         )
 
 
@@ -181,6 +183,7 @@ def _materialize(compilation, *, output_dir: str | Path | None):
         advanced_contract=schedule.get("ascend_advanced"),
         dot_loop=schedule.get("ascend_dot_loop"),
         attention_loop=schedule.get("ascend_attention_loop"),
+        linalg_contract=schedule.get("ascend_linalg"),
     )
 
     return Handle(compilation, (module, kernel), wrapped, published_source)
@@ -235,6 +238,7 @@ def _ascend_wrapper(
     advanced_contract=None,
     dot_loop=None,
     attention_loop=None,
+    linalg_contract=None,
 ):
     from ninetoothed.compiler.runtime import (
         _bound_values,
@@ -257,6 +261,7 @@ def _ascend_wrapper(
             advanced_contract=advanced_contract,
             dot_loop=dot_loop,
             attention_loop=attention_loop,
+            linalg_contract=linalg_contract,
         )
 
         if _empty_launch(abi, public):
@@ -328,24 +333,49 @@ def _validate_dot_loop_runtime_shapes(spec_by_name, tensors, dot_loop) -> None:
         spec = spec_by_name[name]
         source_shape = tuple(spec.attrs.get("source_shape", ()))
 
-        try:
-            expected_shape = tuple(int(dimension) for dimension in source_shape)
-        except (TypeError, ValueError) as exc:
-            raise ValueError(
-                "Ascend generic dot-loop requires statically resolved source shapes."
-            ) from exc
+        concrete_shape = []
+        for dimension in source_shape:
+            try:
+                concrete_shape.append(int(dimension))
+            except (TypeError, ValueError):
+                concrete_shape.append(None)
 
-        if tuple(value.shape) != expected_shape:
+        if any(
+            expected is not None and actual != expected
+            for actual, expected in zip(
+                tuple(value.shape), concrete_shape, strict=False
+            )
+        ):
             raise ValueError(
                 f"Ascend generic dot-loop argument `{name}` has shape "
                 f"{tuple(value.shape)}; expected the compiled access-template "
-                f"shape {expected_shape}."
+                f"shape {tuple(concrete_shape)}."
             )
 
         if value.storage_offset() != 0:
             raise ValueError(
                 f"Ascend generic dot-loop argument `{name}` must have storage offset zero."
             )
+
+
+def validate_tile_ub_capacity(tile, *, dtype_bytes=2, ub_limit_bytes=192 * 1024):
+    """Reject tiles whose input, output, and FP32 accumulator exceed UB budget."""
+    try:
+        m, n, k = (int(tile[key]) for key in ("m", "n", "k"))
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(
+            "Ascend tile contract must provide integer m, n, and k."
+        ) from exc
+    if min(m, n, k) <= 0 or dtype_bytes <= 0:
+        raise ValueError("Ascend tile dimensions and dtype size must be positive.")
+    required = (m * k + k * n) * dtype_bytes + (m * n) * 4
+    if required > ub_limit_bytes:
+        raise UnsupportedBackendOpError(
+            f"Ascend tile {m}x{n}x{k} requires {required} UB bytes (limit {ub_limit_bytes}).",
+            reason="the tile working set exceeds the verified 910B3 UB capacity.",
+            suggestion="reduce BLOCK_SIZE_M/N/K or split the operation into smaller tiles.",
+        )
+    return required
 
 
 def _validate_ascend_bindings(
@@ -361,6 +391,7 @@ def _validate_ascend_bindings(
     advanced_contract=None,
     dot_loop=None,
     attention_loop=None,
+    linalg_contract=None,
 ) -> None:
     spec_by_name = {spec.name: spec for spec in specs}
     _validate_ascend_dtype_specs(
@@ -396,20 +427,14 @@ def _validate_ascend_bindings(
             )
 
         try:
-            layout = admit_tensor_layout(
+            admit_tensor_layout(
                 binding.source,
                 value,
                 allow_rank4_access_template=True,
+                allow_zero_stride_read=binding.access == "read",
             )
         except AscendLayoutCapabilityError as exc:
             raise TypeError(str(exc)) from exc
-
-        if not layout.contiguous:
-            raise TypeError(
-                "Ascend layout lowering has not verified runtime non-contiguous "
-                f"stride addressing for `{binding.source}`; pass a contiguous tensor "
-                "or use a verified direct layout-transfer kernel."
-            )
 
         _validate_storage_span(binding.source, value)
         tensors[binding.source] = value
@@ -418,6 +443,19 @@ def _validate_ascend_bindings(
         return
 
     _validate_dot_loop_runtime_shapes(spec_by_name, tensors, dot_loop)
+    if dot_loop:
+        tile = dot_loop.get("tile", {})
+        sample_dtype = next(iter(tensors.values()), None)
+        dtype_bytes = (
+            4
+            if normalize_ascend_dtype(getattr(sample_dtype, "dtype", None)) == "float32"
+            else 2
+        )
+        validate_tile_ub_capacity(tile, dtype_bytes=dtype_bytes)
+
+    matmul_inputs = _validate_matmul_runtime_shapes(
+        spec_by_name, tensors, linalg_contract
+    )
 
     if not abi.outputs:
         raise ValueError("Ascend elementwise launch requires an output tensor.")
@@ -522,6 +560,12 @@ def _validate_ascend_bindings(
         if name in reduction_inputs or name in layout_inputs or name in advanced_inputs:
             continue
 
+        if name in matmul_inputs:
+            continue
+
+        if not is_output and _is_supported_broadcast_shape(shape, output_shape):
+            continue
+
         if len(shape) != len(output_shape):
             raise ValueError(
                 "Ascend elementwise launch requires tensor arguments to match the "
@@ -539,9 +583,6 @@ def _validate_ascend_bindings(
                 "Ascend multi-output elementwise launch requires every output "
                 f"to contain {output.numel()} elements; `{name}` has {value.numel()}."
             )
-
-        if not is_output and _is_supported_broadcast_shape(shape, output_shape):
-            continue
 
         required_elements = logical_elements
 
@@ -568,14 +609,53 @@ def _validate_ascend_bindings(
         )
 
 
+def _validate_matmul_runtime_shapes(spec_by_name, tensors, contract):
+    """Validate dynamic matmul dimensions while leaving shape semantics to SSA."""
+    if not contract or contract.get("mode") != "tiled-matmul":
+        return frozenset()
+
+    names = (contract.get("lhs"), contract.get("rhs"), contract.get("output"))
+    if any(name not in tensors or name not in spec_by_name for name in names):
+        raise ValueError("Ascend matmul launch is missing a tensor binding.")
+
+    lhs, rhs, output = (tensors[name] for name in names)
+    if (
+        len(lhs.shape) not in {2, 3}
+        or tuple(rhs.shape)[: len(lhs.shape) - 2]
+        != tuple(lhs.shape)[: len(lhs.shape) - 2]
+    ):
+        raise ValueError(
+            "Ascend matmul runtime tensors must have matching batch ranks."
+        )
+    if len(lhs.shape) == 2:
+        expected = (lhs.shape[0], rhs.shape[1])
+        if tuple(output.shape) != expected or lhs.shape[1] != rhs.shape[0]:
+            raise ValueError(
+                "Ascend matmul runtime shapes do not satisfy MxK @ KxN -> MxN."
+            )
+    else:
+        expected = (lhs.shape[0], lhs.shape[1], rhs.shape[2])
+        if tuple(output.shape) != expected or lhs.shape[2] != rhs.shape[1]:
+            raise ValueError("Ascend batched matmul runtime shapes are incompatible.")
+    return frozenset(names)
+
+
 def _is_supported_broadcast_shape(shape, output_shape) -> bool:
-    if shape == output_shape:
-        return True
+    """Accept trailing-aligned singleton broadcasts emitted by shared SSA.
 
-    if len(output_shape) == 1:
-        return shape == (1,)
+    The emitter maps singleton axes to coordinate zero and maps omitted leading
+    axes to zero as well.  Runtime admission mirrors precisely that contract;
+    expanded zero-stride tensors remain rejected by ``admit_tensor_layout``.
+    """
+    if len(shape) > len(output_shape):
+        return False
 
-    return len(output_shape) == 2 and shape == (1, output_shape[1])
+    aligned_shape = (1,) * (len(output_shape) - len(shape)) + tuple(shape)
+
+    return all(
+        input_size == 1 or input_size == output_size
+        for input_size, output_size in zip(aligned_shape, output_shape)
+    )
 
 
 def _uses_public_access_template(spec) -> bool:
@@ -615,6 +695,13 @@ def _validate_binding_storage_span(name: str, value: Any, spec) -> None:
 
 
 def _row_reduction_inputs(tensors, output_names, output_shape, reduction_schedule):
+    """Identify inputs consumed by a verified row-reduction schedule.
+
+    A direct reduction writes the reduced domain, while fused Softmax and
+    RMSNorm consume the same row reduction before returning to the original
+    value domain.  Both forms use the same emitter schedule; this admission
+    check only recognizes their declared rank/domain relationship.
+    """
     if not reduction_schedule or reduction_schedule.get("mode") != "row-vector":
         return frozenset()
 
@@ -647,10 +734,33 @@ def _row_reduction_inputs(tensors, output_names, output_shape, reduction_schedul
 
         inputs.add(name)
 
+    value_shape = tuple(reduction_schedule.get("value_shape", ()))
+    result_shape = tuple(reduction_schedule.get("result_shape", ()))
+    output_shape_symbols = tuple(str(dim) for dim in output_shape)
+    fused_value_domain = len(value_shape) == len(output_shape) and (
+        tuple(str(dim) for dim in result_shape) == output_shape_symbols
+        or len(result_shape) == len(output_shape) - 1
+    )
+
+    if not inputs and fused_value_domain:
+        inputs.update(
+            name
+            for name, value in tensors.items()
+            if name not in output_names
+            and (
+                tuple(str(dim) for dim in value.shape)
+                == tuple(str(dim) for dim in value_shape)
+                or (
+                    len(result_shape) == len(output_shape) - 1
+                    and tuple(value.shape) == output_shape
+                )
+            )
+        )
+
     if not inputs:
         raise ValueError(
-            "Ascend row-vector reduction requires a contiguous input whose shape "
-            "equals the output shape with the reduction axis inserted."
+            "Ascend row-vector reduction requires a contiguous input in its direct "
+            "reduced domain or fused value domain."
         )
 
     return frozenset(inputs)
@@ -749,7 +859,7 @@ def _validate_ascend_dtype_specs(
 
     if unsupported:
         raise ValueError(
-            "Ascend materializer supports only verified FP16, BF16, and FP32 "
+            "Ascend materializer supports only verified FP16, BF16, FP32, and INT32 "
             "elementwise dtypes; received tensor dtypes: "
             f"{', '.join(unsupported)}."
         )

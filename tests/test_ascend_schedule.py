@@ -4,6 +4,7 @@ from ninetoothed import Tensor
 from ninetoothed.backends.ascend import (
     _ascend_advanced_contract,
     _ascend_attention_loop_contract,
+    ascend_capability_matrix,
     ascend_logical_domain,
     is_static_forward_view_offset,
     static_forward_view_offset,
@@ -14,6 +15,31 @@ from ninetoothed.compiler.passes import lower_for_target
 from ninetoothed.frontend.layout import tensor_specs
 from ninetoothed.frontend.python import from_source
 from ninetoothed.ir import TensorSpec, ssa
+
+
+def test_ascend_llm_attention_capability_boundaries_are_explicit():
+    operations = ascend_capability_matrix()["operations"]
+    assert operations["attention"].startswith("verified-static")
+    assert operations["paged_attention"].startswith("fail-closed")
+    assert operations["varlen_attention"].startswith("fail-closed")
+    assert operations["gqa_mqa"].startswith("fail-closed")
+
+
+def test_ascend_weight_only_and_fp8_capability_boundaries_are_explicit():
+    matrix = ascend_capability_matrix()
+    assert matrix["operations"]["weight_only_matmul"].startswith("fail-closed")
+    assert matrix["dtypes"]["fail_closed"]["int8"].startswith("no-verified")
+    assert matrix["dtypes"]["fail_closed"]["int4"].startswith("no-native")
+    assert "not-supported" in matrix["dtypes"]["fail_closed"]["float8_e4m3fn"]
+    assert "not-supported" in matrix["dtypes"]["fail_closed"]["float8_e5m2"]
+
+
+def test_ascend_pipeline_and_autotune_boundaries_are_explicit():
+    micro = ascend_capability_matrix()["microarchitecture"]
+    assert micro["double_buffering"].startswith("not-emittable")
+    assert micro["async_hbm_l1_ub_l0"] == "not-verified"
+    assert micro["tile_autotuning"].startswith("fail-closed")
+    assert micro["verified_gemm_tile"] == {"m": 16, "n": 16, "k": 64}
 
 
 def _program(source: str, tensors: tuple[TensorSpec, ...], kind: str):
@@ -306,7 +332,7 @@ def test_ascend_accepts_verified_low_precision_dtypes_before_source_emission(dty
     )
 
 
-@pytest.mark.parametrize("dtype", ("float64", "int32"))
+@pytest.mark.parametrize("dtype", ("float64",))
 def test_ascend_rejects_unverified_dtype_before_source_emission(dtype):
     with pytest.raises(ValueError, match="only FP16, BF16, and FP32 elementwise SSA"):
         lower_for_target(_elementwise_program(dtype), backend=Target.ASCEND)

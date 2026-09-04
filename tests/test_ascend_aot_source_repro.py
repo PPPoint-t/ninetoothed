@@ -4,6 +4,9 @@ These tests intentionally stop after source emission and private sidecar reload.
 They do not invoke the Triton-Ascend compiler or an NPU runtime.
 """
 
+import ast
+import functools
+
 from ninetoothed import Tensor
 from ninetoothed.backends.ascend import read_ascend_sidecar, write_ascend_sidecar
 from ninetoothed.backends.core import Target
@@ -44,6 +47,31 @@ def _dot_loop_request():
     )
 
 
+def _padded_dot_loop_request():
+    return CompileRequest(
+        arrangement=functools.partial(
+            test_conv2d.arrangement,
+            enable_padding=True,
+            BLOCK_SIZE_M=16,
+            BLOCK_SIZE_N=16,
+            BLOCK_SIZE_K=16,
+        ),
+        application=test_conv2d.matmul.application,
+        tensors=(
+            Tensor(shape=(1, 2, 4, 4), dtype="float16"),
+            Tensor(shape=(3, 2, 3, 3), dtype="float16"),
+            Tensor(shape=(1, 3, 4, 4), dtype="float16"),
+        ),
+        backend=Target.ASCEND,
+        kernel_name="ascend_padded_dot_loop_source_repro",
+        tensor_dtypes={
+            "input": "float16",
+            "filter": "float16",
+            "output": "float16",
+        },
+    )
+
+
 def _attention_request():
     q, k, v, o = tuple(
         Tensor(
@@ -77,6 +105,21 @@ def test_ascend_dot_loop_sidecar_reload_reproduces_source(tmp_path):
     assert second.artifact.primary_source == first.artifact.primary_source
 
 
+def test_ascend_padded_conv_access_template_clamps_invalid_addresses():
+    source = DEFAULT_COMPILER.compile(
+        _padded_dot_loop_request()
+    ).artifact.primary_source
+
+    # ``padding_*`` remains part of the public coordinate expression.  Ascend
+    # additionally derives the physical pointer from that exact load predicate,
+    # so invalid padded lanes cannot form negative addresses before masked load.
+    assert "ninetoothed_constexpr_prefix_padding_h" in source
+    assert "ninetoothed_constexpr_prefix_padding_w" in source
+    assert "tl.load(lhs + tl.where((" in source
+    assert "), 0), mask=(True &" in source
+    ast.parse(source)
+
+
 def test_ascend_attention_sidecar_reload_reproduces_source(tmp_path):
     request = _attention_request()
     first = DEFAULT_COMPILER.compile(request)
@@ -86,7 +129,7 @@ def test_ascend_attention_sidecar_reload_reproduces_source(tmp_path):
 
     attention = first_schedule["ascend_attention_loop"]
     assert attention["mode"] == "generic-online-softmax-loop"
-    assert attention["status"] == "source-generated-cann-not-executed"
+    assert attention["status"] == "verified-static-public-online-softmax"
     assert sidecar["attention_loop"] == attention
     assert (
         second.artifact.metadata["ssa_metadata"]["schedule"]["ascend_attention_loop"]

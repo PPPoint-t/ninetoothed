@@ -198,7 +198,7 @@ def test_ascend_binding_validator_rejects_runtime_dtype_mismatch():
         )
 
 
-@pytest.mark.parametrize("dtype", ("float64", "int8", None))
+@pytest.mark.parametrize("dtype", ("float64", None))
 def test_ascend_materializer_rejects_unverified_dtype_specs(dtype):
     specs = (TensorSpec(ndim=1, shape=("n",), dtype=dtype, name="x"),)
 

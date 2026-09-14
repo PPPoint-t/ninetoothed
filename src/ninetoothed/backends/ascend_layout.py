@@ -43,6 +43,7 @@ def admit_tensor_layout(
     *,
     allow_rank4_access_template: bool = False,
     allow_zero_stride_read: bool = False,
+    allow_overlapping_read: bool = False,
 ) -> AscendLayout:
     """Validate rank, positive strides, span, and non-overlapping elements."""
     try:
@@ -75,11 +76,21 @@ def admit_tensor_layout(
     zero_stride_expand = allow_zero_stride_read and any(
         stride == 0 and size > 1 for size, stride in zip(shape, strides)
     )
-    if not zero_stride_expand and not _tensor_has_non_overlapping_strides(value):
-        raise AscendLayoutCapabilityError(
-            f"Ascend layout for `{name}` has overlapping strides unsupported by Triton-Ascend.",
-            reason="the view aliases storage and writes or ambiguous reads are outside the verified layout contract.",
-            suggestion="pass a non-overlapping positive-stride view or explicitly clone the tensor.",
+    if (
+        not zero_stride_expand
+        and not allow_overlapping_read
+        and not _tensor_has_non_overlapping_strides(value)
+    ):
+        # This is a target legality boundary, not a late CANN error.  Do not
+        # attempt to materialize a physical address mapping for an aliased view
+        # until the Ascend emitter has such a mapping contract.
+        raise UnsupportedBackendOpError(
+            "Ascend backend requires non-overlapping contiguous strides.",
+            reason=(
+                f"tensor `{name}` has overlapping strides and its view aliases "
+                "storage outside the verified Ascend layout contract."
+            ),
+            suggestion="materialize a contiguous tensor before launching on Ascend.",
         )
 
     _validate_storage_span(name, value, shape, strides)

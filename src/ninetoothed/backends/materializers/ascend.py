@@ -173,7 +173,21 @@ def _materialize(compilation, *, output_dir: str | Path | None):
                 tuple(artifact.metadata.get("outputs", ())),
                 allow_access_template=True,
             )
+            # An access-template artifact may have its tile meta parameters
+            # specialized into source before launch ABI construction.  Retain
+            # symbolic validation only when every symbol has one, and exactly
+            # one, ABI binding; otherwise output.numel() is the authoritative
+            # runtime domain.  This prevents stale, doubly-prefixed layout
+            # symbols from becoming phantom launch parameters.
             if access_template
+            and _logical_domain_is_abi_bound(
+                ascend_logical_domain(
+                    compilation.kernel.tensors,
+                    tuple(artifact.metadata.get("outputs", ())),
+                    allow_access_template=True,
+                ),
+                abi,
+            )
             else None
         ),
         reduction_schedule=artifact.metadata.get("ssa_metadata", {})
@@ -432,8 +446,16 @@ def _validate_ascend_bindings(
                 value,
                 allow_rank4_access_template=True,
                 allow_zero_stride_read=binding.access == "read",
+                # Loads use the same per-dimension source-stride address
+                # expression as CUDA.  An aliased source is consequently safe
+                # for read-only clone/gather semantics; any writer remains
+                # subject to the non-overlapping layout contract.
+                allow_overlapping_read=binding.access == "read",
             )
         except AscendLayoutCapabilityError as exc:
+            # Preserve the established diagnostics for malformed metadata and
+            # invalid storage spans.  Overlapping views are rejected directly
+            # by ``admit_tensor_layout`` as UnsupportedBackendOpError above.
             raise TypeError(str(exc)) from exc
 
         _validate_storage_span(binding.source, value)
@@ -875,6 +897,29 @@ def _resolve_logical_domain(expression, abi, public) -> int:
         )
 
     return value
+
+
+def _logical_domain_is_abi_bound(expression, abi) -> bool:
+    """Return whether a private logical-domain expression has ABI bindings.
+
+    Tile constants are intentionally specialized into generated Ascend source.
+    They must not be reintroduced as runtime ABI arguments merely because a
+    pre-specialization layout expression still mentions them.
+    """
+    from ninetoothed.ir import IndexExpr
+
+    available = {
+        binding.name
+        for binding in abi.kernel_args
+        if binding.kind in {"shape", "stride", "meta", "constexpr"}
+    }
+
+    def bound(node) -> bool:
+        if node.op == "symbol":
+            return str(node.value) in available
+        return all(bound(operand) for operand in node.operands)
+
+    return bound(IndexExpr.parse(expression))
 
 
 def _logical_offset(spec, abi, public) -> int:

@@ -205,6 +205,19 @@ class AscendTarget(TritonTarget):
         launch_grid = f"triton.cdiv({launch_total}, block)"
         offsets_expression = "tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)"
         schedule = kernel.ssa.metadata.get("schedule", {})
+        tile = dict(schedule.get("ascend_tile_override", schedule.get("tile", {})))
+        block_value = tile.get(
+            "BLOCK_SIZE_M", tile.get("elements", tile.get("block_m", 256))
+        )
+        try:
+            block_value = int(block_value)
+        except (TypeError, ValueError):
+            block_value = 256
+        compiler_flags = ""
+        if schedule.get("granularity") == "blocked-linalg":
+            compiler_flags = (
+                "\n            multibuffer=False,\n            num_stages=1,"
+            )
         reduction = schedule.get("reduction", {})
         scalar_output = any(
             tensor.name in context.outputs and tensor.ndim == 0
@@ -249,11 +262,12 @@ def {kernel.kernel_name}_kernel(
 {common.indent_block(body, "    ")}
 
 def launch_{kernel.kernel_name}({", ".join((*context.variables, *context.outputs, *context.shape_params))}):
-    block = 256
+    block = {block_value}
     grid = ({launch_grid},)
     {kernel.kernel_name}_kernel[grid](
-        {kernel_args},
-        BLOCK=block,
+            {kernel_args},
+            BLOCK=block,
+            {compiler_flags}
     )
     return {result}
 """
@@ -274,6 +288,33 @@ def emit(kernel: Kernel):
 
     kernel = _rewrite_private_scan_ops(kernel)
     artifact = common.emit(kernel, target)
+
+    # Publish solved matrix dimensions through the artifact schedule.  The
+    # driver uses this metadata when constructing launch ABI defaults, so the
+    # values supplied to Triton's constexpr BLOCK_SIZE_* parameters cannot
+    # silently fall back to the 256 candidate defaults.
+    override = dict(schedule.get("ascend_tile_override", {}))
+    if override:
+        artifact_schedule = dict(artifact.metadata.get("ssa_schedule", {}))
+        artifact_tile = dict(artifact_schedule.get("tile", {}))
+        for source, alias in (
+            ("BLOCK_SIZE_M", "block_m"),
+            ("BLOCK_SIZE_N", "block_n"),
+            ("BLOCK_SIZE_K", "block_k"),
+        ):
+            if alias in override:
+                # ``scheduled_meta_defaults`` matches canonical block_m/n/k
+                # names (including prefixed constexpr symbols).  Publish both
+                # spellings so source emission and ABI construction observe
+                # exactly the same retiled value.
+                artifact_tile[alias] = int(override[alias])
+                artifact_tile[source] = int(override[alias])
+        artifact_schedule["tile"] = artifact_tile
+        metadata = dict(artifact.metadata) | {
+            "ssa_schedule": artifact_schedule,
+            "ascend_tile_override": override,
+        }
+        artifact = replace(artifact, metadata=metadata)
 
     # TritonTarget.schedule_context consumes compiler/layout.py's LayoutTransfer
     # access maps. Keep the public coordinate helpers visible at this boundary so

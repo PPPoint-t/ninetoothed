@@ -97,10 +97,112 @@ class AscendBackend(Backend):
         """Finalize target schedule choices before Ascend source emission."""
         from ninetoothed.compiler.specialization import specialize_schedule_tiles
 
-        kernel = specialize_schedule_tiles(kernel)
-
         if kernel.ssa is None:
             return kernel
+
+        # The public scheduler normally resolves tile constexprs immediately.
+        # Online softmax needs a stricter target-private choice, though: once
+        # those symbols have become literal 128x64 layout dimensions there is
+        # no remaining symbol for the Ascend retile pass to substitute.  Apply
+        # the Ascend choice first, then let the regular schedule materializer
+        # resolve every other meta parameter.
+        schedule = dict(kernel.ssa.metadata.get("schedule", {}))
+        # Preserve tile provenance before any generic specialization can turn
+        # symbolic BLOCK parameters into indistinguishable integer literals.
+        # This target-private record is carried through the artifact/sidecar
+        # and is the input contract for a later structured retile pass.
+        tile = dict(schedule.get("tile", {}))
+        provenance = dict(schedule.get("ascend_tile_provenance", {}))
+        if tile and not provenance:
+            provenance = {
+                "source": "schedule.tile",
+                "parameters": tuple(
+                    name for name in ("block_m", "block_n", "block_k") if name in tile
+                ),
+                "candidate": {
+                    name: int(value)
+                    for name, value in tile.items()
+                    if name in {"block_m", "block_n", "block_k"}
+                    and isinstance(value, int)
+                },
+            }
+            schedule["ascend_tile_provenance"] = provenance
+            kernel = replace(
+                kernel,
+                ssa=replace(
+                    kernel.ssa,
+                    metadata=dict(kernel.ssa.metadata) | {"schedule": schedule},
+                ),
+            )
+        kernel = _retile_ascend_online_softmax(kernel, schedule)
+        kernel = specialize_schedule_tiles(kernel)
+        schedule = dict(kernel.ssa.metadata.get("schedule", {}))
+        tile = dict(schedule.get("tile", {}))
+        matrix_tile = dict(schedule.get("ascend_matrix_tile", {}))
+        solve_input = matrix_tile or tile
+        if solve_input:
+            solved = solve_ascend_tile_config(kernel.ssa, solve_input)
+            # Publish the solved dimensions through the canonical schedule
+            # namespace consumed by Launch-ABI specialization.  Keep the
+            # matrix-specific copy as well, but never leave ``tile`` at the
+            # candidate's original (typically 256) value.
+            canonical_tile = dict(schedule.get("tile", {}))
+            for source, alias in (
+                ("BLOCK_SIZE_M", "block_m"),
+                ("BLOCK_SIZE_N", "block_n"),
+                ("BLOCK_SIZE_K", "block_k"),
+            ):
+                value = solved.get(source, solved.get(alias))
+                if value is not None:
+                    canonical_tile[alias] = int(value)
+                    canonical_tile[source] = int(value)
+            schedule["tile"] = canonical_tile
+            if matrix_tile:
+                schedule["ascend_matrix_tile"] = dict(solved)
+            # This immutable private field is consumed by all Ascend-side
+            # emitters/materializers and takes precedence over candidate defaults.
+            schedule["ascend_tile_override"] = dict(solved)
+            schedule["ascend_tile_provenance"] = dict(
+                schedule.get("ascend_tile_provenance", {})
+            ) | {
+                "resolved": {
+                    key: int(value)
+                    for key, value in solved.items()
+                    if key in {"block_m", "block_n", "block_k"}
+                }
+            }
+            # Triton-Ascend enables ping-pong buffering by default.  Keep the
+            # private NineToothed contract within the documented 96 KiB
+            # double-buffer budget by explicitly selecting a single stage.
+            schedule["multibuffer"] = False
+            schedule["num_stages"] = 1
+            linalg = dict(schedule.get("ascend_linalg", {}))
+            if linalg:
+                linalg["tile"] = dict(solved)
+                linalg["workspace_tile"] = dict(solved)
+                linalg["loop_tile"] = dict(solved)
+                schedule["ascend_linalg"] = linalg
+            updated_ssa = replace(
+                kernel.ssa,
+                metadata=dict(kernel.ssa.metadata) | {"schedule": schedule},
+            )
+            # Attach the same contract directly to matrix operations.  This is
+            # intentionally target-private metadata; the shared IR semantics are
+            # unchanged while downstream linalg lowering can read exact bounds.
+            updated_ssa = _annotate_ascend_linalg_tiles(updated_ssa, solved)
+            metadata = dict(kernel.metadata)
+            defaults = dict(metadata.get("meta_defaults", {}))
+            for name in defaults:
+                normalized = str(name).lower().replace("-", "_")
+                for suffix, alias in (
+                    ("block_size_m", "block_m"),
+                    ("block_size_n", "block_n"),
+                    ("block_size_k", "block_k"),
+                ):
+                    if normalized.endswith(suffix) and alias in solved:
+                        defaults[name] = int(solved[alias])
+            metadata["meta_defaults"] = defaults
+            kernel = replace(kernel, ssa=updated_ssa, metadata=metadata)
 
         contract = dict(kernel.ssa.metadata.get("schedule", {})).get(
             "ascend_linalg", {}
@@ -117,10 +219,279 @@ class AscendBackend(Backend):
         )
 
 
-ASCEND_ELEMENTWISE_DTYPES = frozenset({"float16", "bfloat16", "float32", "int32"})
+ASCEND_UB_LIMIT_BYTES = 96 * 1024
+ASCEND_UB_NORMAL_FRACTION = 0.90
+ASCEND_UB_ATTENTION_FRACTION = 0.55
+
+
+@dataclass(frozen=True)
+class AscendUBPlan:
+    """Target-private UB planning result consumed by Ascend lowering."""
+
+    safe_tile: Mapping[str, int]
+    estimated_peak_bytes: int
+    safety_margin_bytes: int
+    rejection_reason: str | None = None
+
+
+SUPPORTED_DTYPES = frozenset(
+    {"float32", "float16", "bfloat16", "int32", "int8", "bool"}
+)
+UNSUPPORTED_DTYPES = frozenset({"float8_e5m2", "float8_e4m3fn", "float64"})
+ASCEND_ELEMENTWISE_DTYPES = SUPPORTED_DTYPES
 ASCEND_RNG_DTYPES = frozenset({"float16", "bfloat16", "float32"})
 ASCEND_ATOMIC_DTYPES = frozenset({"float16", "bfloat16", "float32", "int32"})
 _SIDECAR_SCHEMA = 3
+
+
+def ascend_dtype_legality(dtypes):
+    """Validate hardware dtype names without importing torch in the backend."""
+    for dtype in dtypes:
+        normalized = normalize_ascend_dtype(dtype)
+        if normalized in UNSUPPORTED_DTYPES:
+            if normalized.startswith("float8"):
+                raise UnsupportedBackendOpError(
+                    "Ascend 910B3 backend does not support float8 execution."
+                )
+            raise UnsupportedBackendOpError(
+                f"Ascend 910B3 hardware does not support dtype {normalized}; "
+                "only FP16, BF16, and FP32 elementwise SSA is verified",
+                reason="the dtype has no verified 910B3/CANN execution path.",
+                suggestion="cast to float16, bfloat16, float32, or int32 before lowering.",
+            )
+    return True
+
+
+def _ssa_tile_values(ssa_graph):
+    for block in getattr(ssa_graph, "blocks", ()):
+        for operation in getattr(block, "operations", ()):
+            for result in getattr(operation, "results", ()):
+                yield result
+
+
+def calculate_ssa_ub_bytes(ssa_graph, tile_config, pipeline_factor=2):
+    """Estimate UB bytes from all tiled SSA values and their element dtypes."""
+    sizes = {
+        "float16": 2,
+        "bfloat16": 2,
+        "float32": 4,
+        "int32": 4,
+        "int8": 1,
+        "bool": 1,
+    }
+    m = int(
+        tile_config.get(
+            "BLOCK_SIZE_M", tile_config.get("block_m", tile_config.get("m", 16))
+        )
+    )
+    n = int(
+        tile_config.get(
+            "BLOCK_SIZE_N", tile_config.get("block_n", tile_config.get("n", 16))
+        )
+    )
+    k = int(
+        tile_config.get(
+            "BLOCK_SIZE_K", tile_config.get("block_k", tile_config.get("k", 16))
+        )
+    )
+    tile_values = tuple(_ssa_tile_values(ssa_graph))
+    # Model operand traffic (not the already-promoted result): low precision
+    # matmul inputs remain FP16/BF16 while the accumulator is always FP32.
+    # Prefer the smallest floating tensor dtype in the SSA tile; this avoids
+    # charging an FP32 output twice while retaining a conservative 4-byte
+    # model for all-FP32 kernels.
+    floating = [
+        sizes[normalize_ascend_dtype(getattr(value.type, "dtype", None))]
+        for value in tile_values
+        if normalize_ascend_dtype(getattr(value.type, "dtype", None))
+        in {"float16", "bfloat16", "float32"}
+    ]
+    dtype_bytes = min(floating) if floating else 2
+    # A and B input tiles plus the output accumulator, all resident for the
+    # duration of a pipelined dot operation.
+    input_output = (m * k + k * n) * dtype_bytes + (m * n) * 4
+    schedule = dict(getattr(ssa_graph, "metadata", {}).get("schedule", {}))
+    if schedule.get("ascend_attention_loop"):
+        # Online softmax retains an FP32 score/accumulator tile plus an
+        # explicit boolean causal predicate.  Model both allocations rather
+        # than treating the dot as an isolated GEMM.
+        input_output += m * n * (4 + 1)
+    return input_output * max(1, int(pipeline_factor))
+
+
+def _retile_ascend_online_softmax(
+    kernel: Kernel, schedule: Mapping[str, Any]
+) -> Kernel:
+    """Specialize public online-softmax loop blocks to an NPU-safe tile.
+
+    This is keyed by the target-private schedule contract, rather than an
+    application/kernel name.  The public IR remains unchanged; only the two
+    existing dynamic tile meta symbols are substituted before Ascend emission.
+    """
+    if not schedule.get("ascend_attention_loop") or kernel.ssa is None:
+        return kernel
+
+    # Start below the 96 KiB budget because causal score masks and the online
+    # accumulator have overlapping lifetimes in BiShengIR.
+    provenance = dict(schedule.get("ascend_tile_provenance", {}))
+    candidate = dict(provenance.get("candidate", {}))
+    # The public contract carries a runtime causal branch (``public-scf-if``)
+    # rather than a compile-time boolean.  Reserve the causal footprint for
+    # both variants so a cached kernel cannot overflow when the flag is true.
+    causal_contract = schedule.get("ascend_attention_loop", {}).get("causal")
+    causal_tile_m = 32 if causal_contract else 64
+    initial = {
+        "block_m": min(int(candidate.get("block_m", causal_tile_m)), causal_tile_m),
+        "block_n": min(int(candidate.get("block_n", 32)), 32),
+        "block_k": min(int(candidate.get("block_k", 32)), 32),
+    }
+    plan = plan_ascend_ub(kernel.ssa, initial)
+    if plan.rejection_reason:
+        raise UnsupportedBackendOpError(
+            "Ascend attention tile cannot satisfy the private UB budget.",
+            reason=plan.rejection_reason,
+            suggestion="Reduce the attention tile or split the sequence loop.",
+        )
+    solved = dict(plan.safe_tile)
+    defaults = dict(kernel.metadata.get("meta_defaults", {}))
+    values = {}
+    block_values = (solved["block_m"], solved["block_n"])
+    for name in defaults:
+        normalized = str(name).lower()
+        for index, value in enumerate(block_values):
+            if normalized.endswith(f"block_size_{index}"):
+                defaults[name] = int(value)
+                values[name] = int(value)
+
+    if not values:
+        return kernel
+
+    from ninetoothed.compiler.specialization import specialize_program
+
+    updated_schedule = dict(schedule) | {
+        "ascend_tile_override": dict(solved),
+        "ascend_attention_tile": dict(solved),
+        "tile": dict(schedule.get("tile", {}))
+        | {
+            "block_m": solved["block_m"],
+            "block_n": solved["block_n"],
+            "block_k": solved["block_k"],
+        },
+        "ascend_ub_plan": {
+            "estimated_peak_bytes": plan.estimated_peak_bytes,
+            "safety_margin_bytes": plan.safety_margin_bytes,
+            "budget_fraction": ASCEND_UB_ATTENTION_FRACTION,
+        },
+    }
+    program = specialize_program(
+        replace(
+            kernel.ssa,
+            metadata=dict(kernel.ssa.metadata) | {"schedule": updated_schedule},
+        ),
+        values,
+    )
+    return replace(
+        kernel,
+        ssa=program,
+        metadata=dict(kernel.metadata) | {"meta_defaults": defaults},
+    )
+
+
+def solve_ascend_tile_config(ssa_graph, initial_tile_config, max_ub_bytes=None):
+    """Downsample the largest BLOCK_SIZE dimension until the UB budget fits."""
+    if max_ub_bytes is None:
+        schedule = dict(getattr(ssa_graph, "metadata", {}).get("schedule", {}))
+        fraction = (
+            ASCEND_UB_ATTENTION_FRACTION
+            if schedule.get("ascend_attention_loop")
+            else ASCEND_UB_NORMAL_FRACTION
+        )
+        max_ub_bytes = int(ASCEND_UB_LIMIT_BYTES * fraction)
+    config = dict(initial_tile_config)
+    while calculate_ssa_ub_bytes(ssa_graph, config) > max_ub_bytes:
+        candidates = [
+            key
+            for key, value in config.items()
+            if (key.startswith("BLOCK_SIZE_") or key.startswith("block_"))
+            and int(value) > 16
+        ]
+        if not candidates:
+            raise UnsupportedBackendOpError(
+                "Ascend tile memory footprint exceeds 910B3 UB limit even at minimum tile size.",
+                reason="the SSA tile working set exceeds the configured UB budget.",
+                suggestion="Operator tile memory footprint exceeds 910B3 UB limit even at minimum tile size. Consider split/loop partitioning.",
+            )
+        key = max(candidates, key=lambda item: int(config[item]))
+        config[key] = max(16, int(config[key]) // 2)
+    return config
+
+
+def plan_ascend_ub(ssa_graph, initial_tile_config) -> AscendUBPlan:
+    """Select a safe tile and expose peak usage and rejection diagnostics."""
+    schedule = dict(getattr(ssa_graph, "metadata", {}).get("schedule", {}))
+    fraction = (
+        ASCEND_UB_ATTENTION_FRACTION
+        if schedule.get("ascend_attention_loop")
+        else ASCEND_UB_NORMAL_FRACTION
+    )
+    budget = int(ASCEND_UB_LIMIT_BYTES * fraction)
+    try:
+        safe = solve_ascend_tile_config(ssa_graph, initial_tile_config, budget)
+    except UnsupportedBackendOpError as exc:
+        return AscendUBPlan(
+            safe_tile=dict(initial_tile_config),
+            estimated_peak_bytes=calculate_ssa_ub_bytes(ssa_graph, initial_tile_config),
+            safety_margin_bytes=0,
+            rejection_reason=str(exc),
+        )
+    peak = calculate_ssa_ub_bytes(ssa_graph, safe)
+    return AscendUBPlan(
+        safe_tile={key: int(value) for key, value in safe.items()},
+        estimated_peak_bytes=peak,
+        safety_margin_bytes=max(0, budget - peak),
+    )
+
+
+def _annotate_ascend_linalg_tiles(program: ssa.Program, tile: Mapping[str, Any]):
+    """Propagate solved M/N/K bounds to Ascend-private linalg operations."""
+    if not tile:
+        return program
+
+    def rewrite(block):
+        operations = []
+        for operation in block.operations:
+            regions = tuple(rewrite(region) for region in operation.regions)
+            if operation.opcode in {"linalg.matmul", "linalg.dot"}:
+                attrs = dict(operation.attrs)
+                for source, target in (
+                    ("BLOCK_SIZE_M", "block_m"),
+                    ("BLOCK_SIZE_N", "block_n"),
+                    ("BLOCK_SIZE_K", "block_k"),
+                ):
+                    value = tile.get(source, tile.get(target))
+                    if value is not None:
+                        attrs[target] = int(value)
+                attrs["ascend_workspace_tile"] = dict(tile)
+                attrs["ascend_loop_tile"] = dict(tile)
+                operation = ssa.Operation(
+                    opcode=operation.opcode,
+                    operands=operation.operands,
+                    results=operation.results,
+                    attrs=attrs,
+                    regions=regions,
+                )
+            else:
+                operation = ssa.Operation(
+                    opcode=operation.opcode,
+                    operands=operation.operands,
+                    results=operation.results,
+                    attrs=operation.attrs,
+                    regions=regions,
+                )
+            operations.append(operation)
+        return ssa.Block(name=block.name, args=block.args, operations=tuple(operations))
+
+    return replace(program, blocks=tuple(rewrite(block) for block in program.blocks))
 
 
 @dataclass(frozen=True)
@@ -525,6 +896,10 @@ def write_ascend_sidecar(
         "block_meta": dict(metadata.get("ssa_schedule", {})).get(
             "ascend_block_meta", {}
         ),
+        "tile_provenance": dict(metadata.get("ssa_metadata", {}))
+        .get("schedule", {})
+        .get("ascend_tile_provenance"),
+        "ub_plan": dict(metadata.get("ssa_schedule", {})).get("ascend_ub_plan"),
         "advanced_contract": dict(metadata.get("ssa_metadata", {}))
         .get("schedule", {})
         .get("ascend_advanced"),
@@ -787,6 +1162,9 @@ def _ascend_dot_loop_contract(program: ssa.Program) -> Mapping[str, Any] | None:
         "loop_carried": bool(dict(matched[0].attrs).get("iter_args")),
         "layout": "public-access-template",
         "tile": {"m": 16, "n": 16, "k": 64},
+        "logical_sequence_axis": -2,
+        "key_mask_value": "-inf-before-softmax",
+        "value_mask_value": 0.0,
     }
 
 
@@ -929,7 +1307,14 @@ class AscendOptimizeSchedule(OptimizeSchedule):
                 ScheduleCandidate(
                     name="ascend-tiled-matmul-16x16x64",
                     schedule={
+                        # Keep explicit matrix dimensions so the private UB
+                        # solver can resize the actual linalg working set.
                         "tile": {"elements": 256},
+                        "ascend_matrix_tile": {
+                            "block_m": 256,
+                            "block_n": 256,
+                            "block_k": 256,
+                        },
                         "vector_width": 1,
                         "core_dim_limit": _max_core_dim(context),
                     },
@@ -1098,6 +1483,7 @@ class AscendOptimizeSchedule(OptimizeSchedule):
         ) or tuple(
             value.type.dtype for value in program.inputs if value.type.kind == "tensor"
         )
+        ascend_dtype_legality(tensor_dtypes)
         advanced = dict(program.metadata.get("schedule", {})).get("ascend_advanced", {})
         unsupported_dtypes = unsupported_ascend_elementwise_dtypes(
             tensor_dtypes,

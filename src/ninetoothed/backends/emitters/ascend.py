@@ -7,6 +7,8 @@ from typing import Iterable
 from ninetoothed.backends.ascend import (
     ASCEND_ELEMENTWISE_DTYPES,
     UnsupportedBackendOpError,
+    _verify_ascend_batched_matmul_contract,
+    _verify_ascend_decomposed_matmul_contract,
     normalize_ascend_dtype,
     unsupported_ascend_elementwise_dtypes,
 )
@@ -177,6 +179,18 @@ class AscendTarget(TritonTarget):
             )
 
         return f"tl.atomic_add({operands[0]} + (index * 0), {operands[1]})"
+
+    def schedule_context(self, context: ModuleRenderContext) -> ModuleRenderContext:
+        """Expose the private Attention grid contract to module rendering."""
+        program = context.kernel.ssa
+        schedule = program.metadata.get("schedule", {}) if program is not None else {}
+        retile = schedule.get("ascend_attention_retile")
+        if not isinstance(retile, dict) and not hasattr(retile, "get"):
+            return super().schedule_context(context)
+        grid = retile.get("grid")
+        if not grid:
+            return super().schedule_context(context)
+        return replace(context, grid_total=str(grid))
 
     def render_module(self, context: ModuleRenderContext) -> str:
         if context.block_program or context.vector_program or context.scalar_program:
@@ -566,6 +580,19 @@ def _validate_program(kernel: Kernel) -> None:
         dot_loop = schedule.get("ascend_dot_loop", {})
 
         if linalg.get("mode") == "tiled-matmul":
+            if linalg.get("rank") == 2 and not any(
+                operation.opcode in {"linalg.matmul", "linalg.dot"}
+                for operation in _operations(kernel.ssa)
+            ):
+                # Public linalg has already been lowered to a scalar K loop.
+                # Consume the private structured contract at this boundary so
+                # source emission is tied to the proven row/k and k/col map.
+                _verify_ascend_decomposed_matmul_contract(kernel.ssa)
+            elif linalg.get("rank") == 3 and not any(
+                operation.opcode in {"linalg.matmul", "linalg.dot"}
+                for operation in _operations(kernel.ssa)
+            ):
+                _verify_ascend_batched_matmul_contract(kernel.ssa)
             return
         if dot_loop.get("mode") == "generic-dot-loop":
             return

@@ -26,6 +26,7 @@ from ninetoothed.backends.emitters.analysis import (
     walk_ops as _walk_ops,
 )
 from ninetoothed.backends.emitters.base import EmitterTarget, ModuleRenderContext
+from ninetoothed.backends.emitters.base import StoreAddressPlan
 from ninetoothed.backends.emitters.context import (
     CooperativeDotPlan as _CooperativeDotPlan,
 )
@@ -982,6 +983,18 @@ def _emit_operation(op: ssa.Operation, ctx: _EmitContext) -> None:
         tensor = op.operands[1]
         view_index = _store_index(op, ctx)
         info = ctx.tensor_infos.get(tensor)
+        store_value_coords: tuple[str, ...] = ()
+        store_mask_coords: tuple[str, ...] = ()
+        target_level = int(op.attrs.get("target_dtype_level", _dtype_level(tensor, ctx)))
+        store_plan = _store_address_plan(value_name, info, target_level, ctx)
+        store_value_coords = store_plan.value_coords
+        if store_plan.mask_coords and store_value_coords and (
+            store_plan.mask_coords != store_value_coords
+        ):
+            raise ValueError(
+                "StoreAddressPlan value_coords and mask_coords must match."
+            )
+        store_mask_coords = store_plan.mask_coords or store_value_coords
 
         if op.attrs.get("source"):
             rendered = tuple(
@@ -1006,9 +1019,6 @@ def _emit_operation(op: ssa.Operation, ctx: _EmitContext) -> None:
                 ctx.target, _source_linear_index(info, rendered)
             )
         else:
-            target_level = int(
-                op.attrs.get("target_dtype_level", _dtype_level(tensor, ctx))
-            )
             base_level = int(
                 op.attrs.get("base_dtype_level", _dtype_level(tensor, ctx))
             )
@@ -1033,6 +1043,7 @@ def _emit_operation(op: ssa.Operation, ctx: _EmitContext) -> None:
                     ctx,
                     level=target_level,
                     extract_indices=extract_indices,
+                    value_coords=store_value_coords,
                 ),
             )
 
@@ -1053,6 +1064,7 @@ def _emit_operation(op: ssa.Operation, ctx: _EmitContext) -> None:
                 ctx=ctx,
                 level=target_level,
                 extract_indices=extract_indices,
+                value_coords=store_mask_coords,
             )
 
         mask = _materialize_bool_expr(mask, ctx)
@@ -1143,7 +1155,8 @@ def _emit_value(name: str, ctx: _EmitContext) -> str:
         if ctx.block_program:
             operator = op.opcode[len("reduce.") :]
             operand = _emit_value(op.operands[0], ctx)
-            axis = int(op.attrs.get("axis", 0) or 0)
+            axis_attr = op.attrs.get("axis", 0)
+            axis = None if axis_attr is None else int(axis_attr)
             expr = ctx.target.vector_reduce(operator, operand, axis)
             ctx.lines.append(ctx.target.local_decl(op.results[0].type, local, expr))
             ctx.memo[name] = local
@@ -2565,6 +2578,14 @@ def _emit_scf_if_results(op: ssa.Operation, ctx: _EmitContext) -> None:
         result_locals[result.name] = local
         init = _zero_value(result.type, ctx.target)
 
+        # Structured if results can carry block tensors (for example the
+        # online-softmax accumulator).  A scalar zero is not a valid Triton
+        # initial value for such a result and makes the two branches infer
+        # different types.  Materialize a zero vector with the result shape.
+        if ctx.target.vector_value_semantics and ctx.block_program and result.type.kind == "tensor":
+            shape = ctx.target.block_shape(tuple(str(dim) for dim in result.type.shape))
+            init = ctx.target.vector_splat(shape, init, result.type.dtype or "float32")
+
         if _uses_mutable_scalar_slots(ctx.target):
             ctx.lines.extend(
                 _mutable_scalar_decl_lines(ctx.target, result.type, local, init)
@@ -2952,6 +2973,28 @@ def _source_index_for_value(
     )
 
 
+def _store_address_plan(
+    value_name: str,
+    info: _TensorInfo | None,
+    level: int,
+    ctx: _EmitContext,
+) -> StoreAddressPlan:
+    """Request an optional target-owned store address plan."""
+    plan = ctx.target.store_address_plan(
+        value_name=value_name,
+        tensor_info=info,
+        level=level,
+        context=ctx,
+    )
+    if not isinstance(plan, StoreAddressPlan):
+        raise TypeError(
+            f"{type(ctx.target).__name__}.store_address_plan() must return "
+            "StoreAddressPlan."
+        )
+
+    return plan
+
+
 def _jagged_runtime_replacements(
     template: Mapping[str, Any],
     replacements: Mapping[str, str],
@@ -3074,9 +3117,12 @@ def _store_mask(
     ctx: _EmitContext,
     level: int | None = None,
     extract_indices: tuple[str, ...] = (),
+    value_coords: tuple[str, ...] = (),
 ) -> str | None:
     if target.tir_value_semantics:
-        template_mask = _mask_from_template_offsets(info, view_index, ctx)
+        template_mask = _mask_from_template_offsets(
+            info, view_index, ctx, value_coords=value_coords
+        )
         masks = []
 
         if base:
@@ -3101,6 +3147,7 @@ def _store_mask(
         ctx=ctx,
         level=level,
         extract_indices=extract_indices,
+        value_coords=value_coords,
     )
 
 
@@ -3108,6 +3155,8 @@ def _mask_from_template_offsets(
     info: _TensorInfo | None,
     view_index: str,
     ctx: _EmitContext,
+    *,
+    value_coords: tuple[str, ...] = (),
 ) -> str | None:
     template = _access_template(
         info, _dtype_level(info.name, ctx) if info is not None else 0
@@ -3123,7 +3172,11 @@ def _mask_from_template_offsets(
         return None
 
     shape = tuple(str(dim) for dim in template.get("shape", ())) or ctx.output_axes
-    coords = _coords_from_linear(view_index, shape, ctx.target)
+    coords = (
+        value_coords
+        if len(value_coords) == len(shape)
+        else _coords_from_linear(view_index, shape, ctx.target)
+    )
     replacements = {"outer_index": ctx.outer_index_expr}
     replacements.update({f"value_{index}": coord for index, coord in enumerate(coords)})
     replacements.update(_jagged_extent_replacements(ctx))
@@ -3975,6 +4028,7 @@ buffer_storage_extent = _buffer_storage_extent
 combined_mask = _combined_mask
 cooperative_dot_plan = _cooperative_dot_plan
 current_coords = _current_coords
+access_template = _access_template
 default_strides = _default_strides
 dot_accumulator_dtype = _dot_accumulator_dtype
 dtype_level = _dtype_level
@@ -4006,6 +4060,7 @@ view_base_coords = _view_base_coords
 
 __all__ = [
     "access_axes",
+    "access_template",
     "buffer_storage_extent",
     "combined_mask",
     "cooperative_dot_plan",

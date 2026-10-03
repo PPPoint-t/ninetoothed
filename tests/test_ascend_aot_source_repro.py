@@ -6,6 +6,10 @@ They do not invoke the Triton-Ascend compiler or an NPU runtime.
 
 import ast
 import functools
+import json
+from collections.abc import Mapping
+
+import pytest
 
 from ninetoothed import Tensor
 from ninetoothed.backends.ascend import read_ascend_sidecar, write_ascend_sidecar
@@ -75,7 +79,7 @@ def _padded_dot_loop_request():
 def _attention_request():
     q, k, v, o = tuple(
         Tensor(
-            shape=(1, 1, 16, 16),
+            shape=(1, 1, 64, 64),
             dtype="float32",
         )
         for _ in range(4)
@@ -127,12 +131,106 @@ def test_ascend_attention_sidecar_reload_reproduces_source(tmp_path):
     sidecar = _write_and_reload_sidecar(tmp_path, first)
     second = DEFAULT_COMPILER.compile(request)
 
+    assert sidecar["schema"] == 4
     attention = first_schedule["ascend_attention_loop"]
-    assert attention["mode"] == "generic-online-softmax-loop"
+    attention_plan = first_schedule["ascend_attention_plan"]
+    attention_retile = first_schedule["ascend_attention_retile"]
+    assert sidecar["logical_domain"] is None
+    assert attention["kind"] == "generic-online-softmax-loop"
+    assert attention["mode"] in {"causal", "non-causal"}
     assert attention["status"] == "verified-static-public-online-softmax"
-    assert sidecar["attention_loop"] == attention
+    assert sidecar["attention_loop"] == _json_compatible(attention)
+    assert sidecar["attention_plan"] == _json_compatible(attention_plan)
+    assert sidecar["attention_retile"] == _json_compatible(attention_retile)
+    selected = attention_plan["resource_plan"]["selected_tile"]
+    assert attention_plan["tile"] == selected
+    assert {
+        axis: attention_retile[f"block_{axis}"] for axis in ("m", "n", "k")
+    } == selected
+    assert first.artifact.metadata["ascend_tile_override"]["BLOCK_SIZE_M"] == selected["m"]
+    assert first.artifact.metadata["ascend_tile_override"]["BLOCK_SIZE_N"] == selected["n"]
+    assert first.artifact.metadata["ascend_tile_override"]["BLOCK_SIZE_K"] == selected["k"]
+
+    source_tree = ast.parse(first.artifact.primary_source)
+    source_contract = next(
+        ast.literal_eval(statement.value)
+        for statement in source_tree.body
+        if isinstance(statement, ast.Assign)
+        and any(
+            isinstance(target, ast.Name)
+            and target.id == "__ninetoothed_ascend_attention_contract__"
+            for target in statement.targets
+        )
+    )
+    assert source_contract == sidecar["attention_source_contract"]
+    assert source_contract["attention_plan"] == sidecar["attention_plan"]
+    assert source_contract["attention_retile"] == sidecar["attention_retile"]
     assert (
         second.artifact.metadata["ssa_metadata"]["schedule"]["ascend_attention_loop"]
-        == sidecar["attention_loop"]
+        == attention
     )
     assert second.artifact.primary_source == first.artifact.primary_source
+
+
+def _json_compatible(value):
+    if isinstance(value, Mapping):
+        return {str(key): _json_compatible(item) for key, item in value.items()}
+    if isinstance(value, (tuple, list)):
+        return [_json_compatible(item) for item in value]
+    return value
+
+
+def test_ascend_attention_sidecar_reload_rejects_stale_source_plan(tmp_path):
+    compilation = DEFAULT_COMPILER.compile(_attention_request())
+    source_path = tmp_path / compilation.artifact.primary_source_name
+    source_path.write_text(compilation.artifact.primary_source, encoding="utf-8")
+    write_ascend_sidecar(
+        source_path,
+        abi=compilation.launch_abi,
+        specs=compilation.kernel.tensors,
+        outputs=compilation.artifact.metadata["outputs"],
+        metadata=compilation.artifact.metadata,
+    )
+
+    tree = ast.parse(source_path.read_text(encoding="utf-8"))
+    contract_statement = next(
+        statement
+        for statement in tree.body
+        if isinstance(statement, ast.Assign)
+        and any(
+            isinstance(target, ast.Name)
+            and target.id == "__ninetoothed_ascend_attention_contract__"
+            for target in statement.targets
+        )
+    )
+    source_contract = ast.literal_eval(contract_statement.value)
+    source_contract["attention_plan"]["tile"]["m"] += 16
+    source = source_path.read_text(encoding="utf-8")
+    original_contract = ast.get_source_segment(source, contract_statement)
+    replacement = (
+        "__ninetoothed_ascend_attention_contract__ = "
+        f"{source_contract!r}"
+    )
+    source_path.write_text(source.replace(original_contract, replacement), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="Ascend Attention plan/source contract mismatch"):
+        read_ascend_sidecar(source_path)
+
+
+def test_ascend_attention_sidecar_reload_rejects_missing_plan(tmp_path):
+    compilation = DEFAULT_COMPILER.compile(_attention_request())
+    source_path = tmp_path / compilation.artifact.primary_source_name
+    source_path.write_text(compilation.artifact.primary_source, encoding="utf-8")
+    sidecar_path = write_ascend_sidecar(
+        source_path,
+        abi=compilation.launch_abi,
+        specs=compilation.kernel.tensors,
+        outputs=compilation.artifact.metadata["outputs"],
+        metadata=compilation.artifact.metadata,
+    )
+    payload = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    payload.pop("attention_plan")
+    sidecar_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="Ascend Attention plan/source contract mismatch"):
+        read_ascend_sidecar(source_path)

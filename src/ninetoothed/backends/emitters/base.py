@@ -34,6 +34,21 @@ class ModuleRenderContext:
 
 
 @dataclass(frozen=True, kw_only=True)
+class StoreAddressPlan:
+    """Optional coordinate facts supplied by a target for a store.
+
+    An empty plan means that the common emitter should use its existing
+    address derivation.  The fields intentionally describe only rendered
+    coordinates and masks; they do not encode any operation or backend
+    specific layout vocabulary.
+    """
+
+    value_coords: tuple[str, ...] = ()
+    mask_coords: tuple[str, ...] = ()
+    source: str = "generic"
+
+
+@dataclass(frozen=True, kw_only=True)
 class EmitterTarget(ABC):
     """Backend syntax hooks consumed by the target-independent SSA walker."""
 
@@ -169,6 +184,24 @@ class EmitterTarget(ABC):
     def schedule_context(self, context: ModuleRenderContext) -> ModuleRenderContext:
         return context
 
+    def store_address_plan(
+        self,
+        *,
+        value_name: str,
+        tensor_info: Any,
+        level: int,
+        context: Any,
+    ) -> StoreAddressPlan:
+        """Return optional target coordinates for one store operation.
+
+        Targets return an empty plan by default, preserving the common
+        flatten/unflatten address path.  The arguments are deliberately
+        emitter-neutral so the hook can evolve without teaching the shared
+        SSA layer about a particular backend or operator.
+        """
+        del value_name, tensor_info, level, context
+        return StoreAddressPlan()
+
     @abstractmethod
     def literal(self, value: Any) -> str: ...
 
@@ -214,4 +247,4 @@ class EmitterTarget(ABC):
     def render_module(self, context: ModuleRenderContext) -> str: ...
 
 
-__all__ = ["EmitterTarget", "ModuleRenderContext"]
+__all__ = ["EmitterTarget", "ModuleRenderContext", "StoreAddressPlan"]

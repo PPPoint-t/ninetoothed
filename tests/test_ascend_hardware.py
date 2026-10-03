@@ -1864,6 +1864,306 @@ def test_ascend_generic_dot_loop_jit_and_aot_reload(tmp_path):
 
 
 @pytest.mark.ascend_next_stage
+def test_ascend_causal_attention_frontend_compile_only(tmp_path):
+    """Compile the causal all-masked path through Triton and CANN without launch."""
+    import importlib.util
+
+    import torch
+    import torch_npu  # noqa: F401
+
+    from tests import test_attention
+
+    assert torch.npu.is_available()
+    shape = (2, 4, 1, 64)
+    q, k, v, output = tuple(
+        Tensor(shape=shape, dtype="float16") for _ in range(4)
+    )
+    compilation = DEFAULT_COMPILER.compile(
+        CompileRequest(
+            arrangement=test_attention.arrangement,
+            application=test_attention.application,
+            tensors=(
+                q,
+                k,
+                v,
+                Tensor(ndim=0, constexpr=True, value=1),
+                output,
+            ),
+            backend="ascend",
+            kernel_name="ascend_attention_causal_compile_only",
+            backend_options={"soc_version": "Ascend910B4", "max_core_dim": 65535},
+        )
+    )
+    schedule = compilation.artifact.metadata["ssa_metadata"]["schedule"]
+    plan = schedule["ascend_attention_plan"]
+    resource = plan["resource_plan"]
+    source = compilation.artifact.primary_source
+    assert plan["mode"] == "causal"
+    assert resource["selected_tile"] == {"m": 16, "n": 32, "k": 32}
+    assert "axis=None) == 0" in source
+    assert "128x64" not in source
+
+    source_path = tmp_path / "ascend_attention_causal_compile_only.py"
+    source_path.write_text(source)
+    spec = importlib.util.spec_from_file_location(
+        "ascend_attention_causal_compile_only", source_path
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    kernel = module.ascend_attention_causal_compile_only_kernel
+
+    q_value = torch.empty(shape, device="npu", dtype=torch.float16)
+    k_value = torch.empty_like(q_value)
+    v_value = torch.empty_like(q_value)
+    output_value = torch.empty_like(q_value)
+    compiled = kernel.warmup(
+        q_value,
+        k_value,
+        v_value,
+        output_value,
+        *q_value.stride(),
+        *k_value.stride(),
+        *v_value.stride(),
+        True,
+        *output_value.stride(),
+        BLOCK=1,
+        grid=(int(plan["grid"]),),
+        num_warps=4,
+        num_stages=1,
+    )
+    assert {"ttir", "ttadapter", "npubin"}.issubset(compiled.asm)
+
+
+@pytest.mark.parametrize(
+    ("dtype_name", "torch_dtype"),
+    (("float16", "float16"), ("float32", "float32")),
+)
+@pytest.mark.parametrize("sequence", (1, 1024))
+@pytest.mark.parametrize("is_causal", (False, True))
+def test_ascend_attention_fp16_fp32_jit_and_aot_matrix(
+    tmp_path, dtype_name, torch_dtype, sequence, is_causal
+):
+    """Run the supported Attention matrix through JIT and AOT reload on NPU."""
+    import json
+    import traceback
+
+    import torch
+    import torch.nn.functional as functional
+    import torch_npu  # noqa: F401
+
+    from ninetoothed.backends.ascend import (
+        ASCEND_ATTENTION_DTYPE_REGISTRY,
+        read_ascend_sidecar,
+    )
+    from ninetoothed.backends.materializers.ascend import AscendMaterializer
+    from tests import test_attention
+
+    assert torch.npu.is_available()
+    shape = (2, 4, sequence, 64)
+    q, k, v, output = tuple(
+        Tensor(shape=shape, dtype=dtype_name) for _ in range(4)
+    )
+    kernel_name = (
+        f"ascend_attention_{dtype_name}_s{sequence}_c{int(is_causal)}_jit_aot"
+    )
+
+    def fail_phase(phase, exc):
+        chain = "\n".join(traceback.format_exception(exc))
+        pytest.fail(f"{phase} failed for {kernel_name}:\n{chain}", pytrace=False)
+
+    try:
+        compilation = DEFAULT_COMPILER.compile(
+            CompileRequest(
+                arrangement=test_attention.arrangement,
+                application=test_attention.application,
+                tensors=(q, k, v, Tensor(0, constexpr=True), output),
+                backend="ascend",
+                kernel_name=kernel_name,
+                backend_options={
+                    "soc_version": "Ascend910B4",
+                    "max_core_dim": 65535,
+                },
+            )
+        )
+    except Exception as exc:
+        fail_phase("runtime validation / Attention contract planning", exc)
+
+    schedule = compilation.artifact.metadata["ssa_metadata"]["schedule"]
+    plan = schedule["ascend_attention_plan"]
+    resource_plan = plan["resource_plan"]
+    selected_tile = resource_plan["selected_tile"]
+    assert selected_tile == {"m": 16, "n": 32, "k": 32}
+    assert int(resource_plan["ub_estimated_peak_bytes"]) <= int(
+        resource_plan["ub_budget_bytes"]
+    )
+
+    materializer = AscendMaterializer()
+    try:
+        jit = materializer.jit_materialize(
+            compilation, output_dir=tmp_path / "jit"
+        )
+        aot = materializer.aot_build(
+            compilation, output_dir=tmp_path / "aot"
+        )
+        sidecar = read_ascend_sidecar(Path(aot._built_artifact.source_path))
+        dtype_contract = sidecar["attention_dtype_registry"][dtype_name]
+        expected_tolerance = ASCEND_ATTENTION_DTYPE_REGISTRY[dtype_name]["error"]
+        assert json.dumps(sidecar["attention_plan"], sort_keys=True) == json.dumps(
+            plan, sort_keys=True, default=dict
+        )
+        assert json.dumps(sidecar["attention_retile"], sort_keys=True) == json.dumps(
+            schedule["ascend_attention_retile"], sort_keys=True, default=dict
+        )
+        assert dtype_contract["input"] == {
+            "q": dtype_name,
+            "k": dtype_name,
+            "v": dtype_name,
+            "o": dtype_name,
+        }
+        assert set(dtype_contract["internal"].values()) == {"float32"}
+        assert dtype_contract["error"] == expected_tolerance
+        assert dtype_contract["status"] == "verified-jit-aot-npu"
+        assert dtype_contract["runtime"] == {
+            "device": "Ascend910B4",
+            "cann": "9.0.0",
+            "torch_npu": "2.7.1",
+            "triton": "3.2.0",
+            "triton_ascend": "3.2.2",
+        }
+        reloaded = load_built_artifact(aot._built_artifact)
+    except Exception as exc:
+        fail_phase("AOT reload / dtype-resource sidecar contract", exc)
+
+    torch.manual_seed(20261003 + sequence + int(is_causal))
+    torch_dtype_value = getattr(torch, torch_dtype)
+    q_value, k_value, v_value = (
+        torch.randn(shape, device="npu", dtype=torch_dtype_value)
+        for _ in range(3)
+    )
+    expected = functional.scaled_dot_product_attention(
+        q_value, k_value, v_value, is_causal=is_causal, scale=1
+    )
+    assert expected.device.type == "npu"
+
+    run_records = {}
+    for label, materialized, launch in (
+        ("jit", jit, jit),
+        ("aot_reload", aot, reloaded),
+    ):
+        raw_kernel = materialized._kernel[1]
+        try:
+            compiled = raw_kernel.warmup(
+                q_value,
+                k_value,
+                v_value,
+                torch.empty_like(expected),
+                *q_value.stride(),
+                *k_value.stride(),
+                *v_value.stride(),
+                is_causal,
+                *expected.stride(),
+                BLOCK=1,
+                grid=(int(plan["grid"]),),
+                num_warps=4,
+                num_stages=1,
+            )
+            missing = {"ttir", "ttadapter", "npubin"} - set(compiled.asm)
+            assert not missing, f"compiled artifact is missing {sorted(missing)}"
+        except Exception as exc:
+            fail_phase(f"CANN compile ({label})", exc)
+
+        output_value = torch.empty_like(expected)
+        try:
+            returned = launch(
+                q_value, k_value, v_value, is_causal, output_value
+            )
+        except Exception as exc:
+            message = str(exc)
+            phase = (
+                f"launch ({label})"
+                if message.startswith("Ascend kernel launch failed")
+                else f"runtime validation ({label})"
+            )
+            fail_phase(phase, exc)
+        assert returned is output_value, f"{label} returned a different output buffer"
+        try:
+            torch.npu.synchronize()
+        except Exception as exc:
+            fail_phase(f"synchronize ({label})", exc)
+
+        if output_value.dtype != torch_dtype_value or tuple(output_value.shape) != shape:
+            pytest.fail(
+                "output contract failed for "
+                f"{kernel_name}/{label}: dtype={output_value.dtype}, "
+                f"shape={tuple(output_value.shape)}, expected dtype={torch_dtype_value}, "
+                f"shape={shape}",
+                pytrace=False,
+            )
+
+        actual_fp32 = output_value.float()
+        expected_fp32 = expected.float()
+        absolute_error = (actual_fp32 - expected_fp32).abs()
+        max_abs_error = float(absolute_error.max().item())
+        max_relative_error = float(
+            (absolute_error / expected_fp32.abs().clamp_min(1e-8)).max().item()
+        )
+        tolerance = expected_tolerance
+        print(
+            "ASCEND_ATTENTION_NUMERICAL_SAMPLE "
+            + json.dumps(
+                {
+                    "case": kernel_name,
+                    "path": label,
+                    "q": q_value[0, 0, 0, :8].float().cpu().tolist(),
+                    "k": k_value[0, 0, 0, :8].float().cpu().tolist(),
+                    "v": v_value[0, 0, 0, :8].float().cpu().tolist(),
+                    "actual": actual_fp32[0, 0, 0, :8].cpu().tolist(),
+                    "expected": expected_fp32[0, 0, 0, :8].cpu().tolist(),
+                },
+                sort_keys=True,
+            )
+        )
+        try:
+            torch.testing.assert_close(
+                output_value,
+                expected,
+                rtol=float(tolerance["rtol"]),
+                atol=float(tolerance["atol"]),
+            )
+        except AssertionError as exc:
+            pytest.fail(
+                "numerical comparison failed for "
+                f"{kernel_name}/{label}: max_abs_error={max_abs_error}, "
+                f"max_relative_error={max_relative_error}, "
+                f"rtol={tolerance['rtol']}, atol={tolerance['atol']}\n{exc}",
+                pytrace=False,
+            )
+        run_records[label] = {
+            "launch": "passed",
+            "synchronize": "passed",
+            "output_dtype": str(output_value.dtype),
+            "output_shape": list(output_value.shape),
+            "max_abs_error": max_abs_error,
+            "max_relative_error": max_relative_error,
+            "rtol": tolerance["rtol"],
+            "atol": tolerance["atol"],
+            "cann_artifacts": sorted(compiled.asm),
+        }
+
+    report = {
+        "case": kernel_name,
+        "device": torch.npu.get_device_name(q_value.device),
+        "selected_mnk": [selected_tile["m"], selected_tile["n"], selected_tile["k"]],
+        "ub_estimated_bytes": resource_plan["ub_estimated_peak_bytes"],
+        "ub_budget_bytes": resource_plan["ub_budget_bytes"],
+        "workspace_bytes": plan["workspace_bytes"],
+        "jit": run_records["jit"],
+        "aot_reload": run_records["aot_reload"],
+    }
+    print("ASCEND_ATTENTION_MATRIX_RESULT " + json.dumps(report, sort_keys=True))
+
+
+@pytest.mark.ascend_next_stage
 def test_ascend_online_softmax_attention_jit_and_aot_reload(tmp_path):
     import torch
     import torch.nn.functional as functional
@@ -2037,4 +2337,4 @@ def test_ascend_aot_composite_matmul_rmsnorm_reload(tmp_path):
     )
     torch.testing.assert_close(projected, expected_matmul, rtol=1e-2, atol=1e-2)
     torch.testing.assert_close(output, expected, rtol=1e-4, atol=1e-4)
-    assert ascend_capability_matrix()["aot"]["sidecar_schema"] == 3
+    assert ascend_capability_matrix()["aot"]["sidecar_schema"] == 4

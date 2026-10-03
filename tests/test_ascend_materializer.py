@@ -1,10 +1,18 @@
 import json
+import math
 import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-from ninetoothed.backends.ascend import read_ascend_sidecar, write_ascend_sidecar
+from ninetoothed.backends.ascend import (
+    ASCEND_ATTENTION_SOURCE_CONTRACT_ATTRIBUTE,
+    UnsupportedBackendOpError,
+    ascend_attention_source_contract,
+    read_ascend_sidecar,
+    write_ascend_sidecar,
+)
 from ninetoothed.backends.core import Artifact, BuiltArtifact, Target
 from ninetoothed.backends.materializers.ascend import (
     AscendMaterializer,
@@ -15,6 +23,7 @@ from ninetoothed.backends.materializers.ascend import (
     _validate_ascend_bindings,
     _validate_ascend_dtype_specs,
     _validate_dot_loop_runtime_shapes,
+    _validate_attention_runtime_contract,
     validate_tile_ub_capacity,
 )
 from ninetoothed.ir import LaunchABI, LaunchBinding, TensorSpec
@@ -80,6 +89,329 @@ class _Tensor:
 
     def stride(self):
         return self._strides
+
+
+@pytest.mark.parametrize("tile_m", (16, 32))
+def test_attention_runtime_grid_and_workspace_follow_resource_tile(tile_m):
+    specs, tensors, roles, plan, retile, source_contract = _attention_runtime_fixture(tile_m)
+    query_tiles = (plan["sequence"] + tile_m - 1) // tile_m
+    key_tiles = (plan["sequence"] + plan["tile"]["n"] - 1) // plan["tile"]["n"]
+    assert plan["grid"] == plan["batch"] * plan["heads"] * query_tiles
+    assert plan["workspace_bytes"] == tile_m * plan["head_dim"] * 4
+
+    _validate_attention_runtime_contract(
+        specs,
+        tensors,
+        {"version": 2, "access_provenance": roles},
+        {
+            "k_score_mask_before_max": True,
+            "v_value_mask_zero_before_dot": True,
+            "causal_query_key_compare": True,
+            "loop_carried_state": ("acc", "m_i", "l_i"),
+            "all_masked_state_preserving_branch": True,
+        },
+        {"predicate": "%key_valid"},
+        {"all_masked": "%all_masked"},
+        plan,
+        max_core_dim=65535,
+        attention_dtype_registry={"float32": {}},
+        attention_retile=retile,
+        attention_source_contract=source_contract,
+    )
+    assert plan["query_tiles"] == query_tiles
+    assert plan["key_tiles"] == key_tiles
+
+
+def test_attention_runtime_resolves_symbolic_workspace_from_bound_shape():
+    specs, tensors, roles, plan, retile, _ = _attention_runtime_fixture(16)
+    plan = dict(plan)
+    resource_plan = dict(plan["resource_plan"])
+    workspace_expression = "16 * (head_dim) * 4"
+    candidate = dict(resource_plan["candidate_tiles"][0])
+    candidate["workspace_bytes"] = workspace_expression
+    resource_plan["candidate_tiles"] = [candidate]
+    resource_plan["workspace_bytes"] = workspace_expression
+    plan["resource_plan"] = resource_plan
+    plan["workspace_bytes"] = workspace_expression
+    plan["head_dim"] = None
+    retile = dict(retile) | {"head_dim": "head_dim"}
+    source_contract = ascend_attention_source_contract(plan, retile)
+
+    _validate_attention_runtime_contract(
+        specs,
+        tensors,
+        {"version": 2, "access_provenance": roles},
+        {
+            "k_score_mask_before_max": True,
+            "v_value_mask_zero_before_dot": True,
+            "causal_query_key_compare": True,
+            "loop_carried_state": ("acc", "m_i", "l_i"),
+            "all_masked_state_preserving_branch": True,
+        },
+        {"predicate": "%key_valid"},
+        {"all_masked": "%all_masked"},
+        plan,
+        max_core_dim=65535,
+        attention_dtype_registry={"float32": {}},
+        attention_retile=retile,
+        attention_source_contract=source_contract,
+    )
+
+
+def _attention_runtime_fixture(tile_m=16):
+    source_shape = (2, 4, 65, 64)
+    roles = {role: {"tensor": role} for role in ("q", "k", "v", "o")}
+    specs = {
+        role: TensorSpec(
+            ndim=4,
+            shape=tuple(str(dim) for dim in source_shape),
+            dtype="float32",
+            name=role,
+            attrs={"source_shape": source_shape},
+        )
+        for role in roles
+    }
+    tensors = {
+        role: _Tensor(
+            elements=math.prod(source_shape),
+            shape=source_shape,
+            dtype="torch.float32",
+        )
+        for role in roles
+    }
+    selected_tile = {"m": tile_m, "n": 32, "k": 32}
+    query_tiles = (source_shape[2] + tile_m - 1) // tile_m
+    key_tiles = (source_shape[2] + selected_tile["n"] - 1) // selected_tile["n"]
+    grid = source_shape[0] * source_shape[1] * query_tiles
+    workspace = tile_m * source_shape[3] * 4
+    ub_estimate = 1024
+    ub_budget = 8192
+    candidate = {
+        "tile": selected_tile,
+        "estimated_ub_bytes": ub_estimate,
+        "solver_tile": selected_tile,
+        "solver_estimated_ub_bytes": ub_estimate,
+        "ub_budget_bytes": ub_budget,
+        "workspace_bytes": workspace,
+        "feasible": True,
+        "rejection_reason": None,
+    }
+    resource_plan = {
+        "version": 1,
+        "candidate_tiles": [candidate],
+        "selected_tile": selected_tile,
+        "ub_estimated_peak_bytes": ub_estimate,
+        "ub_budget_bytes": ub_budget,
+        "internal_dtype": "float32",
+        "workspace_bytes": workspace,
+        "rejection_reason": None,
+    }
+    plan = {
+        "status": "verified-static-single-block",
+        "batch": source_shape[0],
+        "heads": source_shape[1],
+        "sequence": source_shape[2],
+        "head_dim": source_shape[3],
+        "tile": selected_tile,
+        "resource_plan": resource_plan,
+        "query_tiles": query_tiles,
+        "key_tiles": key_tiles,
+        "grid": grid,
+        "core_grid_limit": 65535,
+        "workspace_bytes": workspace,
+        "dot_tiles": {},
+    }
+    key_upper = f"(({source_shape[2]} + {selected_tile['n'] - 1}) // {selected_tile['n']})"
+    query_upper = f"(({source_shape[2]} + {selected_tile['m'] - 1}) // {selected_tile['m']})"
+    retile = {
+        "block_m": selected_tile["m"],
+        "block_n": selected_tile["n"],
+        "block_k": selected_tile["k"],
+        "sequence": source_shape[2],
+        "head_dim": source_shape[3],
+        "query_tiles": query_tiles,
+        "key_tiles": key_tiles,
+        "query_loop_upper": query_upper,
+        "key_loop_upper": key_upper,
+        "loop_upper": key_upper,
+        "grid": f"{source_shape[0]} * {source_shape[1]} * triton.cdiv({source_shape[2]}, {selected_tile['m']})",
+        "dot_tiles": {},
+    }
+    return (
+        specs,
+        tensors,
+        roles,
+        plan,
+        retile,
+        ascend_attention_source_contract(plan, retile),
+    )
+
+
+def _attention_wrapper_for_test(specs_by_name, tensors, roles, plan, retile, source_contract, calls):
+    module = SimpleNamespace(
+        **{ASCEND_ATTENTION_SOURCE_CONTRACT_ATTRIBUTE: source_contract}
+    )
+    abi = LaunchABI(
+        public_args=("q", "k", "v", "o"),
+        kernel_args=tuple(
+            LaunchBinding(
+                name=role,
+                kind="tensor",
+                source=role,
+                access="write" if role == "o" else "read",
+            )
+            for role in ("q", "k", "v", "o")
+        ),
+        outputs=("o",),
+    )
+    return _ascend_wrapper(
+        lambda *args: calls.append(args),
+        abi,
+        tuple(specs_by_name.values()),
+        source_path=Path("attention.ascend.py"),
+        kernel_name="attention",
+        max_core_dim=65535,
+        module=module,
+        attention_loop={"version": 2, "kind": "generic-online-softmax-loop", "access_provenance": roles},
+        attention_mask_semantics={
+            "k_score_mask_before_max": True,
+            "v_value_mask_zero_before_dot": True,
+            "causal_query_key_compare": True,
+            "loop_carried_state": ("acc", "m_i", "l_i"),
+            "all_masked_state_preserving_branch": True,
+        },
+        attention_key_valid={"predicate": "%key_valid"},
+        attention_loop_state={"all_masked": "%all_masked"},
+        attention_plan=plan,
+        attention_retile=retile,
+        attention_dtype_registry={"float32": {}},
+    )
+
+
+def test_attention_runtime_rejects_stale_grid_in_plan_before_launch():
+    specs, tensors, roles, plan, retile, source_contract = _attention_runtime_fixture(16)
+    stale_plan = dict(plan) | {"grid": plan["grid"] + 1}
+    with pytest.raises(UnsupportedBackendOpError, match="plan/source contract mismatch"):
+        _validate_attention_runtime_contract(
+            specs,
+            tensors,
+            {"version": 2, "access_provenance": roles},
+            {
+                "k_score_mask_before_max": True,
+                "v_value_mask_zero_before_dot": True,
+                "causal_query_key_compare": True,
+                "loop_carried_state": ("acc", "m_i", "l_i"),
+                "all_masked_state_preserving_branch": True,
+            },
+            {"predicate": "%key_valid"},
+            {"all_masked": "%all_masked"},
+            stale_plan,
+            max_core_dim=65535,
+            attention_dtype_registry={"float32": {}},
+            attention_retile=retile,
+            attention_source_contract=source_contract,
+        )
+
+
+def test_attention_runtime_rejects_stale_workspace_before_launch():
+    specs, tensors, roles, plan, retile, source_contract = _attention_runtime_fixture(16)
+    stale_plan = dict(plan) | {"workspace_bytes": plan["workspace_bytes"] + 4}
+    with pytest.raises(UnsupportedBackendOpError, match="plan/source contract mismatch"):
+        _validate_attention_runtime_contract(
+            specs,
+            tensors,
+            {"version": 2, "access_provenance": roles},
+            {
+                "k_score_mask_before_max": True,
+                "v_value_mask_zero_before_dot": True,
+                "causal_query_key_compare": True,
+                "loop_carried_state": ("acc", "m_i", "l_i"),
+                "all_masked_state_preserving_branch": True,
+            },
+            {"predicate": "%key_valid"},
+            {"all_masked": "%all_masked"},
+            stale_plan,
+            max_core_dim=65535,
+            attention_dtype_registry={"float32": {}},
+            attention_retile=retile,
+            attention_source_contract=source_contract,
+        )
+
+
+def test_attention_wrapper_rejects_source_plan_mismatch_before_launch():
+    specs_by_name, tensors, roles, plan, retile, source_contract = _attention_runtime_fixture(16)
+    calls = []
+    bad_source_contract = dict(source_contract)
+    bad_source_plan = dict(source_contract["attention_plan"])
+    bad_source_plan["tile"] = {"m": 32, "n": 32, "k": 32}
+    bad_source_contract["attention_plan"] = bad_source_plan
+    launch = _attention_wrapper_for_test(
+        specs_by_name,
+        tensors,
+        roles,
+        plan,
+        retile,
+        bad_source_contract,
+        calls,
+    )
+
+    with pytest.raises(UnsupportedBackendOpError, match="plan/source contract mismatch"):
+        launch(*(tensors[role] for role in ("q", "k", "v", "o")))
+
+    assert calls == []
+
+
+def test_attention_wrapper_rejects_runtime_shape_mismatch_before_launch():
+    specs_by_name, tensors, roles, plan, retile, source_contract = _attention_runtime_fixture(16)
+    tensors = dict(tensors)
+    tensors["q"] = _Tensor(
+        elements=math.prod((2, 4, 64, 64)),
+        shape=(2, 4, 64, 64),
+        dtype="torch.float32",
+    )
+    calls = []
+    launch = _attention_wrapper_for_test(
+        specs_by_name,
+        tensors,
+        roles,
+        plan,
+        retile,
+        source_contract,
+        calls,
+    )
+
+    with pytest.raises(TypeError, match="expected dimension 2 to be 65"):
+        launch(*(tensors[role] for role in ("q", "k", "v", "o")))
+
+    assert calls == []
+
+
+def test_attention_wrapper_rejects_runtime_binding_that_differs_from_plan_before_launch():
+    specs_by_name, tensors, roles, plan, retile, _ = _attention_runtime_fixture(16)
+    plan = dict(plan)
+    plan["batch"] = 3
+    plan["grid"] = plan["batch"] * plan["heads"] * plan["query_tiles"]
+    retile = dict(retile)
+    retile["grid"] = (
+        f"{plan['batch']} * {plan['heads']} * "
+        f"triton.cdiv({plan['sequence']}, {plan['tile']['m']})"
+    )
+    source_contract = ascend_attention_source_contract(plan, retile)
+    calls = []
+    launch = _attention_wrapper_for_test(
+        specs_by_name,
+        tensors,
+        roles,
+        plan,
+        retile,
+        source_contract,
+        calls,
+    )
+
+    with pytest.raises(UnsupportedBackendOpError, match="runtime shape does not match the compiled plan"):
+        launch(*(tensors[role] for role in ("q", "k", "v", "o")))
+
+    assert calls == []
 
 
 def _abi(*, with_access=False):
@@ -624,7 +956,7 @@ def test_ascend_built_source_artifact_reloads_without_a_binary(tmp_path):
     source_path.with_suffix(".ascend-launch.json").write_text(
         json.dumps(
             {
-                "schema": 3,
+                "schema": 4,
                 "launch_abi": {
                     "public_args": [],
                     "kernel_args": [],

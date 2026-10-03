@@ -6,15 +6,19 @@ from typing import Any, Mapping
 
 from ninetoothed.backends.ascend import (
     UnsupportedBackendOpError,
+    ASCEND_ATTENTION_DTYPE_REGISTRY,
+    ASCEND_ATTENTION_SOURCE_CONTRACT_ATTRIBUTE,
     ascend_abi_from_dict,
     ascend_cache_key,
     ascend_logical_domain,
+    ascend_logical_domain_is_abi_bound,
     ascend_uses_access_template,
     normalize_ascend_dtype,
     read_ascend_sidecar,
     static_forward_view_offset,
     unsupported_ascend_elementwise_dtypes,
     validate_build_policy,
+    validate_ascend_attention_source_contract,
     write_ascend_sidecar,
 )
 from ninetoothed.backends.ascend_layout import (
@@ -97,6 +101,12 @@ class AscendMaterializer(Materializer):
             advanced_contract=sidecar.get("advanced_contract"),
             dot_loop=sidecar.get("dot_loop"),
             attention_loop=sidecar.get("attention_loop"),
+            attention_mask_semantics=sidecar.get("attention_mask_semantics"),
+            attention_key_valid=sidecar.get("attention_key_valid"),
+            attention_loop_state=sidecar.get("attention_loop_state"),
+            attention_plan=sidecar.get("attention_plan"),
+            attention_retile=sidecar.get("attention_retile"),
+            attention_dtype_registry=sidecar.get("attention_dtype_registry"),
             linalg_contract=sidecar.get("linalg_contract"),
         )
 
@@ -180,7 +190,7 @@ def _materialize(compilation, *, output_dir: str | Path | None):
             # runtime domain.  This prevents stale, doubly-prefixed layout
             # symbols from becoming phantom launch parameters.
             if access_template
-            and _logical_domain_is_abi_bound(
+            and ascend_logical_domain_is_abi_bound(
                 ascend_logical_domain(
                     compilation.kernel.tensors,
                     tuple(artifact.metadata.get("outputs", ())),
@@ -197,6 +207,12 @@ def _materialize(compilation, *, output_dir: str | Path | None):
         advanced_contract=schedule.get("ascend_advanced"),
         dot_loop=schedule.get("ascend_dot_loop"),
         attention_loop=schedule.get("ascend_attention_loop"),
+        attention_mask_semantics=schedule.get("ascend_attention_mask_semantics"),
+        attention_key_valid=schedule.get("ascend_attention_key_valid"),
+        attention_loop_state=schedule.get("ascend_attention_loop_state"),
+        attention_plan=schedule.get("ascend_attention_plan"),
+        attention_retile=schedule.get("ascend_attention_retile"),
+        attention_dtype_registry=ASCEND_ATTENTION_DTYPE_REGISTRY,
         linalg_contract=schedule.get("ascend_linalg"),
     )
 
@@ -252,6 +268,12 @@ def _ascend_wrapper(
     advanced_contract=None,
     dot_loop=None,
     attention_loop=None,
+    attention_mask_semantics=None,
+    attention_key_valid=None,
+    attention_loop_state=None,
+    attention_plan=None,
+    attention_retile=None,
+    attention_dtype_registry=None,
     linalg_contract=None,
 ):
     from ninetoothed.compiler.runtime import (
@@ -262,6 +284,15 @@ def _ascend_wrapper(
 
     def launch(*args, **kwargs):
         public = _public_values(abi, args, kwargs, specs=specs, target=Target.ASCEND)
+        attention_source_contract = getattr(
+            module, ASCEND_ATTENTION_SOURCE_CONTRACT_ATTRIBUTE, None
+        )
+        if attention_loop and attention_source_contract is None:
+            raise UnsupportedBackendOpError(
+                "Ascend Attention plan/source contract mismatch.",
+                reason="loaded source has no embedded resource plan metadata.",
+                suggestion="reload an AOT artifact emitted with the matching Attention plan.",
+            )
 
         _validate_ascend_bindings(
             abi,
@@ -275,6 +306,13 @@ def _ascend_wrapper(
             advanced_contract=advanced_contract,
             dot_loop=dot_loop,
             attention_loop=attention_loop,
+            attention_mask_semantics=attention_mask_semantics,
+            attention_key_valid=attention_key_valid,
+            attention_loop_state=attention_loop_state,
+            attention_plan=attention_plan,
+            attention_retile=attention_retile,
+            attention_source_contract=attention_source_contract,
+            attention_dtype_registry=attention_dtype_registry,
             linalg_contract=linalg_contract,
         )
 
@@ -321,8 +359,11 @@ def _validate_access_template_contract(dot_loop, attention_loop) -> bool:
     if not isinstance(contract, Mapping):
         raise ValueError("Ascend access-template launch contract is malformed.")
 
-    mode = contract.get("mode")
-    if mode not in {"generic-dot-loop", "generic-online-softmax-loop"}:
+    # Attention uses ``mode`` for causal/non-causal semantics.  Its structural
+    # kind is carried separately, so runtime admission must not interpret a
+    # causal mode as the access-template kind.
+    kind = contract.get("kind", contract.get("mode"))
+    if kind not in {"generic-dot-loop", "generic-online-softmax-loop"}:
         raise ValueError(
             "Ascend rank-4 storage requires a recognized generic dot-loop or "
             "online-softmax access-template contract."
@@ -372,6 +413,253 @@ def _validate_dot_loop_runtime_shapes(spec_by_name, tensors, dot_loop) -> None:
             )
 
 
+def _validate_attention_runtime_contract(
+    spec_by_name,
+    tensors,
+    attention_loop,
+    attention_mask_semantics,
+    attention_key_valid,
+    attention_loop_state,
+    attention_plan,
+    max_core_dim,
+    attention_dtype_registry=None,
+    *,
+    attention_retile=None,
+    attention_source_contract=None,
+) -> None:
+    """Validate runtime bindings against the verified Attention sidecar contract."""
+    if not isinstance(attention_loop, Mapping) or attention_loop.get("version", 0) < 2:
+        raise UnsupportedBackendOpError(
+            "Ascend Attention runtime requires a version 2 structured contract.",
+            reason="the JIT/AOT binding metadata is missing the verified contract.",
+            suggestion="rebuild the artifact through the Ascend Attention verifier.",
+        )
+    if not isinstance(attention_plan, Mapping) or attention_plan.get("status") not in {
+        "verified-static-single-block",
+        "verified-runtime-guarded-single-block",
+    }:
+        raise UnsupportedBackendOpError(
+            "Ascend Attention runtime requires a verified resource plan.",
+            reason="tile, workspace, UB, or grid metadata is absent or stale.",
+            suggestion="rebuild the artifact with the Ascend Attention planner.",
+        )
+    # Validate that the runtime's sidecar plan is the same full plan embedded
+    # by the emitter.  This check covers selected M/N/K, UB candidate evidence,
+    # workspace, static tile counts, and the launch-grid expression.
+    validate_ascend_attention_source_contract(
+        attention_plan,
+        attention_retile,
+        attention_source_contract,
+        require_source=True,
+    )
+    required_semantics = {
+        "k_score_mask_before_max",
+        "v_value_mask_zero_before_dot",
+        "causal_query_key_compare",
+        "loop_carried_state",
+        "all_masked_state_preserving_branch",
+    }
+    if not isinstance(attention_mask_semantics, Mapping) or not required_semantics.issubset(
+        attention_mask_semantics
+    ):
+        raise UnsupportedBackendOpError(
+            "Ascend Attention AOT sidecar is missing verified mask semantics.",
+            reason="mask ordering, causal predicate, or loop-state metadata was not persisted.",
+            suggestion="rebuild the sidecar from the verified Attention schedule.",
+        )
+    if not isinstance(attention_key_valid, Mapping) or not isinstance(attention_loop_state, Mapping):
+        raise UnsupportedBackendOpError(
+            "Ascend Attention AOT sidecar is missing normalization provenance.",
+            reason="key-valid or loop-state normalization metadata was not persisted.",
+            suggestion="rebuild the artifact with the verified Attention normalization passes.",
+        )
+
+    access = attention_loop.get("access_provenance")
+    if not isinstance(access, Mapping):
+        raise UnsupportedBackendOpError(
+            "Ascend Attention runtime has no access provenance.",
+            reason="Q/K/V/O bindings cannot be derived from the sidecar.",
+            suggestion="preserve rank-4 access provenance through AOT materialization.",
+        )
+
+    aliases = {}
+    for name, spec in spec_by_name.items():
+        aliases[name] = name
+        source_name = spec.attrs.get("source_name")
+        if source_name:
+            aliases[str(source_name)] = name
+
+    def resolve_tensor(role):
+        entry = access.get(role)
+        name = entry.get("tensor") if isinstance(entry, Mapping) else None
+        resolved = aliases.get(str(name)) if name is not None else None
+        if resolved is None or resolved not in tensors:
+            raise UnsupportedBackendOpError(
+                "Ascend Attention runtime binding is incomplete.",
+                reason=f"{role} tensor `{name}` is not present in the launch ABI.",
+                suggestion="bind all Q/K/V/O tensors recorded by access provenance.",
+            )
+        return resolved, tensors[resolved]
+
+    resolved = {role: resolve_tensor(role) for role in ("q", "k", "v", "o")}
+    registry = attention_dtype_registry or {}
+    expected_shapes = {}
+    for role, (name, value) in resolved.items():
+        shape = tuple(int(dim) for dim in tuple(value.shape))
+        if len(shape) != 4:
+            raise UnsupportedBackendOpError(
+                "Ascend Attention runtime requires rank-4 Q/K/V/O tensors.",
+                reason=f"{role} `{name}` has runtime shape {shape!r}.",
+                suggestion="use [batch, head, sequence, head_dim] tensors.",
+            )
+        expected_shapes[role] = shape
+        dtype = normalize_ascend_dtype(getattr(value, "dtype", None))
+        if dtype not in registry:
+            raise UnsupportedBackendOpError(
+                "Ascend Attention runtime dtype is not in the verified capability registry.",
+                reason=f"{role} `{name}` has dtype {getattr(value, 'dtype', None)!r}; registry keys={tuple(registry)}.",
+                suggestion="add a complete compile, NPU, and AOT capability record before enabling this dtype.",
+            )
+
+    q_shape = expected_shapes["q"]
+    if q_shape[3] != 64:
+        raise UnsupportedBackendOpError(
+            "Ascend Attention runtime supports head_dim=64 only.",
+            reason=f"runtime head_dim={q_shape[3]}.",
+            suggestion="specialize an artifact with head_dim=64.",
+        )
+    if q_shape[2] <= 0 or q_shape[2] > 1024:
+        raise UnsupportedBackendOpError(
+            "Ascend Attention runtime supports sequence<=1024 only.",
+            reason=f"runtime sequence={q_shape[2]}.",
+            suggestion="use the bounded key-tiled Attention contract or reject before CANN.",
+        )
+    planned_values = {}
+    for field in ("batch", "heads", "sequence", "head_dim"):
+        value = attention_plan.get(field)
+        try:
+            planned_values[field] = int(value)
+        except (TypeError, ValueError):
+            planned_values[field] = None
+    plan_shape = tuple(planned_values[field] for field in ("batch", "heads", "sequence", "head_dim"))
+    if any(expected is not None and actual != expected for actual, expected in zip(q_shape, plan_shape)):
+        raise UnsupportedBackendOpError(
+            "Ascend Attention runtime shape does not match the compiled plan.",
+            reason=f"runtime Q shape={q_shape}, planned shape={plan_shape}.",
+            suggestion="specialize a new artifact for the runtime batch/head/sequence/head_dim.",
+        )
+    if any(shape != q_shape for shape in expected_shapes.values()):
+        raise UnsupportedBackendOpError(
+            "Ascend Attention runtime Q/K/V/O shapes are inconsistent.",
+            reason=f"runtime shapes={expected_shapes!r}.",
+            suggestion="require equal rank-4 batch, head, sequence, and head_dim extents.",
+        )
+
+    resource_plan = attention_plan.get("resource_plan")
+    resource_tile = (
+        resource_plan.get("selected_tile")
+        if isinstance(resource_plan, Mapping)
+        else None
+    )
+    planned_tile = attention_plan.get("tile")
+    if not isinstance(resource_tile, Mapping) or not isinstance(planned_tile, Mapping):
+        raise UnsupportedBackendOpError(
+            "Ascend Attention runtime requires the canonical resource tile.",
+            reason="resource_plan.selected_tile or planner tile is missing.",
+            suggestion="preserve the unified Attention resource plan in artifact metadata.",
+        )
+    selected_tile = {axis: int(resource_tile[axis]) for axis in ("m", "n", "k")}
+    plan_tile = {axis: int(planned_tile[axis]) for axis in ("m", "n", "k")}
+    if selected_tile != plan_tile:
+        raise UnsupportedBackendOpError(
+            "Ascend Attention runtime received inconsistent resource tiles.",
+            reason=f"resource tile={selected_tile!r}, planner tile={plan_tile!r}.",
+            suggestion="use resource_plan.selected_tile as the sole M/N/K source.",
+        )
+
+    try:
+        core_limit = int(attention_plan["core_grid_limit"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise UnsupportedBackendOpError(
+            "Ascend Attention resource plan has invalid grid metadata.",
+            reason=f"plan={dict(attention_plan)!r}.",
+            suggestion="record integer grid and core_grid_limit values.",
+        ) from exc
+    runtime_query_tiles = (q_shape[2] + selected_tile["m"] - 1) // selected_tile["m"]
+    runtime_key_tiles = (q_shape[2] + selected_tile["n"] - 1) // selected_tile["n"]
+    grid = q_shape[0] * q_shape[1] * runtime_query_tiles
+    planned_grid = attention_plan.get("grid")
+    if isinstance(planned_grid, int) and grid != planned_grid:
+        raise UnsupportedBackendOpError(
+            "Ascend Attention runtime grid differs from the selected resource tile.",
+            reason=f"runtime grid={grid}, planned grid={planned_grid}, tile={selected_tile!r}.",
+            suggestion="rebuild the launch grid from selected M and runtime Q shape.",
+        )
+    for field, actual in (
+        ("query_tiles", runtime_query_tiles),
+        ("key_tiles", runtime_key_tiles),
+    ):
+        planned = attention_plan.get(field)
+        if isinstance(planned, int) and planned != actual:
+            raise UnsupportedBackendOpError(
+                "Ascend Attention runtime tile count differs from the selected resource tile.",
+                reason=(
+                    f"runtime {field}={actual}, planned {field}={planned}, "
+                    f"tile={selected_tile!r}, sequence={q_shape[2]}."
+                ),
+                suggestion="recompute query/key tile counts from runtime shape and planned M/N.",
+            )
+    if grid <= 0 or grid > min(int(max_core_dim), core_limit):
+        raise UnsupportedBackendOpError(
+            "Ascend Attention runtime grid exceeds the verified core limit.",
+            reason=f"grid={grid}, plan_limit={core_limit}, runtime_limit={max_core_dim}.",
+            suggestion="specialize a smaller launch grid or update the verified plan.",
+        )
+    expected_workspace = selected_tile["m"] * q_shape[3] * 4
+    planned_workspace_value = attention_plan.get("workspace_bytes")
+    try:
+        planned_workspace = int(planned_workspace_value)
+    except (TypeError, ValueError) as exc:
+        if planned_workspace_value == resource_plan.get("workspace_bytes"):
+            # Symbolic plans record M * (head_dim expression) * 4.  The shared
+            # source contract has already verified that expression against the
+            # retile; resolve it from the bound runtime head dimension here.
+            planned_workspace = expected_workspace
+        else:
+            raise UnsupportedBackendOpError(
+                "Ascend Attention resource plan has invalid workspace metadata.",
+                reason=f"workspace_bytes={planned_workspace_value!r}.",
+                suggestion="record a concrete or plan-consistent workspace size.",
+            ) from exc
+    if planned_workspace != expected_workspace:
+        raise UnsupportedBackendOpError(
+            "Ascend Attention workspace does not match runtime shape.",
+            reason=f"planned={planned_workspace}, expected={expected_workspace}.",
+            suggestion="re-specialize the artifact for the concrete head_dim.",
+        )
+    resource_workspace_value = resource_plan.get("workspace_bytes")
+    try:
+        resource_workspace = int(resource_workspace_value)
+    except (TypeError, ValueError) as exc:
+        if resource_workspace_value == planned_workspace_value:
+            resource_workspace = expected_workspace
+        else:
+            raise UnsupportedBackendOpError(
+                "Ascend Attention resource plan has invalid workspace metadata.",
+                reason=f"resource_plan.workspace_bytes={resource_workspace_value!r}.",
+                suggestion="record the concrete workspace size in the selected resource candidate.",
+            ) from exc
+    if resource_workspace != expected_workspace:
+        raise UnsupportedBackendOpError(
+            "Ascend Attention resource workspace differs from runtime requirements.",
+            reason=(
+                f"resource plan={resource_workspace}, runtime={expected_workspace}, "
+                f"tile={selected_tile!r}, head_dim={q_shape[3]}."
+            ),
+            suggestion="recompute workspace from selected M and the bound head dimension.",
+        )
+
+
 def validate_tile_ub_capacity(tile, *, dtype_bytes=2, ub_limit_bytes=192 * 1024):
     """Reject tiles whose input, output, and FP32 accumulator exceed UB budget."""
     try:
@@ -405,6 +693,13 @@ def _validate_ascend_bindings(
     advanced_contract=None,
     dot_loop=None,
     attention_loop=None,
+    attention_mask_semantics=None,
+    attention_key_valid=None,
+    attention_loop_state=None,
+    attention_plan=None,
+    attention_retile=None,
+    attention_source_contract=None,
+    attention_dtype_registry=None,
     linalg_contract=None,
 ) -> None:
     spec_by_name = {spec.name: spec for spec in specs}
@@ -463,6 +758,21 @@ def _validate_ascend_bindings(
 
     if not tensors:
         return
+
+    if attention_loop:
+        _validate_attention_runtime_contract(
+            spec_by_name,
+            tensors,
+            attention_loop,
+            attention_mask_semantics,
+            attention_key_valid,
+            attention_loop_state,
+            attention_plan,
+            max_core_dim,
+            attention_dtype_registry,
+            attention_retile=attention_retile,
+            attention_source_contract=attention_source_contract,
+        )
 
     _validate_dot_loop_runtime_shapes(spec_by_name, tensors, dot_loop)
     if dot_loop:
@@ -897,29 +1207,6 @@ def _resolve_logical_domain(expression, abi, public) -> int:
         )
 
     return value
-
-
-def _logical_domain_is_abi_bound(expression, abi) -> bool:
-    """Return whether a private logical-domain expression has ABI bindings.
-
-    Tile constants are intentionally specialized into generated Ascend source.
-    They must not be reintroduced as runtime ABI arguments merely because a
-    pre-specialization layout expression still mentions them.
-    """
-    from ninetoothed.ir import IndexExpr
-
-    available = {
-        binding.name
-        for binding in abi.kernel_args
-        if binding.kind in {"shape", "stride", "meta", "constexpr"}
-    }
-
-    def bound(node) -> bool:
-        if node.op == "symbol":
-            return str(node.value) in available
-        return all(bound(operand) for operand in node.operands)
-
-    return bound(IndexExpr.parse(expression))
 
 
 def _logical_offset(spec, abi, public) -> int:

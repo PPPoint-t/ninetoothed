@@ -2,13 +2,17 @@ import ast
 
 import pytest
 
+from ninetoothed import Tensor
 from ninetoothed.backends import emit
 from ninetoothed.backends.core import Target
 from ninetoothed.backends.emitters.ascend import (
+    TARGET as ASCEND_TARGET,
     UnsupportedBackendOpError,
     diagnose_opcode_coverage,
 )
+from ninetoothed.backends.emitters.ssa import _render_source
 from ninetoothed.compiler.passes import lower_for_target
+from ninetoothed.compiler import DEFAULT_COMPILER, CompileRequest
 from ninetoothed.frontend.python import from_source
 from ninetoothed.ir import Kernel, TensorSpec, ssa
 
@@ -57,6 +61,45 @@ def test_ascend_emits_stable_elementwise_triton_source():
     assert "tl.load(x + index, mask=mask, other=0.0)" in first.primary_source
     assert "tl.store(out + index, v0, mask=mask)" in first.primary_source
     ast.parse(first.primary_source)
+
+
+def test_ascend_attention_store_uses_direct_tiled_coordinates():
+    """Attention output pointers keep their 2D tile coordinates on Ascend."""
+    from tests import test_attention
+
+    q, k, v, output = tuple(
+        Tensor(shape=(2, 4, 1, 64), dtype="float16") for _ in range(4)
+    )
+    compilation = DEFAULT_COMPILER.compile(
+        CompileRequest(
+            arrangement=test_attention.arrangement,
+            application=test_attention.application,
+            tensors=(q, k, v, Tensor(0, constexpr=True), output),
+            backend="ascend",
+            kernel_name="ascend_attention_store_coordinates",
+            backend_options={
+                "soc_version": "Ascend910B4",
+                "max_core_dim": 65535,
+            },
+        )
+    )
+    source = compilation.artifact.sources[
+        "ascend_attention_store_coordinates.ascend.py"
+    ]
+    attention_plan = compilation.artifact.metadata["ssa_metadata"]["schedule"][
+        "ascend_attention_plan"
+    ]
+    store = next(
+        line for line in source.splitlines() if "tl.store(o +" in line
+    )
+
+    assert attention_plan["resource_plan"]["selected_tile"]["m"] == 16
+    assert "tl.arange(0, 16)[:, None]" in store
+    assert "tl.arange(0, 64)[None, :]" in store
+    assert "ninetoothed_ninetoothed_tensor_3_stride_2" in store
+    assert "ninetoothed_ninetoothed_tensor_3_stride_3" in store
+    assert "((tl.arange(0, 16)[:, None]) * (64) + " not in store
+    ast.parse(source)
 
 
 def test_ascend_emits_pow_from_generic_ssa():
@@ -491,6 +534,79 @@ def test_ascend_emits_ranked_row_vector_reductions(source, tensors, opcode):
     assert opcode in artifact.primary_source
     assert diagnose_opcode_coverage(kernel)["unsupported"] == ()
     ast.parse(artifact.primary_source)
+
+
+def test_ascend_lowers_reduce_all_without_unsupported_tl_all():
+    tensors = (
+        TensorSpec(ndim=1, shape=("width",), dtype="bool", name="predicate"),
+        TensorSpec(ndim=0, shape=(), dtype="bool", name="out"),
+    )
+    predicate = ssa.Value(
+        name="predicate", type=ssa.Type(kind="tensor", shape=("width",), dtype="bool")
+    )
+    output = ssa.Value(
+        name="out", type=ssa.Type(kind="scalar", dtype="bool")
+    )
+    reduced = ssa.Value(
+        name="%all", type=ssa.Type(kind="scalar", dtype="bool")
+    )
+    program = ssa.Program(
+        kind="all_true",
+        inputs=(predicate, output),
+        outputs=(output,),
+        blocks=(
+            ssa.Block(
+                operations=(
+                    ssa.Operation(
+                        opcode="reduce.all",
+                        operands=("predicate",),
+                        results=(reduced,),
+                        attrs={"axis": 0},
+                    ),
+                    ssa.Operation(
+                        opcode="mem.store", operands=("%all", "out")
+                    ),
+                )
+            ),
+        ),
+        metadata={"schedule": {"granularity": "blocked-linalg", "tile": {"elements": 256}}},
+    )
+    program = ssa.Program(
+        kind=program.kind,
+        inputs=program.inputs,
+        outputs=program.outputs,
+        blocks=program.blocks,
+        metadata=program.metadata,
+    )
+    kernel = Kernel(
+        kernel_name="all_true",
+        source="",
+        source_language="test",
+        entrypoint="all_true",
+        tensors=tensors,
+        ssa=program,
+    )
+
+    del kernel, program
+    expression = ASCEND_TARGET.vector_reduce("all", "predicate", 0)
+    whole_tensor_expression = ASCEND_TARGET.vector_reduce(
+        "all", "matrix_predicate", None
+    )
+
+    assert "tl.all(" not in expression
+    assert expression == "(tl.min((predicate).to(tl.int32), axis=0) != 0)"
+    ast.parse(f"result = {expression}")
+    assert whole_tensor_expression == (
+        "(tl.min((matrix_predicate).to(tl.int32), axis=None) != 0)"
+    )
+    ast.parse(f"result = {whole_tensor_expression}")
+
+
+def test_ascend_vector_bool_splat_uses_supported_integer_dtype():
+    expression = ASCEND_TARGET.vector_splat("(64,)", "False", "bool")
+
+    assert "tl.bool" not in expression
+    assert expression == "tl.full((64,), False, tl.int32)"
 
 
 def test_ascend_canonicalizes_unary_positive_to_its_operand():

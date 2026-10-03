@@ -6,7 +6,10 @@ from typing import Iterable
 
 from ninetoothed.backends.ascend import (
     ASCEND_ELEMENTWISE_DTYPES,
+    ASCEND_ATTENTION_SOURCE_CONTRACT_ATTRIBUTE,
     UnsupportedBackendOpError,
+    ascend_attention_source_contract,
+    _validate_ascend_attention_emission_contract,
     _verify_ascend_batched_matmul_contract,
     _verify_ascend_decomposed_matmul_contract,
     normalize_ascend_dtype,
@@ -15,13 +18,21 @@ from ninetoothed.backends.ascend import (
 from ninetoothed.backends.core import Target
 from ninetoothed.backends.emitters import ssa as common
 from ninetoothed.backends.emitters.analysis import walk_ops
-from ninetoothed.backends.emitters.base import ModuleRenderContext
+from ninetoothed.backends.emitters.base import ModuleRenderContext, StoreAddressPlan
 from ninetoothed.backends.emitters.triton import TritonTarget
 from ninetoothed.ir import Kernel, ssa
 
-_view_base_coords = common.view_base_coords
-_linearized_index = common.linearized_index
-_source_index_for_value = common.source_index_for_value
+_access_template = common.access_template
+_current_coords = common.current_coords
+_value_axes = common.value_axes
+
+
+def _unsupported_attention_emission(reason: str) -> UnsupportedBackendOpError:
+    return UnsupportedBackendOpError(
+        "Ascend Attention structured emission contract is incomplete.",
+        reason=reason,
+        suggestion="rebuild the verified retile and resource plan before emission.",
+    )
 
 _ASCEND_MATH_INTRINSICS = frozenset(
     {
@@ -104,6 +115,56 @@ class AscendTarget(TritonTarget):
     suffix: str = "ascend.py"
     source_route: str = "ssa-unified-ascend-triton-emitter"
     default_load_mask: bool = False
+
+    def store_address_plan(
+        self,
+        *,
+        value_name: str,
+        tensor_info,
+        level: int,
+        context,
+    ) -> StoreAddressPlan:
+        """Provide coordinates for complete multidimensional Ascend stores."""
+        template = _access_template(tensor_info, level)
+        if template is None:
+            return StoreAddressPlan()
+
+        template_shape = tuple(str(dim) for dim in template.get("shape", ()))
+        value_axes = tuple(str(axis) for axis in _value_axes(value_name, context))
+        if not template_shape or value_axes != template_shape:
+            return StoreAddressPlan()
+
+        coords = _current_coords(value_axes, context)
+        return StoreAddressPlan(
+            value_coords=coords,
+            mask_coords=coords,
+            source="target",
+        )
+
+    def vector_reduce(self, operator: str, operand: str, axis: int | None) -> str:
+        if operator == "all":
+            # Triton Ascend does not expose tl.all.  Attention stores boolean
+            # lanes as 0/1 int32 values; their minimum is nonzero exactly when
+            # every lane is true. axis=None produces the scalar predicate
+            # required by the all-masked state-preserving branch.
+            axis_expr = "None" if axis is None else str(axis)
+            return f"(tl.min(({operand}).to(tl.int32), axis={axis_expr}) != 0)"
+        return super().vector_reduce(operator, operand, axis)
+
+    def vector_splat(self, shape: str, value: str, dtype: str) -> str:
+        # This Triton Ascend build has no tl.bool.  Integer lanes preserve the
+        # predicate's 0/1 semantics and remain valid operands for comparisons,
+        # where, and the int32-backed all reduction above.
+        if normalize_ascend_dtype(dtype) == "bool":
+            dtype = "int32"
+        return super().vector_splat(shape, value, dtype)
+
+    def unary(self, operator: str, operand: str) -> str:
+        # Shared SSA uses C's logical-not token, while generated Ascend source
+        # is Python/Triton and must use the Python spelling.
+        if operator == "not":
+            return f"(not {operand})"
+        return super().unary(operator, operand)
 
     def cast(self, dtype: str, value: str) -> str:
         return f"{value}.to(tl.{_triton_dtype(dtype)})"
@@ -294,6 +355,34 @@ def emit(kernel: Kernel):
     """Emit only the explicitly verified first Ascend operation tier."""
     _validate_program(kernel)
     schedule = kernel.ssa.metadata.get("schedule", {})
+    attention_contract = schedule.get("ascend_attention_loop")
+    if attention_contract:
+        _validate_ascend_attention_emission_contract(kernel)
+        retile = schedule.get("ascend_attention_retile")
+        plan = schedule.get("ascend_attention_plan")
+        if not isinstance(retile, dict) and not hasattr(retile, "get"):
+            raise _unsupported_attention_emission(
+                "structured retile metadata is absent from the source boundary."
+            )
+        if not isinstance(plan, dict) and not hasattr(plan, "get"):
+            raise _unsupported_attention_emission(
+                "verified Attention planner metadata is absent from the source boundary."
+            )
+        resource_plan = plan.get("resource_plan", {})
+        selected_tile = dict(resource_plan.get("selected_tile", {}))
+        if (
+            selected_tile != dict(plan.get("tile", {}))
+            or tuple(retile.get(f"block_{axis}") for axis in ("m", "n", "k"))
+            != tuple(selected_tile.get(axis) for axis in ("m", "n", "k"))
+        ):
+            raise _unsupported_attention_emission(
+                "structured retile and planner tile contracts disagree."
+            )
+        if plan.get("sequence") is not None and retile.get("sequence") != plan.get("sequence"):
+            raise _unsupported_attention_emission(
+                "structured retile sequence differs from the resource plan."
+            )
+        attention_source_contract = ascend_attention_source_contract(plan, retile)
     target = (
         replace(TARGET, default_load_mask=True)
         if schedule.get("granularity") == "blocked-linalg"
@@ -302,6 +391,49 @@ def emit(kernel: Kernel):
 
     kernel = _rewrite_private_scan_ops(kernel)
     artifact = common.emit(kernel, target)
+
+    if attention_contract:
+        forbidden_shapes = ("128x64", "tl.full((128, 64))", "memref<128x64>")
+        if any(shape in artifact.primary_source for shape in forbidden_shapes):
+            raise UnsupportedBackendOpError(
+                "Ascend Attention source contains an unverified fixed physical shape.",
+                reason="the emitted source retained a legacy 128x64 shape.",
+                suggestion="emit shapes from the verified Attention tile contract.",
+            )
+        plan = schedule.get("ascend_attention_plan", {})
+        retile = schedule.get("ascend_attention_retile", {})
+        if plan.get("status") == "verified-static-single-block":
+            expected_grid = int(plan["grid"])
+            batch = int(plan["batch"])
+            heads = int(plan["heads"])
+            sequence = int(plan["sequence"])
+            m, n = int(selected_tile["m"]), int(selected_tile["n"])
+            query_tiles = (sequence + m - 1) // m
+            key_tiles = (sequence + n - 1) // n
+            expected_retile_grid = batch * heads * query_tiles
+            if expected_grid != expected_retile_grid:
+                raise _unsupported_attention_emission(
+                    "planner grid is inconsistent with concrete Q shape."
+                )
+            if (
+                f"{batch} * {heads} * triton.cdiv({sequence}, {m})"
+                != retile.get("grid")
+            ):
+                raise _unsupported_attention_emission(
+                    "emitted launch grid expression does not consume concrete batch/head/sequence."
+                )
+            if f"(({sequence} + {n - 1}) // {n})" != retile.get("loop_upper"):
+                raise _unsupported_attention_emission(
+                    "retiled scf.for upper bound does not match the planned sequence tiles."
+                )
+            if f"(({sequence} + {m - 1}) // {m})" != retile.get("query_loop_upper"):
+                raise _unsupported_attention_emission(
+                    "retiled query grid does not match the planned query tiles."
+                )
+            if key_tiles != plan.get("key_tiles") or query_tiles != plan.get("query_tiles"):
+                raise _unsupported_attention_emission(
+                    "planner query/key tile counts disagree with selected M/N."
+                )
 
     # Publish solved matrix dimensions through the artifact schedule.  The
     # driver uses this metadata when constructing launch ABI defaults, so the
@@ -338,8 +470,20 @@ def emit(kernel: Kernel):
 
     artifact = _rewrite_stride_predicates(artifact)
     artifact = _rewrite_unary_positive(artifact)
-
-    return _rewrite_singleton_broadcast_loads(artifact, kernel)
+    artifact = _rewrite_singleton_broadcast_loads(artifact, kernel)
+    if attention_contract:
+        source_metadata = (
+            f"\n\n{ASCEND_ATTENTION_SOURCE_CONTRACT_ATTRIBUTE} = "
+            f"{attention_source_contract!r}\n"
+        )
+        source = artifact.primary_source.rstrip() + source_metadata
+        artifact = replace(
+            artifact,
+            sources={artifact.primary_source_name: source},
+            metadata=dict(artifact.metadata)
+            | {"ascend_attention_source_contract": attention_source_contract},
+        )
+    return artifact
 
 
 def _rewrite_private_scan_ops(kernel: Kernel) -> Kernel:

@@ -6,7 +6,12 @@ from types import SimpleNamespace
 import pytest
 
 from ninetoothed import Tensor
-from ninetoothed.backends.ascend import ascend_cache_key
+from ninetoothed.backends.ascend import (
+    ascend_cache_key,
+    ascend_capability_matrix,
+    ascend_soc_profile,
+    validate_build_policy,
+)
 from ninetoothed.build import build
 from ninetoothed.compiler import DEFAULT_COMPILER, CompileRequest
 
@@ -20,6 +25,10 @@ def _application(input, other, output):
 
 
 def _request(**options):
+    backend_options = options.pop(
+        "backend_options",
+        {"soc_version": "Ascend910B3", "max_core_dim": 8},
+    )
     return CompileRequest(
         arrangement=_arrangement,
         application=_application,
@@ -29,7 +38,7 @@ def _request(**options):
             Tensor(1, dtype="float32"),
         ),
         backend="ascend",
-        backend_options={"soc_version": "Ascend910B3", "max_core_dim": 8},
+        backend_options=backend_options,
         **options,
     )
 
@@ -76,6 +85,32 @@ def test_ascend_cache_key_isolated_by_soc_and_toolchain_target(monkeypatch):
 
     assert first != changed_arch
     assert changed_arch != changed_soc
+
+
+def test_ascend_910b4_profile_is_admitted_without_inferred_capacities():
+    profile = ascend_soc_profile("Ascend910B4")
+    matrix = ascend_capability_matrix()
+
+    assert profile.name == "Ascend910B4"
+    assert profile.cube_cores is None
+    assert profile.vector_cores is None
+    assert profile.l2_cache_bytes is None
+    assert profile.ub_bytes is None
+    assert "Ascend910B4" in matrix["devices"]
+    assert matrix["soc_profiles"]["Ascend910B4"] == {
+        "cube_cores": None,
+        "vector_cores": None,
+        "l2_cache_bytes": None,
+        "ub_bytes": None,
+        "l1_bytes": None,
+        "l0a_bytes": None,
+        "l0b_bytes": None,
+        "l0c_bytes": None,
+    }
+
+    request = _request(backend_options={"soc_version": "Ascend910B4", "max_core_dim": 8})
+    compilation = DEFAULT_COMPILER.compile(request)
+    validate_build_policy(compilation.artifact.metadata, request)
 
 
 def test_ascend_build_uses_generic_multiple_candidate_path(tmp_path, monkeypatch):

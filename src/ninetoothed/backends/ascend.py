@@ -1,5 +1,6 @@
 """Ascend backend policy, contracts, and private launch metadata."""
 
+import ast
 import hashlib
 import json
 import os
@@ -144,9 +145,21 @@ class AscendBackend(Backend):
         tile = dict(schedule.get("tile", {}))
         matrix_tile = dict(schedule.get("ascend_matrix_tile", {}))
         dot_loop = dict(schedule.get("ascend_dot_loop", {}))
-        access_resources = _validate_ascend_access_template_contract(
-            kernel.ssa, schedule, kernel.tensors
-        )
+        is_attention = bool(schedule.get("ascend_attention_loop"))
+        attention_resource_plan = None
+        if is_attention:
+            selected = _selected_attention_tile(schedule)
+            attention_resource_plan = schedule["ascend_attention_plan"][
+                "resource_plan"
+            ]
+        # Attention owns a two-dot online-softmax loop. The generic
+        # access-template validator is for one-dot Conv2d loops and must not
+        # reinterpret this already verified Attention contract as Conv2d.
+        access_resources = None
+        if not is_attention:
+            access_resources = _validate_ascend_access_template_contract(
+                kernel.ssa, schedule, kernel.tensors
+            )
         if access_resources is not None:
             schedule["ascend_access_template_resources"] = access_resources
             dot_tile = dict(access_resources["tile"])
@@ -162,7 +175,29 @@ class AscendBackend(Backend):
             }
         else:
             solve_input = matrix_tile or tile
-        if solve_input:
+        if is_attention:
+            selected = _attention_tile_dict(
+                attention_resource_plan["selected_tile"]
+            )
+            solved = {
+                "block_m": selected["m"],
+                "block_n": selected["n"],
+                "block_k": selected["k"],
+                "BLOCK_SIZE_M": selected["m"],
+                "BLOCK_SIZE_N": selected["n"],
+                "BLOCK_SIZE_K": selected["k"],
+            }
+            budget = int(attention_resource_plan["ub_budget_bytes"])
+            estimated_peak = int(
+                attention_resource_plan["ub_estimated_peak_bytes"]
+            )
+            ub_plan = AscendUBPlan(
+                safe_tile=solved,
+                estimated_peak_bytes=estimated_peak,
+                workspace_bytes=selected["m"] * selected["n"] * 4,
+                safety_margin_bytes=max(0, budget - estimated_peak),
+            )
+        elif solve_input:
             ub_plan = plan_ascend_ub(kernel.ssa, solve_input)
             if ub_plan.rejection_reason:
                 raise UnsupportedBackendOpError(
@@ -171,6 +206,7 @@ class AscendBackend(Backend):
                     suggestion="reduce M/N/K tile dimensions or split the reduction loop.",
                 )
             solved = solve_ascend_tile_config(kernel.ssa, solve_input)
+        if is_attention or solve_input:
             # Publish the solved dimensions through the canonical schedule
             # namespace consumed by Launch-ABI specialization.  Keep the
             # matrix-specific copy as well, but never leave ``tile`` at the
@@ -493,6 +529,10 @@ def _ascend_operation_matches_tile(
 ASCEND_UB_LIMIT_BYTES = 96 * 1024
 ASCEND_UB_NORMAL_FRACTION = 0.90
 ASCEND_UB_ATTENTION_FRACTION = 0.55
+# These tiles share one structured online-softmax lowering. M=16 is the
+# smallest candidate returned by the current UB model; M=32 remains available
+# when its resource estimate fits. Every dimension is consumed from the plan.
+_ASCEND_ATTENTION_TILE_CANDIDATES = ((16, 32, 32), (32, 32, 32))
 
 
 @dataclass(frozen=True)
@@ -513,7 +553,50 @@ UNSUPPORTED_DTYPES = frozenset({"float8_e5m2", "float8_e4m3fn", "float64"})
 ASCEND_ELEMENTWISE_DTYPES = SUPPORTED_DTYPES
 ASCEND_RNG_DTYPES = frozenset({"float16", "bfloat16", "float32"})
 ASCEND_ATOMIC_DTYPES = frozenset({"float16", "bfloat16", "float32", "int32"})
-_SIDECAR_SCHEMA = 3
+ASCEND_ATTENTION_INPUT_DTYPES = frozenset({"float16", "bfloat16", "float32"})
+ASCEND_ATTENTION_INTERNAL_DTYPE = "float32"
+ASCEND_ATTENTION_OUTPUT_DTYPES = ASCEND_ATTENTION_INPUT_DTYPES
+ASCEND_ATTENTION_ERROR_TOLERANCES = {
+    "float16": {"rtol": 0.01, "atol": 0.01},
+    "bfloat16": {"rtol": 0.025, "atol": 0.025},
+    "float32": {"rtol": 0.025, "atol": 0.025},
+}
+ASCEND_ATTENTION_DTYPE_REGISTRY = {
+    dtype: {
+        "input": {"q": dtype, "k": dtype, "v": dtype, "o": dtype},
+        "internal": {
+            "score": "float32",
+            "softmax": "float32",
+            "acc": "float32",
+            "m_i": "float32",
+            "l_i": "float32",
+        },
+        "intrinsics": {
+            "dot": "fp32-accumulate",
+            "reduction": "fp32",
+            "cast": f"{dtype}->float32 and float32->{dtype}",
+        },
+        "ub": {"input_bytes": 2 if dtype in {"float16", "bfloat16"} else 4,
+               "internal_bytes": 4, "workspace_bytes_per_element": 4},
+        "runtime": {
+            "device": "Ascend910B4",
+            "cann": "9.0.0",
+            "torch_npu": "2.7.1",
+            "triton": "3.2.0",
+            "triton_ascend": "3.2.2",
+        },
+        "error": dict(ASCEND_ATTENTION_ERROR_TOLERANCES[dtype]),
+        "status": (
+            "verified-jit-aot-npu"
+            if dtype in {"float16", "float32"}
+            else "contract-only-awaiting-npu-gates"
+        ),
+    }
+    for dtype in sorted(ASCEND_ATTENTION_INPUT_DTYPES)
+}
+_SIDECAR_SCHEMA = 4
+ASCEND_ATTENTION_SOURCE_CONTRACT_ATTRIBUTE = "__ninetoothed_ascend_attention_contract__"
+ASCEND_ATTENTION_SOURCE_CONTRACT_VERSION = 1
 
 
 def ascend_dtype_legality(dtypes):
@@ -588,6 +671,11 @@ def calculate_ssa_ub_bytes(ssa_graph, tile_config, pipeline_factor=2):
         # explicit boolean causal predicate.  Model both allocations rather
         # than treating the dot as an isolated GEMM.
         input_output += m * n * (4 + 1)
+        # Online softmax keeps score, probability, value accumulation and
+        # reduction temporaries live across the structured branch.  Include
+        # those FP32 tiles so the planner cannot admit a source tile that
+        # BiShengIR later rejects for UB overflow.
+        input_output += 3 * (m * n * 4)
     return input_output * max(1, int(pipeline_factor))
 
 
@@ -610,28 +698,16 @@ def _retile_ascend_online_softmax(
     if not schedule.get("ascend_attention_loop") or kernel.ssa is None:
         return kernel
 
-    # Start below the 96 KiB budget because causal score masks and the online
-    # accumulator have overlapping lifetimes in BiShengIR.
+    attention_plan = schedule["ascend_attention_plan"]
+    resource_plan = attention_plan["resource_plan"]
+    selected_tile = _selected_attention_tile(schedule)
+
     provenance = dict(schedule.get("ascend_tile_provenance", {}))
-    candidate = dict(provenance.get("candidate", {}))
-    # The public contract carries a runtime causal branch (``public-scf-if``)
-    # rather than a compile-time boolean.  Reserve the causal footprint for
-    # both variants so a cached kernel cannot overflow when the flag is true.
-    causal_contract = schedule.get("ascend_attention_loop", {}).get("causal")
-    causal_tile_m = 32 if causal_contract else 64
-    initial = {
-        "block_m": min(int(candidate.get("block_m", causal_tile_m)), causal_tile_m),
-        "block_n": min(int(candidate.get("block_n", 32)), 32),
-        "block_k": min(int(candidate.get("block_k", 32)), 32),
+    solved = {
+        "block_m": selected_tile["m"],
+        "block_n": selected_tile["n"],
+        "block_k": selected_tile["k"],
     }
-    plan = plan_ascend_ub(kernel.ssa, initial)
-    if plan.rejection_reason:
-        raise UnsupportedBackendOpError(
-            "Ascend attention tile cannot satisfy the private UB budget.",
-            reason=plan.rejection_reason,
-            suggestion="Reduce the attention tile or split the sequence loop.",
-        )
-    solved = dict(plan.safe_tile)
     defaults = dict(kernel.metadata.get("meta_defaults", {}))
     values = {}
     block_values = (solved["block_m"], solved["block_n"])
@@ -660,8 +736,13 @@ def _retile_ascend_online_softmax(
             "block_k": solved["block_k"],
         },
         "ascend_ub_plan": {
-            "estimated_peak_bytes": plan.estimated_peak_bytes,
-            "safety_margin_bytes": plan.safety_margin_bytes,
+            "estimated_peak_bytes": resource_plan["ub_estimated_peak_bytes"],
+            "safety_margin_bytes": max(
+                0,
+                int(resource_plan["ub_budget_bytes"])
+                - int(resource_plan["ub_estimated_peak_bytes"]),
+            ),
+            "budget_bytes": resource_plan["ub_budget_bytes"],
             "budget_fraction": ASCEND_UB_ATTENTION_FRACTION,
         },
     }
@@ -692,7 +773,7 @@ def _structured_retile_ascend_attention(
         return kernel
     schedule = dict(kernel.ssa.metadata.get("schedule", {}))
     contract = schedule.get("ascend_attention_loop")
-    if not isinstance(contract, Mapping) or contract.get("mode") != "generic-online-softmax-loop":
+    if not isinstance(contract, Mapping) or contract.get("kind") != "generic-online-softmax-loop":
         raise UnsupportedBackendOpError(
             "Ascend structured retile received an unrecognized attention contract.",
             reason="only generic-online-softmax-loop SSA contracts are supported.",
@@ -717,11 +798,24 @@ def _structured_retile_ascend_attention(
         for role in required
         if roles[role].get("resolved") is not None
     }
-    if resolved != {"matmul-m": 32, "matmul-n": 32, "reduction-k": 32}:
+    selected_tile = _selected_attention_tile(schedule)
+    selected_roles = {
+        "matmul-m": selected_tile["m"],
+        "matmul-n": selected_tile["n"],
+        "reduction-k": selected_tile["k"],
+    }
+    if resolved != selected_roles:
         raise UnsupportedBackendOpError(
-            "Ascend attention structured retile requires the 32x32x32 tile.",
-            reason=f"resolved tile roles are {resolved!r}.",
-            suggestion="use BLOCK_M=32, BLOCK_N=32, and BLOCK_K=32 for this contract.",
+            "Ascend Attention structured retile does not match the resource plan.",
+            reason=f"provenance tile roles={resolved!r}, resource tile={selected_roles!r}.",
+            suggestion="derive every structured retile dimension from the canonical resource plan.",
+        )
+    supported = tuple(_ASCEND_ATTENTION_TILE_CANDIDATES)
+    if (selected_tile["m"], selected_tile["n"], selected_tile["k"]) not in supported:
+        raise UnsupportedBackendOpError(
+            "Ascend Attention selected a tile without a verified structured lowering.",
+            reason=f"selected tile={selected_tile!r}, verified candidates={supported!r}.",
+            suggestion="add and verify the complete SSA retile before admitting this tile.",
         )
 
     source_shapes = {
@@ -730,12 +824,28 @@ def _structured_retile_ascend_attention(
         if getattr(spec, "ndim", 0) >= 2
     }
     sequence, head_dim = _attention_sequence_and_head_dim(source_shapes)
-    if head_dim != 64 or sequence > 64:
+    if head_dim is not None and head_dim != 64:
         raise UnsupportedBackendOpError(
-            "Ascend structured retile supports head_dim=64 and sequence<=64 only.",
+            "Ascend structured retile supports head_dim=64 and sequence<=1024 only.",
             reason=f"received head_dim={head_dim!r}, sequence={sequence!r}.",
             suggestion="use the verified small-shape Attention contract.",
         )
+    if sequence is not None and sequence > 1024:
+        raise UnsupportedBackendOpError(
+            "Ascend structured retile supports sequence<=1024 only.",
+            reason=f"received sequence={sequence!r}.",
+            suggestion="use the bounded sequence-tiled Attention contract.",
+        )
+
+    q_source_shape = source_shapes.get("q")
+    if q_source_shape is None or len(q_source_shape) != 4:
+        raise UnsupportedBackendOpError(
+            "Ascend Attention retile requires rank-4 Q source provenance.",
+            reason=f"source shapes={source_shapes!r}.",
+            suggestion="preserve Q batch/head/sequence/head_dim metadata through lowering.",
+        )
+    batch_expr, heads_expr = str(q_source_shape[0]), str(q_source_shape[1])
+    sequence_expr, head_dim_expr = str(q_source_shape[-2]), str(q_source_shape[-1])
 
     loop_paths = []
     values = {}
@@ -743,12 +853,19 @@ def _structured_retile_ascend_attention(
         parameter = str(entry.get("parameter", ""))
         if parameter:
             role = str(entry.get("role"))
-            values[parameter] = 32 if role in required else values.get(parameter)
+            tile_axis = {
+                "matmul-m": "m",
+                "matmul-n": "n",
+                "reduction-k": "k",
+            }.get(role)
+            if tile_axis is not None:
+                values[parameter] = selected_tile[tile_axis]
     for name in _attention_tile_symbols(kernel.ssa) + _attention_tensor_tile_symbols(
         kernel.tensors
     ):
-        for symbol in re.findall(r"[A-Za-z_][A-Za-z0-9_]*BLOCK_SIZE_[01]", str(name)):
-            values[symbol] = 32
+        for symbol in re.findall(r"[A-Za-z_][A-Za-z0-9_]*BLOCK_SIZE_[012]", str(name)):
+            tile_index = int(symbol.rsplit("BLOCK_SIZE_", 1)[1])
+            values[symbol] = selected_tile[("m", "n", "k")[tile_index]]
 
     if not values:
         raise UnsupportedBackendOpError(
@@ -774,6 +891,14 @@ def _structured_retile_ascend_attention(
     )
 
     program = specialize_program(kernel.ssa, values)
+    attention_sequence = sequence if sequence is not None else sequence_expr
+    attention_head_dim = head_dim if head_dim is not None else head_dim_expr
+    dot_tiles = _attention_dot_tile_contracts(
+        selected_tile,
+        sequence=attention_sequence,
+        head_dim=attention_head_dim,
+    )
+    program = _annotate_ascend_attention_dot_tiles(program, dot_tiles)
     loop = next(
         operation
         for block in program.blocks
@@ -781,49 +906,644 @@ def _structured_retile_ascend_attention(
         if operation.opcode == "scf.for"
     )
     loop_attrs = dict(loop.attrs)
+    m, n, k = (selected_tile[axis] for axis in ("m", "n", "k"))
+    query_tiles = (
+        (sequence + m - 1) // m if sequence is not None else f"ceil_div({sequence_expr}, {m})"
+    )
+    key_tiles = (
+        (sequence + n - 1) // n if sequence is not None else f"ceil_div({sequence_expr}, {n})"
+    )
+    query_upper = (
+        f"(({sequence} + {m - 1}) // {m})"
+        if sequence is not None
+        else f"ceil_div({sequence_expr}, {m})"
+    )
+    key_upper = (
+        f"(({sequence} + {n - 1}) // {n})"
+        if sequence is not None
+        else f"ceil_div({sequence_expr}, {n})"
+    )
+    try:
+        batch_value, heads_value = int(batch_expr), int(heads_expr)
+        grid_expr = (
+            f"{batch_value} * {heads_value} * "
+            f"triton.cdiv({sequence if sequence is not None else sequence_expr}, {m})"
+        )
+        grid_value = (
+            batch_value * heads_value * query_tiles
+            if isinstance(query_tiles, int)
+            else f"{batch_value} * {heads_value} * ({query_tiles})"
+        )
+    except (TypeError, ValueError):
+        grid_expr = (
+            f"({batch_expr}) * ({heads_expr}) * "
+            f"triton.cdiv({sequence if sequence is not None else sequence_expr}, {m})"
+        )
+        grid_value = f"({batch_expr}) * ({heads_expr}) * ({query_tiles})"
     loop_attrs["ascend_attention_retile"] = {
-        "block_m": 32,
-        "block_n": 32,
-        "block_k": 32,
-        "sequence": int(sequence),
+        "status": "retiled",
+        "block_m": m,
+        "block_n": n,
+        "block_k": k,
+        "sequence": sequence if sequence is not None else sequence_expr,
+        "head_dim": head_dim if head_dim is not None else head_dim_expr,
+        "query_tiles": query_tiles,
+        "key_tiles": key_tiles,
+        "query_loop_upper": query_upper,
+        "key_loop_upper": key_upper,
         "loop_lower": "0",
-        "loop_upper": f"(({int(sequence)} + 31) // 32)",
+        "loop_upper": key_upper,
         "loop_step": "1",
-        "grid": f"triton.cdiv({int(sequence)}, 32)",
+        "grid": grid_expr,
+        "dot_tiles": dot_tiles,
     }
-    upper_name = "%ascend_attention_sequence_tiles"
+    preceding = ()
     loop_operands = list(loop.operands)
-    loop_operands[1] = upper_name
+    existing_names = {value.name for value in (*program.inputs, *program.outputs)}
+    existing_names.update(
+        argument.name
+        for block in program.blocks
+        for operation in _walk_operations((block,))
+        for region in operation.regions
+        for argument in region.args
+    )
+    existing_names.update(
+        result.name
+        for operation in _walk_operations(program.blocks)
+        for result in operation.results
+    )
+
+    def fresh_scalar(prefix: str) -> ssa.Value:
+        name = f"%ascend_attention_{prefix}"
+        suffix = 0
+        while name in existing_names:
+            suffix += 1
+            name = f"%ascend_attention_{prefix}_{suffix}"
+        existing_names.add(name)
+        return ssa.Value(
+            name=name,
+            type=ssa.Type(kind="scalar", dtype="int64"),
+        )
+
+    if sequence is not None:
+        upper = fresh_scalar("key_tiles")
+        loop_operands[1] = upper.name
+        preceding = (
+            ssa.Operation(
+                opcode="arith.constant",
+                results=(upper,),
+                attrs={"value": key_tiles},
+            ),
+        )
+    else:
+        access = contract.get("access_provenance", {})
+        key_entry = access.get("k", {}) if isinstance(access, Mapping) else {}
+        key_source = key_entry.get("tensor") if isinstance(key_entry, Mapping) else None
+        if not key_source or key_source not in {value.name for value in program.inputs}:
+            raise UnsupportedBackendOpError(
+                "Ascend Attention dynamic key loop has no K source dimension.",
+                reason=f"K access provenance={key_entry!r}.",
+                suggestion="derive the key loop bound from the verified K source shape.",
+            )
+        sequence_value = fresh_scalar("key_sequence")
+        rounding_value = fresh_scalar("key_sequence_rounded")
+        rounding_amount = fresh_scalar("key_tile_rounding")
+        divisor = fresh_scalar("key_tile_divisor")
+        upper = fresh_scalar("key_tiles")
+        preceding = (
+            ssa.Operation(
+                opcode="shape.dim",
+                operands=(str(key_source),),
+                results=(sequence_value,),
+                attrs={
+                    "dim": -2,
+                    "source": True,
+                    "ascend_attention_retile": "key-sequence",
+                },
+            ),
+            ssa.Operation(
+                opcode="arith.constant",
+                results=(rounding_amount,),
+                attrs={"value": n - 1},
+            ),
+            ssa.Operation(
+                opcode="arith.add",
+                operands=(sequence_value.name, rounding_amount.name),
+                results=(rounding_value,),
+                attrs={"ascend_attention_retile": "ceil-div-numerator"},
+            ),
+            ssa.Operation(
+                opcode="arith.constant",
+                results=(divisor,),
+                attrs={"value": n},
+            ),
+            ssa.Operation(
+                opcode="arith.floordiv",
+                operands=(rounding_value.name, divisor.name),
+                results=(upper,),
+                attrs={"ascend_attention_retile": "key-loop-upper"},
+            ),
+        )
+        loop_operands[1] = upper.name
     rewritten_loop = replace(
         loop,
         operands=tuple(loop_operands),
         attrs=loop_attrs,
     )
-    upper_constant = ssa.Operation(
-        opcode="arith.constant",
-        results=(
-            ssa.Value(
-                name=upper_name,
-                type=ssa.Type(kind="scalar", dtype="int64"),
-            ),
-        ),
-        attrs={"value": (int(sequence) + 31) // 32},
-    )
-    program = _replace_operation(
-        program,
-        loop,
-        rewritten_loop,
-        preceding=(upper_constant,),
-    )
+    program = _replace_operation(program, loop, rewritten_loop, preceding=preceding)
     updated_schedule = dict(program.metadata.get("schedule", {}))
     updated_schedule["ascend_attention_retile"] = dict(loop_attrs["ascend_attention_retile"])
     updated_schedule["ascend_tile_provenance"] = dict(provenance)
+    attention_plan = dict(updated_schedule.get("ascend_attention_plan", {}))
+    attention_plan["tile"] = dict(selected_tile)
+    attention_plan["query_tiles"] = query_tiles
+    attention_plan["key_tiles"] = key_tiles
+    attention_plan["grid"] = grid_value
+    attention_plan["dot_tiles"] = dot_tiles
+    attention_plan["loop"] = {"lower": "0", "upper": key_upper, "step": 1}
+    updated_schedule["ascend_attention_plan"] = attention_plan
     program = replace(program, metadata=dict(program.metadata) | {"schedule": updated_schedule})
-    return replace(
+    tensors = specialize_tensor_specs(kernel.tensors, values)
+    retiled_kernel = replace(
         kernel,
-        tensors=specialize_tensor_specs(kernel.tensors, values),
+        tensors=tensors,
         ssa=program,
     )
+    _verify_ascend_attention_retile_plan(retiled_kernel, selected_tile)
+
+    retiled_schedule = dict(program.metadata.get("schedule", {}))
+    retiled_contract = _ascend_attention_loop_contract(program)
+    if not isinstance(retiled_contract, Mapping) or retiled_contract.get("kind") != "generic-online-softmax-loop":
+        raise UnsupportedBackendOpError(
+            "Ascend Attention retile did not preserve its structured SSA contract.",
+            reason=f"reconstructed contract={retiled_contract!r}.",
+            suggestion="preserve both dots, masks, causal predicate, and loop state through retile.",
+        )
+    retiled_schedule["ascend_attention_loop"] = retiled_contract
+    verified_program = replace(
+        program,
+        metadata=dict(program.metadata) | {"schedule": retiled_schedule},
+    )
+    ssa.verify_program(verified_program)
+    semantics = verify_ascend_attention_mask_semantics(verified_program)
+    if not isinstance(semantics, Mapping):
+        raise UnsupportedBackendOpError(
+            "Ascend Attention retile could not reverify mask semantics.",
+            reason="the post-retile verifier returned no semantic proof.",
+            suggestion="keep the verified Attention contract attached to the retiled SSA.",
+        )
+    retiled_schedule["ascend_attention_mask_semantics"] = semantics
+    verified_program = replace(
+        verified_program,
+        metadata=dict(verified_program.metadata) | {"schedule": retiled_schedule},
+    )
+    return replace(retiled_kernel, ssa=verified_program)
+
+
+def _attention_dot_tile_contracts(
+    selected_tile: Mapping[str, int], *, sequence: Any, head_dim: Any
+) -> Mapping[str, Mapping[str, Any]]:
+    """Describe each Attention dot using the planner's M/N/K meanings.
+
+    Attention uses N for the key tile and K for the QK head-dimension
+    reduction tile.  The PV dot therefore contracts over N and produces the
+    full head dimension, while QK contracts over head_dim in K-sized pieces.
+    The logical tensor extents remain intact so the complete head dimension
+    is always covered.
+    """
+    m, n, k = (int(selected_tile[axis]) for axis in ("m", "n", "k"))
+    m_text, n_text, k_text = str(m), str(n), str(k)
+    sequence_text, head_dim_text = str(sequence), str(head_dim)
+    try:
+        head_dim_value = int(head_dim)
+        qk_reduction_tiles: int | str = (head_dim_value + k - 1) // k
+    except (TypeError, ValueError):
+        qk_reduction_tiles = f"ceil_div({head_dim_text}, {k})"
+
+    query_tail = f"query_tile_index * {m} + query_lane < {sequence_text}"
+    key_tail = f"key_tile_index * {n} + key_lane < {sequence_text}"
+    feature_tail = f"feature_lane < {head_dim_text}"
+    reduction_tail = (
+        f"reduction_tile_index * {k} + reduction_lane < {head_dim_text}"
+    )
+    return {
+        "qk": {
+            "role": "qk",
+            "resource_tile": {"m": m, "n": n, "k": k},
+            "tile_shapes": {
+                "lhs": (m_text, k_text),
+                "rhs": (k_text, n_text),
+                "result": (m_text, n_text),
+            },
+            "logical_shapes": {
+                "lhs": (m_text, head_dim_text),
+                "rhs": (head_dim_text, n_text),
+                "result": (m_text, n_text),
+            },
+            "reduction": {
+                "extent": head_dim_value if isinstance(head_dim, int) else head_dim_text,
+                "tile_extent": k,
+                "tile_count": qk_reduction_tiles,
+                "tail_mask": reduction_tail,
+            },
+            "tail_masks": {
+                "query": query_tail,
+                "key": key_tail,
+                "reduction": reduction_tail,
+            },
+        },
+        "pv": {
+            "role": "pv",
+            "resource_tile": {"m": m, "n": n, "k": k},
+            "tile_shapes": {
+                "lhs": (m_text, n_text),
+                "rhs": (n_text, head_dim_text),
+                "result": (m_text, head_dim_text),
+            },
+            "logical_shapes": {
+                "lhs": (m_text, n_text),
+                "rhs": (n_text, head_dim_text),
+                "result": (m_text, head_dim_text),
+            },
+            "reduction": {
+                "extent": n,
+                "tile_extent": n,
+                "tile_count": 1,
+                "tail_mask": key_tail,
+            },
+            "tail_masks": {
+                "query": query_tail,
+                "key": key_tail,
+                "feature": feature_tail,
+            },
+        },
+    }
+
+
+def _annotate_ascend_attention_dot_tiles(
+    program: ssa.Program,
+    dot_tiles: Mapping[str, Mapping[str, Any]],
+) -> ssa.Program:
+    """Attach role-specific planned tile contracts to the QK and PV dots."""
+    dots = tuple(
+        operation
+        for operation in _walk_operations(program.blocks)
+        if operation.opcode == "linalg.dot"
+    )
+    if len(dots) != 2:
+        raise UnsupportedBackendOpError(
+            "Ascend Attention retile requires both planned dot operations.",
+            reason=f"found {len(dots)} linalg.dot operations before dot retile.",
+            suggestion="preserve the QK and PV dots in the verified Attention loop.",
+        )
+    rewritten = program
+    for operation, role in zip(dots, ("qk", "pv"), strict=True):
+        attrs = dict(operation.attrs)
+        dot_tile = dict(dot_tiles[role])
+        resource_tile = dict(dot_tile["resource_tile"])
+        attrs["ascend_attention_dot_tile"] = dot_tile
+        attrs["ascend_attention_resource_tile"] = resource_tile
+        attrs.update(
+            {
+                "block_m": resource_tile["m"],
+                "block_n": resource_tile["n"],
+                "block_k": resource_tile["k"],
+            }
+        )
+        rewritten = _replace_operation(
+            rewritten,
+            operation,
+            ssa.Operation(
+                opcode=operation.opcode,
+                operands=operation.operands,
+                results=operation.results,
+                attrs=attrs,
+                regions=operation.regions,
+            ),
+        )
+    return rewritten
+
+
+def _normalize_attention_contract_value(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {
+            str(key): _normalize_attention_contract_value(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, (tuple, list)):
+        return tuple(_normalize_attention_contract_value(item) for item in value)
+    return value
+
+
+def _verify_ascend_attention_retile_plan(
+    kernel: Kernel, selected_tile: Mapping[str, int]
+) -> None:
+    """Prove that the retiled SSA shapes, masks, and bounds consume the plan."""
+    if kernel.ssa is None:
+        raise UnsupportedBackendOpError(
+            "Ascend Attention retile verification requires SSA.",
+            reason="the retiled kernel has no SSA program.",
+            suggestion="preserve the structured Attention program through retile.",
+        )
+    program = kernel.ssa
+    schedule = dict(program.metadata.get("schedule", {}))
+    attention_plan = schedule.get("ascend_attention_plan", {})
+    resource_plan = attention_plan.get("resource_plan", {})
+    plan_tile = _attention_tile_dict(attention_plan.get("tile", {}))
+    resource_tile = _attention_tile_dict(resource_plan.get("selected_tile", {}))
+    selected = _attention_tile_dict(selected_tile)
+    retile = schedule.get("ascend_attention_retile", {})
+    if plan_tile != selected or resource_tile != selected:
+        raise UnsupportedBackendOpError(
+            "Ascend Attention SSA retile disagrees with the canonical resource plan.",
+            reason=(
+                f"resource={resource_tile!r}, plan={plan_tile!r}, "
+                f"retile_input={selected!r}."
+            ),
+            suggestion="derive M/N/K only from resource_plan.selected_tile.",
+        )
+    if tuple(retile.get(f"block_{axis}") for axis in ("m", "n", "k")) != (
+        selected["m"],
+        selected["n"],
+        selected["k"],
+    ):
+        raise UnsupportedBackendOpError(
+            "Ascend Attention retile metadata disagrees with the resource plan.",
+            reason=f"retile={retile!r}, selected_tile={selected!r}.",
+            suggestion="write loop and grid metadata from the selected M/N/K values.",
+        )
+
+    types = {value.name: value.type for value in (*program.inputs, *program.outputs)}
+
+    def collect(block):
+        for argument in block.args:
+            types[argument.name] = argument.type
+        for operation in block.operations:
+            for result in operation.results:
+                types[result.name] = result.type
+            for region in operation.regions:
+                collect(region)
+
+    for block in program.blocks:
+        collect(block)
+
+    def shape(value: str) -> tuple[str, ...]:
+        value_type = types.get(value)
+        return () if value_type is None else tuple(str(dim) for dim in value_type.shape)
+
+    def compatible_dimension(left: str, right: str) -> bool:
+        if left == right:
+            return True
+        try:
+            return int(left) == int(right)
+        except (TypeError, ValueError):
+            # Distinct symbolic names can denote the same dimension; the
+            # structured Q/K/V provenance verifier checks that relationship.
+            return True
+
+    dots = tuple(
+        operation
+        for operation in _walk_operations(program.blocks)
+        if operation.opcode == "linalg.dot"
+    )
+    if len(dots) != 2 or any(len(operation.operands) < 2 or not operation.results for operation in dots):
+        raise UnsupportedBackendOpError(
+            "Ascend Attention retile requires both QK and PV dots.",
+            reason=f"found {len(dots)} linalg.dot operations.",
+            suggestion="preserve the two online-softmax dot operations through retile.",
+        )
+    score_dot, value_dot = dots
+    score_lhs, score_rhs = (shape(value) for value in score_dot.operands[:2])
+    score_result = tuple(str(dim) for dim in score_dot.results[0].type.shape)
+    value_lhs, value_rhs = (shape(value) for value in value_dot.operands[:2])
+    value_result = tuple(str(dim) for dim in value_dot.results[0].type.shape)
+    m, n = str(selected["m"]), str(selected["n"])
+    if not (
+        len(score_lhs) == 2
+        and len(score_rhs) == 2
+        and score_lhs[0] == m
+        and compatible_dimension(score_lhs[1], score_rhs[0])
+        and score_rhs[1] == n
+        and score_result == (m, n)
+        and value_lhs == (m, n)
+        and len(value_rhs) == 2
+        and value_rhs[0] == n
+        and value_result == (m, value_rhs[1])
+    ):
+        raise UnsupportedBackendOpError(
+            "Ascend Attention QK/PV tensor shapes do not consume the resource tile.",
+            reason=(
+                f"QK={score_lhs}x{score_rhs}->{score_result}; "
+                f"PV={value_lhs}x{value_rhs}->{value_result}; "
+                f"selected M/N/K={selected!r}."
+            ),
+            suggestion="retile QK and PV operand/result shapes from selected M/N/K.",
+        )
+
+    expected_dot_tiles = _attention_dot_tile_contracts(
+        selected,
+        sequence=retile.get("sequence"),
+        head_dim=retile.get("head_dim"),
+    )
+    recorded_dot_tiles = _normalize_attention_contract_value(
+        retile.get("dot_tiles", {})
+    )
+    planned_dot_tiles = _normalize_attention_contract_value(
+        attention_plan.get("dot_tiles", {})
+    )
+    if recorded_dot_tiles != expected_dot_tiles or planned_dot_tiles != expected_dot_tiles:
+        raise UnsupportedBackendOpError(
+            "Ascend Attention dot tiles disagree with the resource plan.",
+            reason=(
+                f"retile dot tiles={recorded_dot_tiles!r}, "
+                f"plan dot tiles={planned_dot_tiles!r}, "
+                f"expected={expected_dot_tiles!r}."
+            ),
+            suggestion="derive QK/PV tile shapes and reduction masks from resource_plan.selected_tile.",
+        )
+    for operation, role in ((score_dot, "qk"), (value_dot, "pv")):
+        actual_dot_tile = _normalize_attention_contract_value(
+            operation.attrs.get("ascend_attention_dot_tile", {})
+        )
+        resource_tile = operation.attrs.get("ascend_attention_resource_tile", {})
+        try:
+            actual_resource_tile = _attention_tile_dict(resource_tile)
+        except (TypeError, ValueError):
+            actual_resource_tile = {}
+        try:
+            actual_block_tile = {
+                axis: int(operation.attrs.get(f"block_{axis}", -1))
+                for axis in ("m", "n", "k")
+            }
+        except (TypeError, ValueError):
+            actual_block_tile = {}
+        if (
+            actual_dot_tile != expected_dot_tiles[role]
+            or actual_resource_tile != selected
+            or actual_block_tile != selected
+        ):
+            raise UnsupportedBackendOpError(
+                "Ascend Attention SSA dot tile was not retiled from the resource plan.",
+                reason=(
+                    f"{role} dot tile={actual_dot_tile!r}, "
+                    f"resource tile={actual_resource_tile!r}, "
+                    f"block tile={actual_block_tile!r}, "
+                    f"expected={expected_dot_tiles[role]!r}."
+                ),
+                suggestion="attach the planned role-specific M/N/K tile to each Attention dot.",
+            )
+
+    for role, expected_axis in (("q", m), ("o", m), ("k", n), ("v", n)):
+        spec = next((item for item in kernel.tensors if item.name == role), None)
+        attrs = {} if spec is None else dict(spec.attrs)
+        dtype_shapes = tuple(attrs.get("dtype_shapes", ()))
+        if not dtype_shapes or len(tuple(dtype_shapes[-1])) != 2:
+            raise UnsupportedBackendOpError(
+                "Ascend Attention access tile shape is missing after retile.",
+                reason=f"{role} dtype_shapes={dtype_shapes!r}.",
+                suggestion="specialize Q/O with M and K/V with N from the resource plan.",
+            )
+        tile_shape = tuple(str(dim) for dim in dtype_shapes[-1])
+        templates = tuple(attrs.get("access_templates", ()))
+        matrix_templates = tuple(
+            item
+            for item in templates
+            if isinstance(item, Mapping) and len(tuple(item.get("shape", ()))) == 2
+        )
+        if tile_shape[0] != expected_axis or not matrix_templates:
+            raise UnsupportedBackendOpError(
+                "Ascend Attention tail-mask tile does not match the resource plan.",
+                reason=f"{role} tile_shape={tile_shape!r}, expected leading tile={expected_axis}.",
+                suggestion="specialize each access template and tail mask using its planned tile axis.",
+            )
+        for template in matrix_templates:
+            mask = str(template.get("mask", "True"))
+            template_shape = tuple(str(dim) for dim in template.get("shape", ()))
+            if (
+                template_shape != tile_shape
+                or f"value_0 < {expected_axis}" not in mask
+                or mask == "True"
+            ):
+                raise UnsupportedBackendOpError(
+                    "Ascend Attention access mask is stale after retile.",
+                    reason=(
+                        f"{role} template_shape={template_shape!r}, tile_shape={tile_shape!r}, "
+                        f"expected leading tile={expected_axis}."
+                    ),
+                    suggestion="rebuild query/key tail masks from the selected resource tile.",
+                )
+
+    loop = next(
+        (operation for operation in _walk_operations(program.blocks) if operation.opcode == "scf.for"),
+        None,
+    )
+    if loop is None or len(loop.operands) < 3:
+        raise UnsupportedBackendOpError(
+            "Ascend Attention retile lost its key sequence loop.",
+            reason="no scf.for bounds remain in the retiled SSA.",
+            suggestion="retain the online-softmax key loop while changing tile dimensions.",
+        )
+    loop_contract = loop.attrs.get("ascend_attention_retile", {})
+    if (
+        loop_contract.get("loop_upper") != retile.get("key_loop_upper")
+        or loop_contract.get("query_loop_upper") != retile.get("query_loop_upper")
+        or loop_contract.get("grid") != retile.get("grid")
+    ):
+        raise UnsupportedBackendOpError(
+            "Ascend Attention loop bounds or grid disagree with the resource plan.",
+            reason=f"loop={dict(loop_contract)!r}, schedule={retile!r}.",
+            suggestion="derive query/key bounds and launch grid from selected M/N.",
+        )
+    sequence = attention_plan.get("sequence")
+    if sequence is not None:
+        expected_query_tiles = (int(sequence) + selected["m"] - 1) // selected["m"]
+        expected_key_tiles = (int(sequence) + selected["n"] - 1) // selected["n"]
+        upper_value = types.get(loop.operands[1])
+        upper_producer = next(
+            (
+                operation
+                for operation in _walk_operations(program.blocks)
+                if operation.results
+                and operation.results[0].name == loop.operands[1]
+            ),
+            None,
+        )
+        if (
+            upper_value is None
+            or upper_producer is None
+            or upper_producer.opcode != "arith.constant"
+            or int(upper_producer.attrs.get("value", -1)) != expected_key_tiles
+            or attention_plan.get("query_tiles") != expected_query_tiles
+            or attention_plan.get("key_tiles") != expected_key_tiles
+        ):
+            raise UnsupportedBackendOpError(
+                "Ascend Attention concrete loop bounds disagree with the selected tile.",
+                reason=(
+                    f"query_tiles={attention_plan.get('query_tiles')!r}, "
+                    f"key_tiles={attention_plan.get('key_tiles')!r}, "
+                    f"expected=({expected_query_tiles},{expected_key_tiles})."
+                ),
+                suggestion="rebuild the query grid and key loop upper bound from M/N.",
+            )
+    else:
+        producers = {
+            result.name: operation
+            for operation in _walk_operations(program.blocks)
+            for result in operation.results
+        }
+        upper_producer = producers.get(loop.operands[1])
+        if (
+            upper_producer is None
+            or upper_producer.opcode != "arith.floordiv"
+            or len(upper_producer.operands) != 2
+        ):
+            raise UnsupportedBackendOpError(
+                "Ascend Attention symbolic key loop does not use the planned N tile.",
+                reason=f"upper operand producer={upper_producer!r}.",
+                suggestion="compute ceil_div(K.sequence, selected N) in SSA.",
+            )
+        numerator = producers.get(upper_producer.operands[0])
+        divisor = producers.get(upper_producer.operands[1])
+        access = schedule.get("ascend_attention_loop", {}).get("access_provenance", {})
+        key_entry = access.get("k", {}) if isinstance(access, Mapping) else {}
+        key_source = key_entry.get("tensor") if isinstance(key_entry, Mapping) else None
+        sequence_dim = (
+            producers.get(numerator.operands[0])
+            if numerator is not None
+            and numerator.opcode == "arith.add"
+            and numerator.operands
+            else None
+        )
+        rounding = (
+            producers.get(numerator.operands[1])
+            if numerator is not None
+            and numerator.opcode == "arith.add"
+            and len(numerator.operands) == 2
+            else None
+        )
+        if (
+            numerator is None
+            or numerator.opcode != "arith.add"
+            or sequence_dim is None
+            or sequence_dim.opcode != "shape.dim"
+            or sequence_dim.operands != (key_source,)
+            or sequence_dim.attrs.get("dim") != -2
+            or not sequence_dim.attrs.get("source")
+            or divisor is None
+            or divisor.opcode != "arith.constant"
+            or int(divisor.attrs.get("value", -1)) != selected["n"]
+            or rounding is None
+            or rounding.opcode != "arith.constant"
+            or int(rounding.attrs.get("value", -1)) != selected["n"] - 1
+        ):
+            raise UnsupportedBackendOpError(
+                "Ascend Attention symbolic key loop upper bound is stale.",
+                reason=(
+                    f"N={selected['n']}, sequence_dim={sequence_dim!r}, "
+                    f"rounding={rounding!r}, divisor={divisor!r}."
+                ),
+                suggestion="derive ceil_div(K.sequence, N) from resource_plan.selected_tile.",
+            )
 
 
 def _attention_sequence_and_head_dim(source_shapes):
@@ -836,14 +1556,13 @@ def _attention_sequence_and_head_dim(source_shapes):
     shape = next(iter(source_shapes.values()))
     if len(shape) < 2:
         return None, None
-    try:
-        return int(shape[-2]), int(shape[-1])
-    except (TypeError, ValueError) as exc:
-        raise UnsupportedBackendOpError(
-            "Ascend attention structured retile requires static sequence and head_dim.",
-            reason=f"source shape {shape!r} is symbolic.",
-            suggestion="specialize sequence and head_dim before Ascend emission.",
-        ) from exc
+    def static_int(value):
+        try:
+            return int(str(value))
+        except (TypeError, ValueError):
+            return None
+
+    return static_int(shape[-2]), static_int(shape[-1])
 
 
 def _attention_tile_symbols(program: ssa.Program):
@@ -936,6 +1655,368 @@ def plan_ascend_ub(ssa_graph, initial_tile_config) -> AscendUBPlan:
         workspace_bytes=_ascend_workspace_bytes(safe),
         safety_margin_bytes=max(0, budget - peak),
     )
+
+
+def _attention_tile_dict(tile: Mapping[str, Any]) -> dict[str, int]:
+    """Normalize public/private tile aliases to one M/N/K representation."""
+    aliases = {
+        "m": ("m", "block_m", "BLOCK_SIZE_M"),
+        "n": ("n", "block_n", "BLOCK_SIZE_N"),
+        "k": ("k", "block_k", "BLOCK_SIZE_K"),
+    }
+    result = {}
+    for axis, names in aliases.items():
+        value = next((tile[name] for name in names if name in tile), None)
+        if value is None:
+            raise ValueError(f"Attention tile is missing {axis.upper()} dimension: {tile!r}.")
+        result[axis] = int(value)
+    return result
+
+
+def ascend_attention_source_contract(
+    attention_plan: Mapping[str, Any], attention_retile: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Validate and freeze the complete plan metadata embedded in source/AOT."""
+    def mismatch(reason: str):
+        raise UnsupportedBackendOpError(
+            "Ascend Attention plan/source contract mismatch.",
+            reason=reason,
+            suggestion="rebuild the source and AOT sidecar from one verified Attention resource plan.",
+        )
+
+    if not isinstance(attention_plan, Mapping) or not isinstance(attention_retile, Mapping):
+        mismatch("the resource plan or structured retile metadata is missing.")
+    resource_plan = attention_plan.get("resource_plan")
+    if not isinstance(resource_plan, Mapping):
+        mismatch("attention_plan.resource_plan is missing.")
+    try:
+        selected = _attention_tile_dict(resource_plan.get("selected_tile", {}))
+        plan_tile = _attention_tile_dict(attention_plan.get("tile", {}))
+        retile_tile = {
+            axis: int(attention_retile[f"block_{axis}"])
+            for axis in ("m", "n", "k")
+        }
+    except (KeyError, TypeError, ValueError) as exc:
+        mismatch(f"selected M/N/K is missing or malformed: {exc}.")
+    if selected != plan_tile or selected != retile_tile:
+        mismatch(
+            f"resource tile={selected!r}, attention tile={plan_tile!r}, "
+            f"retile tile={retile_tile!r}."
+        )
+    if min(selected.values()) <= 0:
+        mismatch(f"selected tile dimensions must be positive: {selected!r}.")
+
+    candidates = tuple(resource_plan.get("candidate_tiles", ()))
+    selected_record = next(
+        (
+            record
+            for record in candidates
+            if isinstance(record, Mapping)
+            and _normalize_attention_contract_value(record.get("tile", {})) == selected
+        ),
+        None,
+    )
+    if selected_record is None or selected_record.get("feasible") is not True:
+        mismatch(f"selected tile {selected!r} has no feasible candidate record.")
+    try:
+        solver_tile = _attention_tile_dict(selected_record.get("solver_tile", {}))
+        estimate = int(resource_plan["ub_estimated_peak_bytes"])
+        budget = int(resource_plan["ub_budget_bytes"])
+        candidate_estimate = int(selected_record["estimated_ub_bytes"])
+        candidate_budget = int(selected_record["ub_budget_bytes"])
+        candidate_workspace = selected_record["workspace_bytes"]
+    except (KeyError, TypeError, ValueError) as exc:
+        mismatch(f"selected candidate UB record is incomplete: {exc}.")
+    if (
+        solver_tile != selected
+        or estimate != candidate_estimate
+        or budget != candidate_budget
+        or estimate > budget
+    ):
+        mismatch(
+            f"selected tile={selected!r}, solver tile={solver_tile!r}, "
+            f"estimated UB={estimate}/{candidate_estimate}, budget={budget}/{candidate_budget}."
+        )
+    if resource_plan.get("rejection_reason") is not None:
+        mismatch(
+            f"selected resource plan still has rejection reason "
+            f"{resource_plan.get('rejection_reason')!r}."
+        )
+
+    resource_workspace = resource_plan.get("workspace_bytes")
+    planned_workspace = attention_plan.get("workspace_bytes")
+    if (
+        resource_workspace is None
+        or planned_workspace != resource_workspace
+        or candidate_workspace != resource_workspace
+    ):
+        mismatch(
+            f"resource workspace={resource_workspace!r}, "
+            f"attention workspace={planned_workspace!r}, "
+            f"selected candidate workspace={candidate_workspace!r}."
+        )
+    if resource_plan.get("internal_dtype") != ASCEND_ATTENTION_INTERNAL_DTYPE:
+        mismatch(
+            f"resource internal dtype={resource_plan.get('internal_dtype')!r}, "
+            f"expected {ASCEND_ATTENTION_INTERNAL_DTYPE!r}."
+        )
+    try:
+        head_dim = int(attention_plan.get("head_dim"))
+    except (TypeError, ValueError):
+        head_dim = None
+    if head_dim is not None:
+        expected_workspace = selected["m"] * head_dim * 4
+        try:
+            actual_workspace = int(resource_workspace)
+        except (TypeError, ValueError):
+            mismatch(f"workspace {resource_workspace!r} is not concrete for head_dim={head_dim}.")
+        if actual_workspace != expected_workspace:
+            mismatch(
+                f"resource workspace={actual_workspace}, expected={expected_workspace} "
+                f"for M={selected['m']} and head_dim={head_dim}."
+            )
+    else:
+        head_dim_expression = attention_retile.get("head_dim")
+        expected_workspace_expression = (
+            f"{selected['m']} * ({head_dim_expression}) * 4"
+        )
+        actual_compact = "".join(str(resource_workspace).split())
+        expected_compact = "".join(expected_workspace_expression.split())
+        if actual_compact != expected_compact:
+            mismatch(
+                f"symbolic resource workspace={resource_workspace!r}, expected "
+                f"{expected_workspace_expression!r} from the retiled head_dim."
+            )
+
+    for key in ("query_tiles", "key_tiles"):
+        if attention_plan.get(key) != attention_retile.get(key):
+            mismatch(
+                f"{key} differs between planner={attention_plan.get(key)!r} "
+                f"and retile={attention_retile.get(key)!r}."
+            )
+    if attention_plan.get("dot_tiles") != attention_retile.get("dot_tiles"):
+        mismatch("QK/PV dot tile metadata differs between planner and retile.")
+
+    try:
+        batch = int(attention_plan.get("batch"))
+        heads = int(attention_plan.get("heads"))
+        sequence = int(attention_plan.get("sequence"))
+    except (TypeError, ValueError):
+        batch = heads = sequence = None
+    if batch is not None and heads is not None and sequence is not None:
+        query_tiles = (sequence + selected["m"] - 1) // selected["m"]
+        key_tiles = (sequence + selected["n"] - 1) // selected["n"]
+        grid = batch * heads * query_tiles
+        expected_grid_expr = (
+            f"{batch} * {heads} * triton.cdiv({sequence}, {selected['m']})"
+        )
+        expected_key_upper = f"(({sequence} + {selected['n'] - 1}) // {selected['n']})"
+        expected_query_upper = f"(({sequence} + {selected['m'] - 1}) // {selected['m']})"
+        if (
+            attention_plan.get("query_tiles") != query_tiles
+            or attention_plan.get("key_tiles") != key_tiles
+            or attention_plan.get("grid") != grid
+            or attention_retile.get("query_loop_upper") != expected_query_upper
+            or attention_retile.get("key_loop_upper") != expected_key_upper
+            or attention_retile.get("loop_upper") != expected_key_upper
+            or attention_retile.get("grid") != expected_grid_expr
+        ):
+            mismatch(
+                f"recomputed query/key/grid={(query_tiles, key_tiles, grid)!r} "
+                f"does not match planner/retile metadata."
+            )
+
+    return {
+        "version": ASCEND_ATTENTION_SOURCE_CONTRACT_VERSION,
+        "attention_plan": _json_value(attention_plan),
+        "attention_retile": _json_value(attention_retile),
+    }
+
+
+def validate_ascend_attention_source_contract(
+    attention_plan: Mapping[str, Any],
+    attention_retile: Mapping[str, Any],
+    source_contract: Mapping[str, Any] | None = None,
+    *,
+    require_source: bool = False,
+) -> dict[str, Any]:
+    """Check source metadata against the canonical resource plan and retile."""
+    expected = ascend_attention_source_contract(attention_plan, attention_retile)
+    if source_contract is None:
+        if require_source:
+            raise UnsupportedBackendOpError(
+                "Ascend Attention plan/source contract mismatch.",
+                reason="generated source has no embedded Attention plan metadata.",
+                suggestion="regenerate the artifact with the matching Ascend emitter.",
+            )
+        return expected
+    actual = _normalize_attention_contract_value(source_contract)
+    normalized_expected = _normalize_attention_contract_value(expected)
+    if actual != normalized_expected:
+        raise UnsupportedBackendOpError(
+            "Ascend Attention plan/source contract mismatch.",
+            reason=(
+                f"embedded source contract={actual!r} differs from "
+                f"resource plan/retile={normalized_expected!r}."
+            ),
+            suggestion="regenerate source and sidecar together from the verified Attention schedule.",
+        )
+    return expected
+
+
+def _attention_ub_budget_bytes() -> int:
+    return int(ASCEND_UB_LIMIT_BYTES * ASCEND_UB_ATTENTION_FRACTION)
+
+
+def _plan_ascend_attention_resources(
+    program: ssa.Program,
+    *,
+    head_dim: int | None,
+    head_dim_expression: Any = None,
+    candidates: tuple[Mapping[str, int], ...] | None = None,
+) -> Mapping[str, Any]:
+    """Choose only an Attention tile that survives the generic UB solver unchanged.
+
+    Candidate order is the schedule's preference order.  The solver may shrink
+    its input tile to explain how it could fit, but that smaller result is not
+    silently accepted unless it is itself a declared, verified candidate.
+    """
+    if candidates is None:
+        candidates = tuple(
+            {"m": m, "n": n, "k": k}
+            for m, n, k in _ASCEND_ATTENTION_TILE_CANDIDATES
+        )
+    budget = _attention_ub_budget_bytes()
+    records = []
+    selected = None
+    for raw_candidate in candidates:
+        candidate = _attention_tile_dict(raw_candidate)
+        ub_estimate = calculate_ssa_ub_bytes(
+            program,
+            {
+                "block_m": candidate["m"],
+                "block_n": candidate["n"],
+                "block_k": candidate["k"],
+            },
+        )
+        solver_plan = plan_ascend_ub(
+            program,
+            {
+                "block_m": candidate["m"],
+                "block_n": candidate["n"],
+                "block_k": candidate["k"],
+            },
+        )
+        solver_tile = _attention_tile_dict(solver_plan.safe_tile)
+        reasons = []
+        if solver_plan.rejection_reason:
+            reasons.append(solver_plan.rejection_reason)
+        if ub_estimate > budget:
+            reasons.append(
+                f"estimated UB {ub_estimate} bytes exceeds budget {budget} bytes"
+            )
+        if solver_tile != candidate:
+            reasons.append(
+                f"UB solver would change candidate tile to {solver_tile!r}; "
+                "implicit tile changes are not verified for Attention"
+            )
+        feasible = not reasons
+        if head_dim is not None:
+            workspace = candidate["m"] * head_dim * 4
+        elif head_dim_expression is not None:
+            workspace = f"{candidate['m']} * ({head_dim_expression}) * 4"
+        else:
+            workspace = None
+        records.append(
+            {
+                "tile": candidate,
+                "estimated_ub_bytes": int(ub_estimate),
+                "solver_tile": solver_tile,
+                "solver_estimated_ub_bytes": int(solver_plan.estimated_peak_bytes),
+                "ub_budget_bytes": budget,
+                "workspace_bytes": workspace,
+                "feasible": feasible,
+                "rejection_reason": "; ".join(reasons) if reasons else None,
+            }
+        )
+        if feasible and selected is None:
+            selected = candidate
+
+    selected_record = next(
+        (record for record in records if record["tile"] == selected), None
+    )
+    rejection_reason = None
+    if selected is None:
+        if not records:
+            rejection_reason = "no verified Attention tile candidates were provided"
+        else:
+            rejection_reason = "no UB-feasible verified Attention tile candidate"
+
+    return {
+        "version": 1,
+        "candidate_tiles": tuple(records),
+        "selected_tile": selected,
+        "ub_estimated_peak_bytes": (
+            selected_record["estimated_ub_bytes"] if selected_record else None
+        ),
+        "ub_budget_bytes": budget,
+        "internal_dtype": ASCEND_ATTENTION_INTERNAL_DTYPE,
+        "workspace_bytes": (
+            selected_record["workspace_bytes"] if selected_record else None
+        ),
+        "rejection_reason": rejection_reason,
+    }
+
+
+def _attention_resource_plan_error(
+    resource_plan: Mapping[str, Any],
+) -> UnsupportedBackendOpError:
+    candidates = tuple(resource_plan.get("candidate_tiles", ()))
+    details = "; ".join(
+        (
+            f"tile={record.get('tile')!r}, "
+            f"estimated_ub={record.get('estimated_ub_bytes')} bytes, "
+            f"budget={record.get('ub_budget_bytes')} bytes, "
+            f"solver_tile={record.get('solver_tile')!r}"
+        )
+        for record in candidates
+    ) or "no candidate tiles were provided"
+    return UnsupportedBackendOpError(
+        "Ascend Attention has no UB-feasible verified tile.",
+        reason=f"{resource_plan.get('rejection_reason')}; candidates: {details}.",
+        suggestion=(
+            "provide a verified tile/lowering that fits the UB budget or revise "
+            "the resource model using compiler evidence."
+        ),
+    )
+
+
+def _selected_attention_tile(schedule: Mapping[str, Any]) -> dict[str, int]:
+    """Read and cross-check the sole selected tile from the canonical plan."""
+    attention_plan = schedule.get("ascend_attention_plan")
+    resource_plan = (
+        attention_plan.get("resource_plan")
+        if isinstance(attention_plan, Mapping)
+        else None
+    )
+    if not isinstance(resource_plan, Mapping):
+        raise UnsupportedBackendOpError(
+            "Ascend Attention requires the canonical resource plan.",
+            reason="the Attention schedule has no planner-owned tile/UB record.",
+            suggestion="run Attention semantic verification and resource planning before lowering.",
+        )
+    selected = resource_plan.get("selected_tile")
+    if not isinstance(selected, Mapping):
+        raise _attention_resource_plan_error(resource_plan)
+    selected = _attention_tile_dict(selected)
+    planned_tile = _attention_tile_dict(attention_plan.get("tile", {}))
+    if planned_tile != selected:
+        raise UnsupportedBackendOpError(
+            "Ascend Attention plan contains inconsistent selected tiles.",
+            reason=f"resource selected_tile={selected!r}, attention tile={planned_tile!r}.",
+            suggestion="use the resource plan as the sole selected-tile source.",
+        )
+    return selected
 
 
 def _annotate_ascend_linalg_tiles(program: ssa.Program, tile: Mapping[str, Any]):
@@ -1762,7 +2843,17 @@ _ASCEND_SOC_PROFILES = {
         cube_cores=20,
         vector_cores=40,
         l2_cache_bytes=192 * 1024 * 1024,
-    )
+    ),
+    # The 910B4 device identity is confirmed by the migration runner, while
+    # its per-core resource capacities have not yet been independently
+    # verified.  Keep those fields unknown so scheduling does not infer B3
+    # capacities or silently reuse its profile.
+    "Ascend910B4": AscendSocProfile(
+        name="Ascend910B4",
+        cube_cores=None,
+        vector_cores=None,
+        l2_cache_bytes=None,
+    ),
 }
 
 
@@ -1787,7 +2878,7 @@ def ascend_capability_matrix() -> Mapping[str, Any]:
     """
     return {
         "target": Target.ASCEND.value,
-        "devices": ("Ascend910B3",),
+        "devices": tuple(_ASCEND_SOC_PROFILES),
         "soc_profiles": {
             name: {
                 "cube_cores": profile.cube_cores,
@@ -1805,6 +2896,23 @@ def ascend_capability_matrix() -> Mapping[str, Any]:
             "elementwise": tuple(sorted(ASCEND_ELEMENTWISE_DTYPES)),
             "rng": tuple(sorted(ASCEND_RNG_DTYPES)),
             "atomic": tuple(sorted(ASCEND_ATOMIC_DTYPES)),
+            "attention": {
+                "q": tuple(sorted(ASCEND_ATTENTION_INPUT_DTYPES)),
+                "k": tuple(sorted(ASCEND_ATTENTION_INPUT_DTYPES)),
+                "v": tuple(sorted(ASCEND_ATTENTION_INPUT_DTYPES)),
+                "o": tuple(sorted(ASCEND_ATTENTION_OUTPUT_DTYPES)),
+                "score": ASCEND_ATTENTION_INTERNAL_DTYPE,
+                "softmax": ASCEND_ATTENTION_INTERNAL_DTYPE,
+                "m_i": ASCEND_ATTENTION_INTERNAL_DTYPE,
+                "l_i": ASCEND_ATTENTION_INTERNAL_DTYPE,
+                "accumulator": ASCEND_ATTENTION_INTERNAL_DTYPE,
+                "casts": "Q/K/V to FP32 for score/softmax/dot accumulation; O cast to requested output dtype",
+                "error_tolerance": {
+                    dtype: dict(values)
+                    for dtype, values in ASCEND_ATTENTION_ERROR_TOLERANCES.items()
+                },
+                "registry": {dtype: dict(contract) for dtype, contract in ASCEND_ATTENTION_DTYPE_REGISTRY.items()},
+            },
             "fail_closed": {
                 "float64": "no-verified-ascend-triton-execution-path",
                 "int8": "no-verified-weight-only-dequant-gemm-contract",
@@ -1848,7 +2956,7 @@ def ascend_capability_matrix() -> Mapping[str, Any]:
             "generic_dot_loop": "verified-static-shape-subset",
             "gemm_epilogue": "verified-silu; source-verified-gelu-leaky-relu-scale-bias-residual-same-kernel",
             "weight_only_matmul": "fail-closed-pending-w8a16-w4a16-dequant-contract",
-            "attention": "verified-static-fp32-batch2-head2-seq32-causal-and-noncausal",
+            "attention": "verified-static-fp16-bf16-fp32-inputs-fp32-internal-static-head64-seq1024-causal-and-noncausal",
             "paged_attention": "fail-closed-pending-block-table-indirect-addressing",
             "varlen_attention": "fail-closed-pending-cu-seqlens-prefix-sum-contract",
             "gqa_mqa": "fail-closed-pending-kv-head-broadcast-contract",
@@ -2099,6 +3207,24 @@ def ascend_logical_domain(
     return f"min({product(dimensions)}, {product(source_shape)})"
 
 
+def ascend_logical_domain_is_abi_bound(expression, abi) -> bool:
+    """Return whether a logical-domain expression has only public ABI symbols."""
+    from ninetoothed.ir import IndexExpr
+
+    available = {
+        binding.name
+        for binding in abi.kernel_args
+        if binding.kind in {"shape", "stride", "meta", "constexpr"}
+    }
+
+    def bound(node) -> bool:
+        if node.op == "symbol":
+            return str(node.value) in available
+        return all(bound(operand) for operand in node.operands)
+
+    return bound(IndexExpr.parse(expression))
+
+
 def ascend_uses_access_template(metadata: Mapping[str, Any]) -> bool:
     """Identify private schedules that consume a public access template."""
     schedule = dict(metadata.get("ssa_metadata", {})).get("schedule", {})
@@ -2119,16 +3245,50 @@ def write_ascend_sidecar(
 ) -> Path:
     """Persist public launch ABI plus Ascend AOT descriptive metadata."""
     path = _sidecar_path(source_path)
+    schedule = dict(metadata.get("ssa_metadata", {})).get("schedule", {})
+    attention_plan = dict(schedule).get("ascend_attention_plan")
+    attention_retile = dict(schedule).get("ascend_attention_retile")
+    attention_loop = dict(schedule).get("ascend_attention_loop")
+    attention_source_contract = None
+    if attention_loop:
+        if not isinstance(attention_plan, Mapping) or not isinstance(
+            attention_retile, Mapping
+        ):
+            raise UnsupportedBackendOpError(
+                "Ascend Attention plan/source contract mismatch.",
+                reason="sidecar metadata is missing the resource plan or structured retile.",
+                suggestion="materialize only an artifact emitted from the verified Attention schedule.",
+            )
+        attention_source_contract = ascend_attention_source_contract(
+            attention_plan, attention_retile
+        )
+        # The sidecar is tied to the exact generated source.  Catch a stale or
+        # hand-edited source before publishing AOT metadata instead of waiting
+        # until a later reload to discover the split contract.
+        source_contract = _read_ascend_attention_source_contract(source_path)
+        validate_ascend_attention_source_contract(
+            attention_plan,
+            attention_retile,
+            source_contract,
+            require_source=True,
+        )
+    logical_domain = ascend_logical_domain(
+        specs,
+        tuple(outputs),
+        allow_access_template=ascend_uses_access_template(metadata),
+    )
+    if not ascend_logical_domain_is_abi_bound(logical_domain, abi):
+        # Match JIT materialization: when a pre-specialization tile symbol is
+        # absent from the launch ABI, the concrete runtime output extent is the
+        # authoritative logical domain.
+        logical_domain = None
+
     payload = {
         "schema": _SIDECAR_SCHEMA,
         # This is the exact public LaunchABI from Compilation.  A sidecar must
         # never contain a second ABI with backend-specific launch semantics.
         "launch_abi": _ascend_abi_dict(abi),
-        "logical_domain": ascend_logical_domain(
-            specs,
-            tuple(outputs),
-            allow_access_template=ascend_uses_access_template(metadata),
-        ),
+        "logical_domain": logical_domain,
         "outputs": tuple(outputs),
         "max_core_dim": dict(metadata.get("ssa_schedule", {})).get(
             "core_dim_limit", 65535
@@ -2159,6 +3319,26 @@ def write_ascend_sidecar(
         "attention_loop": dict(metadata.get("ssa_metadata", {}))
         .get("schedule", {})
         .get("ascend_attention_loop"),
+        "attention_mask_semantics": dict(metadata.get("ssa_metadata", {}))
+        .get("schedule", {})
+        .get("ascend_attention_mask_semantics"),
+        "attention_key_valid": dict(metadata.get("ssa_metadata", {}))
+        .get("schedule", {})
+        .get("ascend_attention_key_valid"),
+        "attention_loop_state": dict(metadata.get("ssa_metadata", {}))
+        .get("schedule", {})
+        .get("ascend_attention_loop_state"),
+        "attention_plan": dict(metadata.get("ssa_metadata", {}))
+        .get("schedule", {})
+        .get("ascend_attention_plan"),
+        "attention_retile": dict(metadata.get("ssa_metadata", {}))
+        .get("schedule", {})
+        .get("ascend_attention_retile"),
+        "attention_source_contract": attention_source_contract,
+        "attention_dtype_registry": {
+            dtype: dict(contract)
+            for dtype, contract in ASCEND_ATTENTION_DTYPE_REGISTRY.items()
+        },
         "toolchain": {"cann_version": ascend_toolchain_version()},
     }
     path.write_text(json.dumps(_json_value(payload), sort_keys=True), encoding="utf-8")
@@ -2178,9 +3358,80 @@ def read_ascend_sidecar(source_path: Path) -> dict[str, Any]:
         ) from exc
 
     if payload.get("schema") != _SIDECAR_SCHEMA:
-        raise ValueError(f"Unsupported Ascend artifact sidecar schema in {path}.")
+        raise UnsupportedBackendOpError(
+            "Ascend Attention AOT contract mismatch.",
+            reason=(
+                f"sidecar schema {payload.get('schema')!r} does not contain the "
+                f"required plan/source contract schema {_SIDECAR_SCHEMA}."
+            ),
+            suggestion="rebuild the source and sidecar with the current Ascend Attention emitter.",
+        )
+
+    source_contract = _read_ascend_attention_source_contract(source_path)
+    sidecar_plan = payload.get("attention_plan")
+    sidecar_retile = payload.get("attention_retile")
+    sidecar_contract = payload.get("attention_source_contract")
+    sidecar_attention_loop = payload.get("attention_loop")
+    if (
+        sidecar_attention_loop
+        or any(value is not None for value in (sidecar_plan, sidecar_retile, sidecar_contract))
+        or source_contract is not None
+    ):
+        if not isinstance(sidecar_plan, Mapping) or not isinstance(sidecar_retile, Mapping):
+            raise UnsupportedBackendOpError(
+                "Ascend Attention plan/source contract mismatch.",
+                reason="AOT sidecar is missing the complete resource plan or retile record.",
+                suggestion="rebuild the sidecar from the verified Attention schedule.",
+            )
+        validate_ascend_attention_source_contract(
+            sidecar_plan,
+            sidecar_retile,
+            sidecar_contract,
+            require_source=True,
+        )
+        validate_ascend_attention_source_contract(
+            sidecar_plan,
+            sidecar_retile,
+            source_contract,
+            require_source=True,
+        )
 
     return payload
+
+
+def _read_ascend_attention_source_contract(source_path: Path) -> Mapping[str, Any] | None:
+    """Read the emitter-owned literal plan metadata without importing Triton."""
+    try:
+        source = source_path.read_text(encoding="utf-8")
+        tree = ast.parse(source, filename=str(source_path))
+    except (OSError, SyntaxError) as exc:
+        raise UnsupportedBackendOpError(
+            "Ascend Attention plan/source contract mismatch.",
+            reason=f"generated source metadata cannot be read or parsed: {exc}.",
+            suggestion="regenerate the source artifact before AOT reload.",
+        ) from exc
+    for statement in tree.body:
+        if isinstance(statement, ast.Assign) and any(
+            isinstance(target, ast.Name)
+            and target.id == ASCEND_ATTENTION_SOURCE_CONTRACT_ATTRIBUTE
+            for target in statement.targets
+        ):
+            try:
+                value = ast.literal_eval(statement.value)
+            except (ValueError, TypeError) as exc:
+                raise UnsupportedBackendOpError(
+                    "Ascend Attention plan/source contract mismatch.",
+                    reason="embedded source Attention metadata is not a literal contract.",
+                    suggestion="regenerate source through the verified Ascend emitter.",
+                ) from exc
+            if not isinstance(value, Mapping):
+                raise UnsupportedBackendOpError(
+                    "Ascend Attention plan/source contract mismatch.",
+                    reason="embedded source Attention metadata is malformed.",
+                    suggestion="regenerate source through the verified Ascend emitter.",
+                )
+            return value
+    return None
 
 
 def ascend_abi_from_dict(value: Mapping[str, Any]) -> LaunchABI:
@@ -2613,40 +3864,1298 @@ def _validate_ascend_access_template_contract(
     }
 
 
-def _ascend_attention_loop_contract(program: ssa.Program) -> Mapping[str, Any] | None:
-    """Recognize public loop-carried online-softmax SSA without new opcodes."""
-    loops = [
+def _ascend_attention_loop_contract(
+    program: ssa.Program, *, require_value_mask: bool = True
+) -> Mapping[str, Any] | None:
+    """Build a structured contract for one online-softmax SSA candidate."""
+
+    loops = tuple(
         operation
         for operation in _walk_operations(program.blocks)
         if operation.opcode == "scf.for"
-    ]
+    )
     candidates = []
     for loop in loops:
         body = tuple(_walk_operations(loop.regions))
-        opcodes = [operation.opcode for operation in body]
+        dots = tuple(operation for operation in body if operation.opcode == "linalg.dot")
         if (
-            opcodes.count("linalg.dot") == 2
-            and opcodes.count("math.exp2") >= 2
-            and "reduce.max" in opcodes
-            and "reduce.sum" in opcodes
-            and "scf.if" in opcodes
-            and len(tuple(dict(loop.attrs).get("iter_args", ()))) == 3
+            len(dots) == 2
+            and any(operation.opcode == "reduce.max" for operation in body)
+            and any(operation.opcode == "reduce.sum" for operation in body)
+            and any(operation.opcode == "math.exp2" for operation in body)
         ):
             candidates.append(loop)
     if not candidates:
         return None
     if len(candidates) != 1:
-        raise ValueError(
-            "Ascend attention requires exactly one online-softmax loop; "
-            "multiple candidate loops are fail-closed."
+        raise UnsupportedBackendOpError(
+            "Ascend attention requires exactly one online-softmax candidate.",
+            reason=f"found {len(candidates)} candidate scf.for loops.",
+            suggestion="lower one structured Attention loop before Ascend scheduling.",
         )
+
+    loop = candidates[0]
+    body = tuple(_walk_operations(loop.regions))
+    iter_args = tuple(dict(loop.attrs).get("iter_args", ()))
+    if len(iter_args) != 3:
+        raise UnsupportedBackendOpError(
+            "Ascend Attention candidate requires three loop-carried states.",
+            reason=f"found {len(iter_args)} loop-carried values.",
+            suggestion="carry acc, m_i, and l_i through the online-softmax loop.",
+        )
+    if not any(operation.opcode == "scf.if" for operation in body):
+        raise UnsupportedBackendOpError(
+            "Ascend Attention candidate requires structured control flow.",
+            reason="the online-softmax loop has no scf.if branch.",
+            suggestion="preserve causal or all-masked structured control flow.",
+        )
+
+    dots = tuple(operation for operation in body if operation.opcode == "linalg.dot")
+    score_dot, value_dot = dots
+    producers = {
+        result.name: operation
+        for operation in _walk_operations(program.blocks)
+        for result in operation.results
+    }
+    input_names = {
+        value.name
+        for value in (*program.inputs, *program.outputs)
+        if value.type.kind == "tensor"
+    }
+
+    def source_root(name: str, seen: set[str] | None = None) -> str | None:
+        seen = set() if seen is None else seen
+        if name in seen:
+            return None
+        seen.add(name)
+        if name in input_names:
+            return name
+        operation = producers.get(name)
+        if operation is None:
+            return None
+        for operand in operation.operands:
+            root = source_root(operand, seen)
+            if root is not None:
+                return root
+        return None
+
+    def operand_shape(name: str) -> tuple[str, ...]:
+        operation = producers.get(name)
+        if operation is not None and operation.opcode in {"tensor.extract", "linalg.transpose"}:
+            source = source_root(operation.operands[0]) if operation.operands else None
+            if source is not None:
+                for value in (*program.inputs, *program.outputs):
+                    if value.name == source:
+                        attrs = dict(value.type.attrs)
+                        shapes = tuple(attrs.get("dtype_shapes", ()))
+                        if shapes:
+                            return tuple(str(dim) for dim in shapes[-1])
+        if operation is not None and operation.results:
+            return tuple(str(dim) for dim in operation.results[0].type.shape)
+        for value in (*program.inputs, *program.outputs):
+            if value.name == name:
+                return tuple(str(dim) for dim in value.type.shape)
+        return ()
+
+    score_lhs, score_rhs = score_dot.operands[:2]
+    value_lhs, value_rhs = value_dot.operands[:2]
+    q_source = source_root(score_lhs)
+    k_source = source_root(score_rhs)
+    v_source = source_root(value_rhs)
+    if q_source is None or k_source is None or v_source is None:
+        raise UnsupportedBackendOpError(
+            "Ascend Attention dot provenance is incomplete.",
+            reason=(
+                f"score sources q={q_source!r}, k={k_source!r}; "
+                f"value source v={v_source!r}."
+            ),
+            suggestion="preserve Q/K/V tensor.extract provenance through dot lowering.",
+        )
+
+    score_lhs_shape = operand_shape(score_lhs)
+    score_rhs_shape = operand_shape(score_rhs)
+    score_result_shape = tuple(str(dim) for dim in score_dot.results[0].type.shape)
+    value_lhs_shape = operand_shape(value_lhs)
+    value_rhs_shape = operand_shape(value_rhs)
+    value_result_shape = tuple(str(dim) for dim in value_dot.results[0].type.shape)
+    if (
+        len(score_lhs_shape) != 2
+        or len(score_rhs_shape) != 2
+        or len(score_result_shape) != 2
+        or len(value_lhs_shape) != 2
+        or len(value_rhs_shape) != 2
+        or len(value_result_shape) != 2
+    ):
+        raise UnsupportedBackendOpError(
+            "Ascend Attention dot shapes do not match score/value roles.",
+            reason=(
+                f"score=({score_lhs_shape},{score_rhs_shape})->{score_result_shape}; "
+                f"value=({value_lhs_shape},{value_rhs_shape})->{value_result_shape}."
+            ),
+            suggestion="preserve QK=[query,key] and PV=[query,value] dot shapes.",
+        )
+
+    negative_inf = {
+        result.name
+        for operation in body
+        if operation.opcode == "arith.constant"
+        and str(operation.attrs.get("value")) in {"-inf", "-Infinity", "-float('inf')"}
+        for result in operation.results
+    }
+    score_masks = tuple(
+        operation
+        for operation in body
+        if operation.opcode == "select.where"
+        and len(operation.operands) == 3
+        and operation.operands[1] == score_dot.results[0].name
+        and operation.operands[2] in negative_inf
+    )
+    causal_masks = tuple(
+        operation
+        for operation in body
+        if operation.opcode == "cmp.ge"
+        and len(operation.operands) == 2
+    )
+    value_mask = next(
+        (
+            operation
+            for operation in body
+            if operation.opcode == "select.where"
+            and operation.attrs.get("ascend_attention_mask") == "value"
+            and operation.results
+            and operation.results[0].name in value_dot.operands
+        ),
+        None,
+    )
+    if not score_masks:
+        raise UnsupportedBackendOpError(
+            "Ascend Attention contract is missing the K score mask.",
+            reason="no select.where(score, -inf) feeds the score path.",
+            suggestion="materialize the K bounds mask before reduce.max.",
+        )
+    if value_mask is None and require_value_mask:
+        raise UnsupportedBackendOpError(
+            "Ascend Attention contract is missing the V value mask.",
+            reason="the second dot has no explicit zero-valued V select.",
+            suggestion="run Ascend V value-mask normalization before contract construction.",
+        )
+
+    state_names = tuple(str(item.get("name")) for item in iter_args)
+    state_roles = {
+        role: name
+        for role, name in zip(("acc", "m_i", "l_i"), state_names, strict=True)
+    }
+    yields = (
+        loop.regions[0].operations[-1]
+        if loop.regions[0].operations
+        and loop.regions[0].operations[-1].opcode == "scf.yield"
+        else None
+    )
+    if yields is None or len(yields.operands) != 3:
+        raise UnsupportedBackendOpError(
+            "Ascend Attention contract has no three-value loop yield.",
+            reason="loop region does not end with acc/m_i/l_i yield.",
+            suggestion="preserve the three online-softmax loop-carried values.",
+        )
+
+    specs = {value.name: value for value in (*program.inputs, *program.outputs)}
+
+    def rank4_access(name: str, role: str) -> Mapping[str, Any]:
+        value = specs.get(name)
+        attrs = {} if value is None else dict(value.type.attrs)
+        source_shape = tuple(str(dim) for dim in attrs.get("source_shape", ()))
+        if len(source_shape) != 4:
+            raise UnsupportedBackendOpError(
+                "Ascend Attention requires rank-4 access provenance.",
+                reason=f"{role} source `{name}` has shape {source_shape!r}.",
+                suggestion="preserve [batch, head, position, dim] source metadata.",
+            )
+        position = "query_position" if role in {"q", "o"} else "key_position"
+        dimension = "head_dim" if role in {"q", "k"} else "value_dim"
+        return {
+            "tensor": name,
+            "coordinates": ("batch", "head", position, dimension),
+            "source_shape": source_shape,
+            "access_templates": len(tuple(attrs.get("access_templates", ()))),
+        }
+
+    output_source = source_root(program.outputs[0].name) if program.outputs else None
+    if output_source is None:
+        output_source = program.outputs[0].name if program.outputs else None
+    if output_source is None:
+        raise UnsupportedBackendOpError(
+            "Ascend Attention contract cannot identify output provenance.",
+            reason="the program has no tensor output.",
+            suggestion="preserve the O tensor binding through SSA lowering.",
+        )
+
+    access = {
+        "q": rank4_access(q_source, "q"),
+        "k": rank4_access(k_source, "k"),
+        "v": rank4_access(v_source, "v"),
+        "o": rank4_access(output_source, "o"),
+    }
+    source_shapes = {
+        role: tuple(item["source_shape"])
+        for role, item in access.items()
+    }
+    def dimensions_compatible(*values: str) -> bool:
+        concrete = set()
+        for value in values:
+            try:
+                concrete.add(int(value))
+            except (TypeError, ValueError):
+                continue
+        return len(concrete) <= 1
+
+    if not (
+        dimensions_compatible(*(source_shapes[role][0] for role in ("q", "k", "v", "o")))
+        and dimensions_compatible(*(source_shapes[role][1] for role in ("q", "k", "v", "o")))
+        and dimensions_compatible(source_shapes["q"][2], source_shapes["o"][2])
+        and dimensions_compatible(source_shapes["k"][2], source_shapes["v"][2])
+        and dimensions_compatible(source_shapes["q"][3], source_shapes["k"][3])
+        and dimensions_compatible(source_shapes["v"][3], source_shapes["o"][3])
+    ):
+        raise UnsupportedBackendOpError(
+            "Ascend Attention batch/head provenance is inconsistent.",
+            reason=f"source shapes={source_shapes!r}.",
+            suggestion="require equal batch and head dimensions for Q/K/V/O.",
+        )
+
+    def static_int(value: Any) -> int | None:
+        try:
+            return int(str(value))
+        except (TypeError, ValueError):
+            return None
+
+    sequence = static_int(source_shapes["q"][-2])
+    head_dim = static_int(source_shapes["q"][-1])
+    schedule = dict(program.metadata.get("schedule", {}))
+    tile = dict(schedule.get("ascend_attention_tile", {}))
+    if not tile:
+        tile = dict(schedule.get("ascend_dot_loop", {}).get("tile", {}))
+    key_valid = schedule.get("ascend_attention_key_valid")
+    state_normalization = schedule.get("ascend_attention_loop_state")
+    if not require_value_mask and (
+        not isinstance(key_valid, Mapping) or not isinstance(state_normalization, Mapping)
+    ):
+        return {
+            "version": 1,
+            "kind": "generic-online-softmax-loop-candidate",
+            "mode": "candidate",
+            "status": "recognized-before-normalization",
+            "tile": tile,
+        }
+    if not isinstance(key_valid, Mapping):
+        raise UnsupportedBackendOpError(
+            "Ascend Attention key-valid contract is missing.",
+            reason="normalization metadata was not preserved before contract construction.",
+            suggestion="run key-valid normalization before building the Attention contract.",
+        )
+    if not isinstance(state_normalization, Mapping):
+        raise UnsupportedBackendOpError(
+            "Ascend Attention loop-state contract is missing.",
+            reason="state-preserving branch metadata was not preserved before contract construction.",
+            suggestion="run online-softmax loop-state normalization before contract construction.",
+        )
+    all_masked_name = key_valid.get("all_masked")
+    state_if = next(
+        (
+            operation
+            for operation in body
+            if operation.opcode == "scf.if"
+            and operation.attrs.get("ascend_attention_state_normalization")
+        ),
+        None,
+    )
+    if state_if is None or state_if.operands[0] != all_masked_name:
+        raise UnsupportedBackendOpError(
+            "Ascend Attention state-preserving branch is not connected.",
+            reason=f"expected all_masked={all_masked_name!r} in a result-producing scf.if.",
+            suggestion="connect all_masked to the normalized acc/m_i/l_i branch.",
+        )
+    causal_mode = "causal" if causal_masks else "non-causal"
+
     return {
-        "version": 1,
-        "mode": "generic-online-softmax-loop",
-        "causal": "public-scf-if",
+        "version": 2,
+        "causal": causal_mode,
+        "mode": causal_mode,
         "layout": "public-access-template",
         "status": "verified-static-public-online-softmax",
+        "kind": "generic-online-softmax-loop",
+        "score_dot": {
+            "operation": score_dot.results[0].name,
+            "lhs": q_source,
+            "rhs": k_source,
+            "reduction_axis": "head_dim",
+            "lhs_shape": score_lhs_shape,
+            "rhs_shape": score_rhs_shape,
+            "result_shape": score_result_shape,
+        },
+        "value_dot": {
+            "operation": value_dot.results[0].name,
+            "lhs": value_lhs,
+            "rhs": v_source,
+            "reduction_axis": "key_position",
+            "lhs_shape": value_lhs_shape,
+            "rhs_shape": value_rhs_shape,
+            "result_shape": value_result_shape,
+        },
+        "k_score_mask": {
+            "operations": tuple(operation.results[0].name for operation in score_masks),
+            "invalid_value": "-inf",
+            "before": "reduce.max",
+        },
+        "key_bounds_mask": {
+            "operation": score_masks[0].results[0].name,
+            "predicate": score_masks[0].operands[0],
+            "invalid_value": "-inf",
+            "before": "reduce.max",
+            "source": "K.access-template.bounds",
+        },
+        "combined_key_valid": {
+            "operation": key_valid.get("predicate"),
+            "bounds_predicate": key_valid.get("bounds_predicate"),
+            "causal_predicate": key_valid.get("causal_predicate"),
+            "source": key_valid.get("source"),
+        },
+        "all_masked_predicate": {
+            "operation": all_masked_name,
+            "input": key_valid.get("not_predicate"),
+            "axis": key_valid.get("axis", "key_position"),
+            "source": key_valid.get("source"),
+        },
+        "v_value_mask": (
+            {
+                "operation": value_mask.results[0].name,
+                "predicate": value_mask.operands[0],
+                "load": value_mask.operands[1],
+                "zero": value_mask.operands[2],
+                "invalid_value": 0.0,
+            }
+            if value_mask is not None
+            else None
+        ),
+        "causal_mask": {
+            "operations": tuple(operation.results[0].name for operation in causal_masks),
+            "predicate": "query_position >= key_position",
+        },
+        "loop_carried_state": {
+            "roles": state_roles,
+            "yield": tuple(yields.operands),
+            "dtype": "float32",
+        },
+        "state_preserving_branch": {
+            "operation": state_if.results[0].name,
+            "predicate": state_if.operands[0],
+            "old_state": tuple(state_if.attrs.get("old_state", ())),
+            "new_state": tuple(state_if.attrs.get("new_state", ())),
+            "roles": tuple(state_if.attrs.get("state_roles", ())),
+            "dtype": "float32",
+            "provenance": state_if.attrs.get("provenance"),
+        },
+        "access_provenance": access,
+        "tile": tile,
+        "sequence": sequence,
+        "head_dim": head_dim,
     }
+
+
+def _normalize_ascend_attention_value_mask(program: ssa.Program) -> ssa.Program:
+    """Materialize the V bounds predicate for the recognized value dot.
+
+    Public layout lowering retains V's source bounds in its access-template
+    metadata.  CUDA can apply that predicate while emitting a masked load, but
+    Ascend's private verifier needs the zero value to be visible in SSA before
+    the second dot.  This pass only rewrites the V operand of the recognized
+    online-softmax value dot; score dots and unrelated operations are untouched.
+    """
+    loops = tuple(
+        operation
+        for operation in _walk_operations(program.blocks)
+        if operation.opcode == "scf.for"
+    )
+    if len(loops) != 1 or len(loops[0].regions) != 1:
+        raise UnsupportedBackendOpError(
+            "Ascend attention value-mask normalization requires one structured loop.",
+            reason=f"found {len(loops)} candidate loops.",
+            suggestion="preserve one online-softmax scf.for before Ascend lowering.",
+        )
+
+    loop = loops[0]
+    body = tuple(_walk_operations(loop.regions))
+    dots = tuple(operation for operation in body if operation.opcode == "linalg.dot")
+    if len(dots) != 2:
+        raise UnsupportedBackendOpError(
+            "Ascend attention value-mask normalization requires two dots.",
+            reason=f"found {len(dots)} linalg.dot operations.",
+            suggestion="preserve score and value dots in the online-softmax contract.",
+        )
+
+    value_dot = dots[1]
+    if len(value_dot.operands) < 2:
+        raise UnsupportedBackendOpError(
+            "Ascend attention value dot has no V operand.",
+            reason="the second linalg.dot does not have two operands.",
+            suggestion="preserve P and V operands through SSA lowering.",
+        )
+
+    v_name = value_dot.operands[1]
+    producers = {
+        result.name: operation
+        for operation in body
+        for result in operation.results
+    }
+    v_load = producers.get(v_name)
+    if v_load is None or v_load.opcode != "tensor.extract" or not v_load.operands:
+        raise UnsupportedBackendOpError(
+            "Ascend attention value-mask normalization cannot identify V load.",
+            reason=f"value dot operand `{v_name}` is not a tensor.extract.",
+            suggestion="preserve tensor.extract(V, key_tile) before the value dot.",
+        )
+
+    source_tensor = v_load.operands[0]
+    existing = {
+        value.name
+        for value in (*program.inputs, *program.outputs)
+    }
+    existing.update(
+        result.name
+        for operation in _walk_operations(program.blocks)
+        for result in operation.results
+    )
+
+    def fresh(prefix: str, type_: ssa.Type) -> ssa.Value:
+        index = 0
+        name = f"%ascend_{prefix}"
+        while name in existing:
+            index += 1
+            name = f"%ascend_{prefix}_{index}"
+        existing.add(name)
+        return ssa.Value(name=name, type=type_)
+
+    index_type = ssa.Type(kind="index")
+    value_type = v_load.results[0].type
+    key_position = fresh("v_key_position", index_type)
+    sequence = fresh("v_sequence", index_type)
+    predicate = fresh("v_valid", ssa.Type(kind="scalar", dtype="bool"))
+    zero = fresh("v_zero", value_type)
+    masked = fresh("v_masked", value_type)
+
+    inserted = (
+        ssa.Operation(
+            opcode="index.offset",
+            operands=(v_name,),
+            results=(key_position,),
+            attrs={
+                "dim": -2,
+                "ascend_attention_mask": "value",
+                "source": "access-template",
+            },
+        ),
+        ssa.Operation(
+            opcode="shape.dim",
+            operands=(source_tensor,),
+            results=(sequence,),
+            attrs={
+                "dim": -2,
+                "source": True,
+                "ascend_attention_mask": "value",
+            },
+        ),
+        ssa.Operation(
+            opcode="cmp.lt",
+            operands=(key_position.name, sequence.name),
+            results=(predicate,),
+            attrs={
+                "ascend_attention_mask": "value",
+                "predicate_source": "V.access-template",
+            },
+        ),
+        ssa.Operation(
+            opcode="arith.constant",
+            results=(zero,),
+            attrs={
+                "value": 0.0,
+                "dtype": value_type.dtype,
+                "ascend_attention_mask": "value",
+            },
+        ),
+        ssa.Operation(
+            opcode="select.where",
+            operands=(predicate.name, v_name, zero.name),
+            results=(masked,),
+            attrs={
+                "ascend_attention_mask": "value",
+                "predicate_source": "V.access-template",
+                "consumer": "value-dot",
+                "zero_value": 0.0,
+            },
+        ),
+    )
+
+    def rewrite_block(block: ssa.Block) -> ssa.Block:
+        operations = []
+        for operation in block.operations:
+            regions = tuple(rewrite_block(region) for region in operation.regions)
+            current = replace(operation, regions=regions)
+            if operation is value_dot:
+                current = replace(
+                    current,
+                    operands=(current.operands[0], masked.name, *current.operands[2:]),
+                )
+                operations.extend(inserted)
+            operations.append(current)
+        return replace(block, operations=tuple(operations))
+
+    rewritten = replace(program, blocks=tuple(rewrite_block(block) for block in program.blocks))
+    schedule = dict(rewritten.metadata.get("schedule", {}))
+    schedule["ascend_attention_value_mask"] = {
+        "source": "V.access-template",
+        "predicate": predicate.name,
+        "load": v_name,
+        "zero": zero.name,
+        "masked": masked.name,
+        "consumer": "value-dot",
+        "dtype": value_type.dtype,
+    }
+    normalized = replace(
+        rewritten,
+        metadata=dict(rewritten.metadata) | {"schedule": schedule},
+    )
+    ssa.verify_program(normalized)
+    return normalized
+
+
+def _normalize_ascend_attention_key_valid(program: ssa.Program) -> ssa.Program:
+    """Materialize a unified key-valid and all-masked predicate.
+
+    The public lowering may expose bounds and causal predicates as separate
+    score selects.  Ascend keeps their provenance separate, then records one
+    key-valid predicate for the score path and an explicit ``reduce.all``
+    reduction for all-masked tile detection.  This pass only handles the
+    recognized two-dot online-softmax candidate and does not rewrite tensor
+    coordinates or value loads.
+    """
+    loops = tuple(
+        operation
+        for operation in _walk_operations(program.blocks)
+        if operation.opcode == "scf.for"
+    )
+    if len(loops) != 1 or len(loops[0].regions) != 1:
+        raise UnsupportedBackendOpError(
+            "Ascend attention key-valid normalization requires one structured loop.",
+            reason=f"found {len(loops)} candidate loops.",
+            suggestion="preserve one online-softmax scf.for before Ascend lowering.",
+        )
+    loop = loops[0]
+    body = tuple(_walk_operations(loop.regions))
+    dots = tuple(operation for operation in body if operation.opcode == "linalg.dot")
+    if len(dots) != 2:
+        raise UnsupportedBackendOpError(
+            "Ascend attention key-valid normalization requires two dots.",
+            reason=f"found {len(dots)} linalg.dot operations.",
+            suggestion="preserve score and value dots in the online-softmax contract.",
+        )
+    score_dot = dots[0]
+    producers = {
+        result.name: operation
+        for operation in body
+        for result in operation.results
+    }
+
+    def source_root(name: str, seen: set[str] | None = None) -> str | None:
+        seen = set() if seen is None else seen
+        if name in seen:
+            return None
+        seen.add(name)
+        operation = producers.get(name)
+        if operation is None:
+            return name
+        for operand in operation.operands:
+            root = source_root(operand, seen.copy())
+            if root is not None:
+                return root
+        return None
+
+    score_masks = tuple(
+        operation
+        for operation in body
+        if operation.opcode == "select.where"
+        and len(operation.operands) == 3
+        and operation.operands[1] == score_dot.results[0].name
+    )
+    if not score_masks:
+        raise UnsupportedBackendOpError(
+            "Ascend attention key-valid normalization cannot find score mask.",
+            reason="the score dot has no explicit select.where predicate.",
+            suggestion="preserve the K bounds score mask before reduce.max.",
+        )
+
+    # The bounds predicate is defined after the score dot.  A causal predicate
+    # may be defined inside the following scf.if, so it cannot be referenced
+    # in the parent region without being yielded as an if result.
+    bounds_mask = score_masks[0]
+    bounds_predicate = bounds_mask.operands[0]
+    causal_masks = tuple(
+        operation
+        for operation in body
+        if operation.opcode == "select.where"
+        and len(operation.operands) == 3
+        and operation.operands[1] == score_masks[-1].results[0].name
+        and operation is not bounds_mask
+    )
+    causal_predicate = causal_masks[0].operands[0] if causal_masks else None
+    causal_if = next(
+        (
+            operation for operation in loop.regions[0].operations
+            if operation.opcode == "scf.if"
+            and causal_masks
+            and any(mask is nested for region in operation.regions
+                    for nested in region.operations for mask in causal_masks)
+        ),
+        None,
+    )
+    if causal_predicate is not None and (
+        causal_if is None or len(causal_if.regions) != 2
+        or len(causal_if.results) != 1
+    ):
+        raise UnsupportedBackendOpError(
+            "Ascend Attention cannot propagate causal key validity.",
+            reason="the causal predicate is not in a one-result, two-region scf.if.",
+            suggestion="preserve the causal predicate and score as structured if results.",
+        )
+
+    existing = {
+        value.name for value in (*program.inputs, *program.outputs)
+    }
+    existing.update(
+        result.name
+        for operation in _walk_operations(program.blocks)
+        for result in operation.results
+    )
+
+    def fresh(prefix: str, type_: ssa.Type) -> ssa.Value:
+        index = 0
+        name = f"%ascend_{prefix}"
+        while name in existing:
+            index += 1
+            name = f"%ascend_{prefix}_{index}"
+        existing.add(name)
+        return ssa.Value(name=name, type=type_)
+
+    bounds_producer = producers.get(bounds_predicate)
+    if bounds_producer is None or not bounds_producer.results:
+        raise UnsupportedBackendOpError(
+            "Ascend Attention cannot trace the K bounds predicate.",
+            reason=f"predicate {bounds_predicate!r} has no SSA producer.",
+            suggestion="preserve K source bounds as an explicit cmp operation.",
+        )
+    bool_type = bounds_producer.results[0].type
+    bounds_valid = fresh("bounds_valid", bool_type)
+    key_valid = fresh("key_valid", bool_type) if causal_if is not None else bounds_valid
+    not_key_valid = fresh("not_key_valid", bool_type)
+    false_value = fresh("false", bool_type)
+    all_masked = fresh("all_masked", ssa.Type(kind="scalar", dtype="bool"))
+    bounds_identity = ssa.Operation(
+        opcode="select.where",
+        operands=(bounds_predicate, bounds_predicate, bounds_predicate),
+        results=(bounds_valid,),
+        attrs={
+            "ascend_attention_mask": "bounds_valid",
+            "predicate_source": "K.access-template.bounds",
+            "bounds_predicate": bounds_predicate,
+            "causal_predicate": causal_predicate,
+            "preserves_coordinates": True,
+        },
+    )
+    after_score = (
+        ssa.Operation(
+            opcode="arith.constant",
+            results=(false_value,),
+            attrs={"value": False, "dtype": "bool"},
+        ),
+        ssa.Operation(
+            opcode="cmp.eq",
+            operands=(key_valid.name, false_value.name),
+            results=(not_key_valid,),
+            attrs={
+                "ascend_attention_mask": "key_valid",
+                "predicate_source": "K.access-template.bounds",
+            },
+        ),
+        ssa.Operation(
+            opcode="reduce.all",
+            operands=(not_key_valid.name,),
+            results=(all_masked,),
+            attrs={
+                # This scalar predicate means that every query/key pair in
+                # the current tile is invalid.  In causal mode key validity
+                # has rank two, so reducing only one axis would leave a
+                # vector and make it invalid as the scalar condition of the
+                # state-preserving scf.if.
+                "axis": None,
+                "axis_role": "all_key_valid_elements",
+                "ascend_attention_mask": "all_masked",
+                "predicate_source": "K.access-template.bounds",
+                "key_valid": key_valid.name,
+                "causal_predicate": causal_predicate,
+            },
+        ),
+    )
+    combined = fresh("causal_key_valid", bool_type) if causal_if is not None else None
+
+    def rewrite_block(block: ssa.Block) -> ssa.Block:
+        operations = []
+        for operation in block.operations:
+            regions = tuple(rewrite_block(region) for region in operation.regions)
+            current = replace(operation, regions=regions)
+            if operation is bounds_mask:
+                current = replace(
+                    current,
+                    operands=(bounds_valid.name, *current.operands[1:]),
+                    attrs=dict(current.attrs)
+                    | {
+                        "predicate_source": "Ascend.bounds_valid",
+                        "bounds_valid": bounds_valid.name,
+                    },
+                )
+                operations.append(bounds_identity)
+            if operation is causal_if:
+                then_region, else_region = current.regions
+                then_yield = then_region.operations[-1]
+                else_yield = else_region.operations[-1]
+                if (
+                    then_yield.opcode != "scf.yield"
+                    or else_yield.opcode != "scf.yield"
+                ):
+                    raise UnsupportedBackendOpError(
+                        "Ascend Attention causal branch has no structured yields.",
+                        reason="the causal score branch cannot yield key validity.",
+                        suggestion="preserve scf.yield in both causal branches.",
+                    )
+                then_ops = then_region.operations[:-1] + (
+                    ssa.Operation(
+                        opcode="arith.and",
+                        operands=(bounds_valid.name, causal_predicate),
+                        results=(combined,),
+                        attrs={"ascend_attention_mask": "key_valid"},
+                    ),
+                    replace(then_yield, operands=(*then_yield.operands, combined.name)),
+                )
+                else_ops = else_region.operations[:-1] + (
+                    replace(
+                        else_yield,
+                        operands=(*else_yield.operands, bounds_valid.name),
+                    ),
+                )
+                current = replace(
+                    current,
+                    results=(*current.results, key_valid),
+                    regions=(
+                        replace(then_region, operations=then_ops),
+                        replace(else_region, operations=else_ops),
+                    ),
+                )
+            operations.append(current)
+            if operation is causal_if or (causal_if is None and operation is bounds_mask):
+                operations.extend(after_score)
+        return replace(block, operations=tuple(operations))
+
+    rewritten = replace(program, blocks=tuple(rewrite_block(block) for block in program.blocks))
+    schedule = dict(rewritten.metadata.get("schedule", {}))
+    schedule["ascend_attention_key_valid"] = {
+        "predicate": key_valid.name,
+        "bounds_predicate": bounds_predicate,
+        "causal_predicate": causal_predicate,
+        "not_predicate": not_key_valid.name,
+        "all_masked": all_masked.name,
+        "axis": "all_key_valid_elements",
+        "source": "K.bounds+causal" if causal_if is not None else "K.access-template.bounds",
+        "coordinates_preserved": True,
+    }
+    normalized = replace(
+        rewritten,
+        metadata=dict(rewritten.metadata) | {"schedule": schedule},
+    )
+    ssa.verify_program(normalized)
+    return normalized
+
+
+def _normalize_ascend_attention_loop_state(program: ssa.Program) -> ssa.Program:
+    """Guard online-softmax state updates with the normalized all-masked flag."""
+    loops = tuple(
+        operation for operation in _walk_operations(program.blocks)
+        if operation.opcode == "scf.for"
+    )
+    if len(loops) != 1 or len(loops[0].regions) != 1:
+        raise UnsupportedBackendOpError(
+            "Ascend attention state normalization requires one structured loop.",
+            reason=f"found {len(loops)} candidate loops.",
+            suggestion="preserve one online-softmax scf.for before Ascend lowering.",
+        )
+    loop = loops[0]
+    iter_args = tuple(dict(loop.attrs).get("iter_args", ()))
+    region = loop.regions[0]
+    if len(iter_args) != 3 or len(region.args) != 4:
+        raise UnsupportedBackendOpError(
+            "Ascend attention state normalization requires acc, m_i, and l_i.",
+            reason=f"iter_args={len(iter_args)}, block_args={len(region.args)}.",
+            suggestion="preserve three FP32 loop-carried states.",
+        )
+    schedule = dict(program.metadata.get("schedule", {}))
+    key_contract = schedule.get("ascend_attention_key_valid")
+    all_masked = key_contract.get("all_masked") if isinstance(key_contract, Mapping) else None
+    if not all_masked:
+        raise UnsupportedBackendOpError(
+            "Ascend attention state normalization requires all_masked provenance.",
+            reason="the key-valid normalization did not publish an all-masked predicate.",
+            suggestion="run key-valid normalization before loop-state normalization.",
+        )
+    # Only move the loop's direct operations into the normal branch.  Using
+    # `_walk_operations` here would flatten nested regions and duplicate the
+    # score/value computations when rebuilding the scf.if.
+    body = list(region.operations)
+    yields = body[-1] if body and body[-1].opcode == "scf.yield" else None
+    if yields is None or len(yields.operands) != 3:
+        raise UnsupportedBackendOpError(
+            "Ascend attention state normalization requires a three-value yield.",
+            reason="online-softmax loop has no acc/m_i/l_i yield.",
+            suggestion="preserve the three state updates through scf.yield.",
+        )
+    state_args = tuple(argument.name for argument in region.args[1:])
+    updates = tuple(yields.operands)
+    value_types = {
+        value.name: value.type for value in (*program.inputs, *program.outputs)
+    }
+    value_types.update(
+        {
+            result.name: result.type
+            for operation in _walk_operations(program.blocks)
+            for result in operation.results
+        }
+    )
+    value_types.update(
+        {
+            argument.name: argument.type
+            for operation in _walk_operations(program.blocks)
+            for region_ in operation.regions
+            for argument in region_.args
+        }
+    )
+    for name in (*state_args, *updates):
+        type_ = value_types.get(name)
+        if type_ is None or normalize_ascend_dtype(type_.dtype) != "float32":
+            raise UnsupportedBackendOpError(
+                "Ascend attention loop state must remain FP32.",
+                reason=f"state `{name}` has type {None if type_ is None else type_.dtype!r}.",
+                suggestion="normalize acc, m_i, and l_i states to FP32 before emission.",
+            )
+    if any(name == state for name, state in zip(updates, state_args, strict=True)):
+        raise UnsupportedBackendOpError(
+            "Ascend attention state normalization found no distinct update path.",
+            reason=f"updates={updates!r}, state_args={state_args!r}.",
+            suggestion="preserve explicit normal-path state updates before normalization.",
+        )
+
+    # The branch controls the complete score/value/reduction/state update path.
+    # All-masked yields the old block arguments without executing normal_body.
+    all_masked_index = next(
+        index
+        for index, operation in enumerate(body[:-1])
+        if any(result.name == all_masked for result in operation.results)
+    )
+    normal_body = tuple(body[all_masked_index + 1 : -1]) + (
+        ssa.Operation(opcode="scf.yield", operands=updates),
+    )
+    masked_region = ssa.Block(
+        name="all_masked",
+        operations=(ssa.Operation(opcode="scf.yield", operands=state_args),),
+    )
+    normal_region = ssa.Block(name="normal", operations=normal_body)
+    state_if_results = tuple(
+        ssa.Value(name=f"%ascend_state_{index}", type=region.args[index + 1].type)
+        for index in range(3)
+    )
+    existing = {
+        value.name for value in (*program.inputs, *program.outputs)
+    }
+    existing.update(
+        result.name for operation in _walk_operations(program.blocks)
+        for result in operation.results
+    )
+    state_if_results = tuple(
+        ssa.Value(
+            name=(
+                result.name
+                if result.name not in existing
+                else f"{result.name}_{index}"
+            ),
+            type=result.type,
+        )
+        for index, result in enumerate(state_if_results)
+    )
+    state_if = ssa.Operation(
+        opcode="scf.if",
+        operands=(all_masked,),
+        results=state_if_results,
+        attrs={
+            "ascend_attention_state_normalization": True,
+            "all_masked": all_masked,
+            "state_roles": ("acc", "m_i", "l_i"),
+            "old_state": state_args,
+            "new_state": updates,
+            "provenance": "Ascend.online-softmax.all-masked",
+        },
+        regions=(masked_region, normal_region),
+    )
+    prefix = tuple(body[: all_masked_index + 1])
+    new_operations = prefix + (
+        state_if,
+        ssa.Operation(
+            opcode="scf.yield",
+            operands=tuple(result.name for result in state_if_results),
+        ),
+    )
+    rewritten_region = replace(region, operations=new_operations)
+    rewritten_loop = replace(loop, regions=(rewritten_region,))
+
+    def rewrite_block(block: ssa.Block) -> ssa.Block:
+        operations = []
+        for operation in block.operations:
+            regions = tuple(rewrite_block(child) for child in operation.regions)
+            current = replace(operation, regions=regions)
+            if operation is loop:
+                current = rewritten_loop
+            operations.append(current)
+        return replace(block, operations=tuple(operations))
+
+    rewritten = replace(program, blocks=tuple(rewrite_block(block) for block in program.blocks))
+    schedule["ascend_attention_loop_state"] = {
+        "all_masked": all_masked,
+        "roles": {"acc": state_args[0], "m_i": state_args[1], "l_i": state_args[2]},
+        "old_state": state_args,
+        "new_state": updates,
+        "branch": state_if_results[0].name,
+        "dtype": "float32",
+        "provenance": "Ascend.online-softmax.all-masked",
+    }
+    normalized = replace(rewritten, metadata=dict(rewritten.metadata) | {"schedule": schedule})
+    ssa.verify_program(normalized)
+    return normalized
+
+
+def _plan_ascend_attention_contract(
+    program: ssa.Program, contract: Mapping[str, Any]
+) -> Mapping[str, Any]:
+    """Plan the first static, single-block Ascend Attention contract."""
+    if not isinstance(contract, Mapping) or contract.get("kind") != "generic-online-softmax-loop":
+        raise UnsupportedBackendOpError(
+            "Ascend Attention planner received an invalid structured contract.",
+            reason="only the generic online-softmax contract is supported.",
+            suggestion="construct the verified structured Attention contract first.",
+        )
+    if contract.get("mode") not in {"causal", "non-causal"}:
+        raise UnsupportedBackendOpError(
+            "Ascend Attention planner requires an explicit causal mode.",
+            reason=f"received mode={contract.get('mode')!r}.",
+            suggestion="record mode=causal or mode=non-causal in the structured contract.",
+        )
+    for field in (
+        "score_dot", "value_dot", "key_bounds_mask", "combined_key_valid",
+        "all_masked_predicate", "v_value_mask", "loop_carried_state",
+        "state_preserving_branch", "access_provenance",
+    ):
+        if not isinstance(contract.get(field), Mapping):
+            raise UnsupportedBackendOpError(
+                "Ascend Attention planner received an incomplete contract.",
+                reason=f"missing field `{field}`.",
+                suggestion="run Attention verifier before resource planning.",
+            )
+
+    def positive_int(value: Any, field: str) -> int | None:
+        """Resolve a dimension when specialized, otherwise keep it symbolic.
+
+        The first ``make`` compilation is built from symbolic Tensor specs.
+        Runtime tensor dimensions are supplied by the lazy materializer and
+        trigger a concrete specialization before launch.  Rejecting the
+        symbolic form here would prevent that specialization from occurring.
+        """
+        try:
+            result = int(str(value))
+        except (TypeError, ValueError):
+            return None
+        if result <= 0:
+            raise UnsupportedBackendOpError(
+                "Ascend Attention planner requires positive dimensions.",
+                reason=f"{field}={result} is not positive.",
+                suggestion="use a non-empty static Attention shape.",
+            )
+        return result
+
+    access = contract.get("access_provenance")
+    if not isinstance(access, Mapping):
+        raise UnsupportedBackendOpError(
+            "Ascend Attention planner requires access provenance.",
+            reason="rank-4 Q/K/V/O metadata is absent.",
+            suggestion="build the structured access contract before planning.",
+        )
+    q_shape = tuple(access.get("q", {}).get("source_shape", ()))
+    k_shape = tuple(access.get("k", {}).get("source_shape", ()))
+    if len(q_shape) != 4 or len(k_shape) != 4:
+        raise UnsupportedBackendOpError(
+            "Ascend Attention planner requires rank-4 Q/K sources.",
+            reason=f"q_shape={q_shape!r}, k_shape={k_shape!r}.",
+            suggestion="use [batch,head,sequence,head_dim] source tensors.",
+        )
+    batch = positive_int(q_shape[0], "batch")
+    heads = positive_int(q_shape[1], "heads")
+    sequence = positive_int(contract.get("sequence"), "sequence")
+    if sequence is None:
+        sequence = positive_int(q_shape[2], "sequence")
+    head_dim = positive_int(contract.get("head_dim"), "head_dim")
+    if head_dim is None:
+        head_dim = positive_int(q_shape[3], "head_dim")
+    if head_dim is not None and head_dim != 64:
+        raise UnsupportedBackendOpError(
+            "Ascend Attention planner supports head_dim=64 only.",
+            reason=f"received head_dim={head_dim}.",
+            suggestion="use the first-version head_dim=64 contract.",
+        )
+    if sequence is not None and sequence > 1024:
+        raise UnsupportedBackendOpError(
+            "Ascend Attention planner supports sequence<=1024 only.",
+            reason=f"received sequence={sequence}.",
+            suggestion="use the bounded sequence-tiled Attention contract.",
+        )
+
+    verified_tiles = tuple(
+        dict(zip(("m", "n", "k"), tile, strict=True))
+        for tile in _ASCEND_ATTENTION_TILE_CANDIDATES
+    )
+    contract_tile = dict(contract.get("tile", {}))
+    # The public arrangement may expose its 16x16x64 candidate before the
+    # Ascend private retile hook runs. Validate that input candidate
+    # structurally; the resource planner considers only verified private tiles.
+    candidate_tile = {key: contract_tile.get(key) for key in ("m", "n", "k")}
+    accepted_candidates = ({"m": 16, "n": 16, "k": 64}, *verified_tiles)
+    if contract_tile and candidate_tile not in accepted_candidates:
+        raise UnsupportedBackendOpError(
+            "Ascend Attention planner received an unsupported tile.",
+            reason=f"contract tile={contract_tile!r}, verified candidates={verified_tiles!r}.",
+            suggestion="use a tile from the verified Attention resource candidates.",
+        )
+    resource_plan = _plan_ascend_attention_resources(
+        program,
+        head_dim=head_dim,
+        head_dim_expression=(
+            contract.get("head_dim")
+            if contract.get("head_dim") is not None
+            else q_shape[-1]
+        ),
+    )
+    if resource_plan["selected_tile"] is None:
+        raise _attention_resource_plan_error(resource_plan)
+    resolved_tile = _attention_tile_dict(resource_plan["selected_tile"])
+    sequence_expr = str(q_shape[2])
+    query_tiles = (
+        (sequence + resolved_tile["m"] - 1) // resolved_tile["m"]
+        if sequence is not None
+        else f"ceil_div({sequence_expr}, {resolved_tile['m']})"
+    )
+    key_tiles = (
+        (sequence + resolved_tile["n"] - 1) // resolved_tile["n"]
+        if sequence is not None
+        else f"ceil_div({sequence_expr}, {resolved_tile['n']})"
+    )
+    grid = (
+        batch * heads * query_tiles
+        if batch is not None and heads is not None and isinstance(query_tiles, int)
+        else f"({q_shape[0]}) * ({q_shape[1]}) * ({query_tiles})"
+    )
+    schedule = dict(program.metadata.get("schedule", {}))
+    core_limit = int(schedule.get("core_dim_limit", 65535))
+    if core_limit <= 0 or isinstance(grid, int) and grid > core_limit:
+        raise UnsupportedBackendOpError(
+            "Ascend Attention grid exceeds the private core limit.",
+            reason=f"grid={grid}, core_limit={core_limit}.",
+            suggestion="reduce batch/head/query tiles or increase the permitted core grid.",
+        )
+
+    workspace_bytes = resource_plan["workspace_bytes"]
+    dot_iterations = (
+        query_tiles * key_tiles
+        if isinstance(query_tiles, int) and isinstance(key_tiles, int)
+        else f"({query_tiles}) * ({key_tiles})"
+    )
+    complexity = {
+        "query_tiles": query_tiles,
+        "key_tiles": key_tiles,
+        "key_tile_iterations_per_query": key_tiles,
+        "dot_iterations": dot_iterations,
+        "estimated_ssa_operations": (
+            dot_iterations * 2
+            if isinstance(dot_iterations, int)
+            else f"2 * ({dot_iterations})"
+        ),
+        "bounded_by_sequence": 1024,
+        "loop_based": True,
+    }
+
+    loop = next(
+        (operation for operation in _walk_operations(program.blocks) if operation.opcode == "scf.for"),
+        None,
+    )
+    if loop is None or len(loop.operands) < 3:
+        raise UnsupportedBackendOpError(
+            "Ascend Attention planner cannot prove the sequence loop.",
+            reason="the structured contract has no scf.for bounds and step.",
+            suggestion="preserve one sequence tile loop with lower=0 and step=1.",
+        )
+    loop_contract = {
+        "lower": "0",
+        "upper": (
+            f"(({sequence} + {resolved_tile['n'] - 1}) // {resolved_tile['n']})"
+            if sequence is not None
+            else f"ceil_div({sequence_expr}, {resolved_tile['n']})"
+        ),
+        "step": 1,
+    }
+    return {
+        "version": 1,
+        "status": (
+            "verified-static-single-block"
+            if all(value is not None for value in (batch, heads, sequence, head_dim))
+            else "verified-runtime-guarded-single-block"
+        ),
+        "batch": batch,
+        "heads": heads,
+        "sequence": sequence,
+        "head_dim": head_dim,
+        "tile": resolved_tile,
+        "resource_plan": resource_plan,
+        "query_tiles": query_tiles,
+        "key_tiles": key_tiles,
+        "grid": grid,
+        "core_grid_limit": core_limit,
+        "loop": loop_contract,
+        "query_tail_mask": True,
+        "key_tail_mask": True,
+        "workspace_bytes": workspace_bytes,
+        "cross_block_workspace": False,
+        "ub_peak_bytes": resource_plan["ub_estimated_peak_bytes"],
+        "ub_budget_bytes": resource_plan["ub_budget_bytes"],
+        "ub_safety_margin_bytes": max(
+            0,
+            int(resource_plan["ub_budget_bytes"])
+            - int(resource_plan["ub_estimated_peak_bytes"]),
+        ),
+        "compile_complexity": complexity,
+        "mode": contract["mode"],
+        "all_masked_predicate": contract["all_masked_predicate"],
+        "state_preserving_branch": contract["state_preserving_branch"],
+    }
+
+
+def _validate_ascend_attention_emission_contract(kernel: Kernel) -> None:
+    """Require the complete private contract at the emitter boundary."""
+    if kernel.ssa is None:
+        raise UnsupportedBackendOpError(
+            "Ascend Attention emitter requires SSA metadata.",
+            reason="the kernel has no structured Attention program.",
+            suggestion="run the Ascend verifier and planner before emission.",
+        )
+    schedule = dict(kernel.ssa.metadata.get("schedule", {}))
+    contract = schedule.get("ascend_attention_loop")
+    semantics = schedule.get("ascend_attention_mask_semantics")
+    plan = schedule.get("ascend_attention_plan")
+    required_semantics = {
+        "k_score_mask_before_max",
+        "v_value_mask_zero_before_dot",
+        "causal_query_key_compare",
+        "loop_carried_state",
+        "all_masked_state_preserving_branch",
+    }
+    if not isinstance(contract, Mapping) or contract.get("version", 0) < 2:
+        raise UnsupportedBackendOpError(
+            "Ascend Attention emitter requires a structured contract.",
+            reason="the version 2 Attention contract is absent.",
+            suggestion="complete Ascend Attention verification before emission.",
+        )
+    if not isinstance(semantics, Mapping) or not required_semantics.issubset(semantics):
+        raise UnsupportedBackendOpError(
+            "Ascend Attention emitter requires verified mask semantics.",
+            reason="score/value masks or loop-state proof is incomplete.",
+            suggestion="run verify_ascend_attention_mask_semantics successfully.",
+        )
+    if not isinstance(plan, Mapping) or plan.get("status") not in {
+        "verified-static-single-block",
+        "verified-runtime-guarded-single-block",
+    }:
+        raise UnsupportedBackendOpError(
+            "Ascend Attention emitter requires a verified resource plan.",
+            reason="tile, UB, workspace, grid, or sequence planning is absent.",
+            suggestion="run the private Attention planner before emission.",
+        )
+    resource_plan = plan.get("resource_plan")
+    selected_tile = (
+        resource_plan.get("selected_tile")
+        if isinstance(resource_plan, Mapping)
+        else None
+    )
+    if not isinstance(selected_tile, Mapping):
+        raise UnsupportedBackendOpError(
+            "Ascend Attention emitter requires the canonical resource tile.",
+            reason="resource_plan.selected_tile is missing.",
+            suggestion="run the unified Attention resource planner before emission.",
+        )
+    selected_tile = _attention_tile_dict(selected_tile)
+    planned_tile = _attention_tile_dict(plan.get("tile", {}))
+    if planned_tile != selected_tile:
+        raise UnsupportedBackendOpError(
+            "Ascend Attention emitter received an inconsistent tile contract.",
+            reason=f"resource tile={selected_tile!r}, planner tile={planned_tile!r}.",
+            suggestion="carry the canonical resource-plan tile through source emission.",
+        )
+    for field in (
+        "score_dot",
+        "value_dot",
+        "k_score_mask",
+        "key_bounds_mask",
+        "combined_key_valid",
+        "all_masked_predicate",
+        "v_value_mask",
+        "causal_mask",
+        "loop_carried_state",
+        "state_preserving_branch",
+        "access_provenance",
+    ):
+        if not contract.get(field):
+            raise UnsupportedBackendOpError(
+                "Ascend Attention emitter received an incomplete contract.",
+                reason=f"missing structured field `{field}`.",
+                suggestion="emit only after all Attention provenance is verified.",
+            )
+    mode = contract.get("mode")
+    if mode not in {"causal", "non-causal"}:
+        raise UnsupportedBackendOpError(
+            "Ascend Attention emitter requires an explicit causal mode.",
+            reason=f"mode={mode!r}.",
+            suggestion="emit only a causal or non-causal verified contract.",
+        )
+    if plan.get("mode") != mode:
+        raise UnsupportedBackendOpError(
+            "Ascend Attention emitter received a stale planner mode.",
+            reason=f"contract mode={mode!r}, plan mode={plan.get('mode')!r}.",
+            suggestion="rebuild the planner output from the current contract.",
+        )
+    if plan.get("all_masked_predicate") != contract.get("all_masked_predicate"):
+        raise UnsupportedBackendOpError(
+            "Ascend Attention emitter received a stale all_masked plan.",
+            reason="planner and structured contract refer to different all_masked metadata.",
+            suggestion="rebuild the verified Attention plan.",
+        )
+    _verify_ascend_attention_retile_plan(kernel, selected_tile)
 
 
 def verify_ascend_attention_mask_semantics(
@@ -2663,6 +5172,12 @@ def verify_ascend_attention_mask_semantics(
     contract = schedule.get("ascend_attention_loop")
     if not contract:
         return None
+    if not isinstance(contract, Mapping) or contract.get("version", 0) < 2:
+        raise UnsupportedBackendOpError(
+            "Ascend Attention requires the structured contract schema.",
+            reason="the schedule has no score/value/access provenance contract.",
+            suggestion="construct the version 2 structured Attention contract first.",
+        )
 
     loops = [
         operation
@@ -2692,6 +5207,157 @@ def verify_ascend_attention_mask_semantics(
         )
 
     score_dot, value_dot = dots
+
+    # Consume the structured dot contract instead of inferring roles from dot
+    # order alone.  The producer map includes operations outside the loop,
+    # such as q preprocessing and tensor casts.
+    producers = {
+        result.name: operation
+        for operation in _walk_operations(program.blocks)
+        for result in operation.results
+    }
+    input_names = {
+        value.name
+        for value in (*program.inputs, *program.outputs)
+        if value.type.kind == "tensor"
+    }
+
+    def source_root(name: str, seen: set[str] | None = None) -> str | None:
+        seen = set() if seen is None else seen
+        if name in seen:
+            return None
+        if name in input_names:
+            return name
+        seen.add(name)
+        operation = producers.get(name)
+        if operation is None:
+            return None
+        for operand in operation.operands:
+            root = source_root(operand, seen.copy())
+            if root is not None:
+                return root
+        return None
+
+    score_contract = contract.get("score_dot")
+    value_contract = contract.get("value_dot")
+    if not isinstance(score_contract, Mapping) or not isinstance(value_contract, Mapping):
+        raise UnsupportedBackendOpError(
+            "Ascend Attention dot provenance is missing.",
+            reason="score_dot/value_dot are absent from the structured contract.",
+            suggestion="record Q/K and P/V operands with reduction axes and shapes.",
+        )
+    if (
+        score_contract.get("operation") != score_dot.results[0].name
+        or value_contract.get("operation") != value_dot.results[0].name
+    ):
+        raise UnsupportedBackendOpError(
+            "Ascend Attention dot contract does not match SSA operations.",
+            reason="contract operation ids are stale or point to different dots.",
+            suggestion="rebuild the structured contract after private normalization.",
+        )
+    actual_q = source_root(score_dot.operands[0])
+    actual_k = source_root(score_dot.operands[1])
+    actual_v = source_root(value_dot.operands[1])
+    if (
+        actual_q != score_contract.get("lhs")
+        or actual_k != score_contract.get("rhs")
+        or actual_v != value_contract.get("rhs")
+        or score_contract.get("reduction_axis") != "head_dim"
+        or value_contract.get("reduction_axis") != "key_position"
+    ):
+        raise UnsupportedBackendOpError(
+            "Ascend Attention dot operand provenance is not proven.",
+            reason=(
+                f"actual q/k/v=({actual_q!r},{actual_k!r},{actual_v!r}); "
+                f"contract q/k/v=({score_contract.get('lhs')!r},"
+                f"{score_contract.get('rhs')!r},{value_contract.get('rhs')!r})."
+            ),
+            suggestion="preserve Q/K/P/V source provenance and the two reduction axes.",
+        )
+    score_result_shape = tuple(str(dim) for dim in score_dot.results[0].type.shape)
+    expected_score_shape = tuple(str(dim) for dim in score_contract.get("result_shape", ()))
+    if expected_score_shape and score_result_shape != expected_score_shape:
+        raise UnsupportedBackendOpError(
+            "Ascend Attention score dot shape contract is stale.",
+            reason=f"SSA result={score_result_shape!r}, contract={expected_score_shape!r}.",
+            suggestion="record query_tile x key_tile as the score result shape.",
+        )
+    value_result_shape = tuple(str(dim) for dim in value_dot.results[0].type.shape)
+    expected_value_shape = tuple(str(dim) for dim in value_contract.get("result_shape", ()))
+    if expected_value_shape and value_result_shape != expected_value_shape:
+        raise UnsupportedBackendOpError(
+            "Ascend Attention value dot shape contract is stale.",
+            reason=f"SSA result={value_result_shape!r}, contract={expected_value_shape!r}.",
+            suggestion="record query_tile x value_dim as the value result shape.",
+        )
+
+    access = contract.get("access_provenance")
+    if not isinstance(access, Mapping):
+        raise UnsupportedBackendOpError(
+            "Ascend Attention access provenance is missing.",
+            reason="the structured contract has no rank-4 Q/K/V/O access map.",
+            suggestion="record batch, head, position, and dimension coordinates.",
+        )
+    expected_coordinates = {
+        "q": ("batch", "head", "query_position", "head_dim"),
+        "k": ("batch", "head", "key_position", "head_dim"),
+        "v": ("batch", "head", "key_position", "value_dim"),
+        "o": ("batch", "head", "query_position", "value_dim"),
+    }
+    shapes = {}
+    for role, coordinates in expected_coordinates.items():
+        item = access.get(role)
+        if not isinstance(item, Mapping) or tuple(item.get("coordinates", ())) != coordinates:
+            raise UnsupportedBackendOpError(
+                "Ascend Attention rank-4 coordinate contract is incomplete.",
+                reason=f"{role} coordinates={None if item is None else item.get('coordinates')!r}.",
+                suggestion="use explicit [batch,head,position,dim] provenance for Q/K/V/O.",
+            )
+        shape = tuple(str(dim) for dim in item.get("source_shape", ()))
+        if len(shape) != 4 or not item.get("access_templates"):
+            raise UnsupportedBackendOpError(
+                "Ascend Attention rank-4 source or access template is missing.",
+                reason=f"{role} source_shape={shape!r}, templates={item.get('access_templates') if isinstance(item, Mapping) else None!r}.",
+                suggestion="preserve rank-4 source shape and masked access templates.",
+            )
+        shapes[role] = shape
+    def dimensions_compatible(*values: str) -> bool:
+        concrete = set()
+        for value in values:
+            try:
+                concrete.add(int(value))
+            except (TypeError, ValueError):
+                continue
+        return len(concrete) <= 1
+
+    if not (
+        dimensions_compatible(*(shapes[role][0] for role in ("q", "k", "v", "o")))
+        and dimensions_compatible(*(shapes[role][1] for role in ("q", "k", "v", "o")))
+        and dimensions_compatible(shapes["q"][2], shapes["o"][2])
+        and dimensions_compatible(shapes["k"][2], shapes["v"][2])
+        and dimensions_compatible(shapes["q"][3], shapes["k"][3])
+        and dimensions_compatible(shapes["v"][3], shapes["o"][3])
+    ):
+        raise UnsupportedBackendOpError(
+            "Ascend Attention Q/K/V/O sequence or batch/head contract is inconsistent.",
+            reason=f"source shapes={shapes!r}.",
+            suggestion="require equal batch/head, Q/O query, K/V key, and compatible dims.",
+        )
+    specs = {value.name: value for value in (*program.inputs, *program.outputs)}
+    for role, item in access.items():
+        tensor = item.get("tensor") if isinstance(item, Mapping) else None
+        spec = specs.get(tensor)
+        templates = () if spec is None else tuple(dict(spec.type.attrs).get("access_templates", ()))
+        if not templates or any(
+            not isinstance(template, Mapping) or not str(template.get("mask", "True"))
+            or str(template.get("mask", "True")) == "True"
+            for template in templates
+        ):
+            raise UnsupportedBackendOpError(
+                "Ascend Attention access template does not prove tail masking.",
+                reason=f"{role} has no non-trivial masked access template.",
+                suggestion="retain query/key bounds predicates for every rank-4 tile.",
+            )
     negative_inf = {
         result.name
         for operation in body
@@ -2717,6 +5383,30 @@ def verify_ascend_attention_mask_semantics(
             reason="the SSA does not prove select.where(score, -inf) before max reduction.",
             suggestion="materialize the K score mask as an explicit SSA select before reduce.max.",
         )
+    score_mask_contract = contract.get("k_score_mask")
+    if not isinstance(score_mask_contract, Mapping) or not score_mask_contract.get("operations"):
+        raise UnsupportedBackendOpError(
+            "Ascend Attention K score mask contract is missing.",
+            reason="the structured contract has no key bounds mask operation.",
+            suggestion="record the -inf score select and its reduce.max ordering.",
+        )
+    score_mask_names = set(score_mask_contract.get("operations", ()))
+    if not score_mask_names.intersection(
+        result.name for operation in score_masks for result in operation.results
+    ) or score_mask_contract.get("invalid_value") != "-inf":
+        raise UnsupportedBackendOpError(
+            "Ascend Attention K score mask contract does not match SSA.",
+            reason="score mask operation or invalid value is stale.",
+            suggestion="use select.where(score, -inf) before reduce.max.",
+        )
+    reduce_max_position = positions[id(reduce_max)]
+    for operation in body:
+        if operation.opcode in {"math.exp2", "reduce.sum"} and positions[id(operation)] < reduce_max_position:
+            raise UnsupportedBackendOpError(
+                "Ascend Attention softmax operation precedes reduce.max.",
+                reason=f"{operation.opcode} appears before the score max reduction.",
+                suggestion="apply score masking and reduce.max before exp2/reduce.sum.",
+            )
 
     by_result = {
         result.name: operation
@@ -2743,11 +5433,24 @@ def verify_ascend_attention_mask_semantics(
         and len(operation.operands) == 2
         and all(position_expr(operand) for operand in operation.operands)
     )
-    if not causal_comparisons:
+    mode = contract.get("mode")
+    if mode not in {"causal", "non-causal"}:
+        raise UnsupportedBackendOpError(
+            "Ascend Attention contract has no explicit causal mode.",
+            reason=f"mode={mode!r}.",
+            suggestion="record mode=causal or mode=non-causal.",
+        )
+    if mode == "causal" and not causal_comparisons:
         raise UnsupportedBackendOpError(
             "Ascend causal attention requires query/key position comparison.",
             reason="no cmp.ge over explicit query_position/key_position offsets was found.",
             suggestion="represent causal masking as query_position >= key_position in SSA.",
+        )
+    if mode == "non-causal" and causal_comparisons:
+        raise UnsupportedBackendOpError(
+            "Ascend non-causal Attention contains a causal predicate.",
+            reason="contract mode is non-causal but SSA contains query/key cmp.ge.",
+            suggestion="remove causal masking or mark the contract causal.",
         )
 
     zero_values = {
@@ -2787,10 +5490,90 @@ def verify_ascend_attention_mask_semantics(
             reason="V masking is only implicit in access-template load predicates; SSA has no zero-valued V select.",
             suggestion="add a value-mask SSA select(value_predicate, V_load, 0.0) feeding the second dot.",
         )
+    value_mask_contract = contract.get("v_value_mask")
+    if not isinstance(value_mask_contract, Mapping):
+        raise UnsupportedBackendOpError(
+            "Ascend Attention V value mask contract is missing.",
+            reason="the structured contract has no V predicate, load, and zero provenance.",
+            suggestion="record the explicit V zero select before the value dot.",
+        )
+    value_mask_operation = next(
+        (
+            operation
+            for operation in value_zero_masks
+            if operation.results[0].name == value_mask_contract.get("operation")
+        ),
+        None,
+    )
+    if value_mask_operation is None or value_mask_operation.results[0].name not in value_dot_inputs:
+        raise UnsupportedBackendOpError(
+            "Ascend Attention V value mask is not connected to the value dot.",
+            reason="the contract select result or V load is not on the second dot path.",
+            suggestion="connect select.where(value_predicate,V_load,zero) to value dot.",
+        )
+    zero_name = value_mask_operation.operands[2]
+    zero_producer = producers.get(zero_name)
+    if (
+        zero_producer is None
+        or zero_producer.opcode != "arith.constant"
+        or zero_producer.attrs.get("value") not in {0, 0.0, "0", "0.0"}
+        or zero_producer.results[0].type.dtype
+        != producers.get(value_mask_operation.operands[1], value_mask_operation).results[0].type.dtype
+    ):
+        raise UnsupportedBackendOpError(
+            "Ascend Attention V value mask zero has the wrong dtype or provenance.",
+            reason="zero must be a typed zero compatible with the V load.",
+            suggestion="create arith.constant 0.0 with the V operand dtype.",
+        )
+
+    state_normalization = schedule.get("ascend_attention_loop_state")
+    key_valid_contract = schedule.get("ascend_attention_key_valid")
+    if not isinstance(key_valid_contract, Mapping) or not key_valid_contract.get("all_masked"):
+        raise UnsupportedBackendOpError(
+            "Ascend Attention all-masked provenance is missing.",
+            reason="the verifier cannot trace all_masked to the K key-valid predicate.",
+            suggestion="run Ascend key-valid normalization before state verification.",
+        )
+    if not isinstance(state_normalization, Mapping):
+        raise UnsupportedBackendOpError(
+            "Ascend Attention loop-state normalization metadata is missing.",
+            reason="acc/m_i/l_i state branch provenance was not recorded.",
+            suggestion="run Ascend online-softmax state normalization before verification.",
+        )
+    if state_normalization.get("all_masked") != key_valid_contract.get("all_masked"):
+        raise UnsupportedBackendOpError(
+            "Ascend Attention state branch uses a stale all_masked predicate.",
+            reason=(
+                f"key-valid={key_valid_contract.get('all_masked')!r}, "
+                f"state={state_normalization.get('all_masked')!r}."
+            ),
+            suggestion="rebuild state normalization from the current key-valid contract.",
+        )
+    contract_fields = {
+        "key_bounds_mask": contract.get("key_bounds_mask"),
+        "combined_key_valid": contract.get("combined_key_valid"),
+        "all_masked_predicate": contract.get("all_masked_predicate"),
+        "state_preserving_branch": contract.get("state_preserving_branch"),
+    }
+    if any(not isinstance(value, Mapping) for value in contract_fields.values()):
+        raise UnsupportedBackendOpError(
+            "Ascend Attention normalized contract is incomplete.",
+            reason=f"missing fields={tuple(name for name, value in contract_fields.items() if not isinstance(value, Mapping))!r}.",
+            suggestion="record normalized mask and loop-state operations one-to-one with SSA.",
+        )
+    if contract_fields["all_masked_predicate"].get("operation") != key_valid_contract.get("all_masked"):
+        raise UnsupportedBackendOpError(
+            "Ascend Attention all_masked contract is stale.",
+            reason="contract operation does not match key-valid normalization metadata.",
+            suggestion="rebuild the contract after key-valid normalization.",
+        )
 
     iter_args = tuple(dict(loop.attrs).get("iter_args", ()))
-    yields = next(
-        (operation for operation in body if operation.opcode == "scf.yield"), None
+    yields = (
+        loop.regions[0].operations[-1]
+        if loop.regions[0].operations
+        and loop.regions[0].operations[-1].opcode == "scf.yield"
+        else None
     )
     if len(iter_args) != 3 or yields is None or len(yields.operands) != 3:
         raise UnsupportedBackendOpError(
@@ -2800,6 +5583,59 @@ def verify_ascend_attention_mask_semantics(
         )
 
     state_names = tuple(str(item.get("name")) for item in iter_args)
+    state_contract = contract.get("loop_carried_state")
+    if not isinstance(state_contract, Mapping):
+        raise UnsupportedBackendOpError(
+            "Ascend Attention loop state contract is missing.",
+            reason="acc/m_i/l_i roles are not recorded.",
+            suggestion="record all three loop-carried state roles and dtypes.",
+        )
+    state_roles = state_contract.get("roles")
+    if not isinstance(state_roles, Mapping) or tuple(state_roles) != ("acc", "m_i", "l_i"):
+        raise UnsupportedBackendOpError(
+            "Ascend Attention loop state roles are incomplete.",
+            reason=f"received roles={state_roles!r}.",
+            suggestion="record acc, m_i, and l_i in that order.",
+        )
+    value_types = {
+        value.name: value.type
+        for value in (*program.inputs, *program.outputs)
+    }
+    value_types.update(
+        {
+            result.name: result.type
+            for operation in _walk_operations(program.blocks)
+            for result in operation.results
+        }
+    )
+    loop_args = loop.regions[0].args[1:]
+    if len(loop_args) != 3:
+        raise UnsupportedBackendOpError(
+            "Ascend Attention loop block arguments are incomplete.",
+            reason=f"found {len(loop_args)} carried block arguments.",
+            suggestion="preserve acc, m_i, and l_i block arguments.",
+        )
+    for initial, block_arg, update in zip(
+        loop.operands[3:], loop_args, yields.operands, strict=True
+    ):
+        initial_type = value_types.get(initial)
+        update_type = value_types.get(update)
+        if (
+            initial_type is None
+            or normalize_ascend_dtype(block_arg.type.dtype) != "float32"
+            or normalize_ascend_dtype(initial_type.dtype) != "float32"
+            or update_type is None
+            or normalize_ascend_dtype(update_type.dtype) != "float32"
+        ):
+            raise UnsupportedBackendOpError(
+                "Ascend Attention loop state dtype is not uniformly FP32.",
+                reason=(
+                    f"initial={None if initial_type is None else initial_type.dtype!r}, "
+                    f"block={block_arg.type.dtype!r}, "
+                    f"update={None if update_type is None else update_type.dtype!r}."
+                ),
+                suggestion="normalize acc, m_i, and l_i initial/block/update values to FP32.",
+            )
     update_branches = tuple(
         operation
         for operation in body
@@ -2816,6 +5652,56 @@ def verify_ascend_attention_mask_semantics(
             "Ascend attention requires an all-masked state-preserving branch.",
             reason="no scf.if preserves acc, m_i, and l_i when a tile has no valid K lanes.",
             suggestion="add an all-masked predicate and yield the previous three loop-carried values unchanged.",
+        )
+
+    state_arg_names = tuple(argument.name for argument in loop_args)
+    preserving_branch = False
+    for branch in update_branches:
+        for region in branch.regions:
+            if not region.operations or region.operations[-1].opcode != "scf.yield":
+                continue
+            yielded = tuple(region.operations[-1].operands)
+            if yielded == state_arg_names:
+                preserving_branch = True
+    if not preserving_branch:
+        raise UnsupportedBackendOpError(
+            "Ascend Attention all-masked branch does not preserve loop state.",
+            reason="no scf.if branch yields the previous acc, m_i, and l_i values unchanged.",
+            suggestion="yield the three loop block arguments in the all-masked branch.",
+        )
+
+    normalized_branch = next(
+        (
+            operation
+            for operation in body
+            if operation.opcode == "scf.if"
+            and operation.attrs.get("ascend_attention_state_normalization")
+        ),
+        None,
+    )
+    if normalized_branch is None or normalized_branch.operands[0] != key_valid_contract.get("all_masked"):
+        raise UnsupportedBackendOpError(
+            "Ascend Attention state branch is not connected to all_masked.",
+            reason="the result-producing scf.if does not consume normalized all_masked.",
+            suggestion="guard state updates with the key-valid all_masked predicate.",
+        )
+    if tuple(normalized_branch.attrs.get("old_state", ())) != state_arg_names:
+        raise UnsupportedBackendOpError(
+            "Ascend Attention state branch old-state provenance is incomplete.",
+            reason=f"old_state={normalized_branch.attrs.get('old_state')!r}.",
+            suggestion="yield the original acc/m_i/l_i block arguments in all-masked branch.",
+        )
+    if tuple(normalized_branch.attrs.get("new_state", ())) != tuple(
+        normalized_branch.regions[1].operations[-1].operands
+        if normalized_branch.regions
+        and normalized_branch.regions[1].operations
+        and normalized_branch.regions[1].operations[-1].opcode == "scf.yield"
+        else ()
+    ):
+        raise UnsupportedBackendOpError(
+            "Ascend Attention state branch new-state provenance is stale.",
+            reason=f"new_state={normalized_branch.attrs.get('new_state')!r}.",
+            suggestion="record the normal-path acc/m_i/l_i updates in the branch contract.",
         )
 
     return {
@@ -2848,8 +5734,14 @@ class AscendOptimizeSchedule(OptimizeSchedule):
                     | {"ascend_dot_loop": dot_loop}
                 },
             )
-        attention_loop = _ascend_attention_loop_contract(program)
+        attention_loop = _ascend_attention_loop_contract(
+            program, require_value_mask=False
+        )
         if attention_loop is not None:
+            program = _normalize_ascend_attention_value_mask(program)
+            program = _normalize_ascend_attention_key_valid(program)
+            program = _normalize_ascend_attention_loop_state(program)
+            attention_loop = _ascend_attention_loop_contract(program)
             attention_program = replace(
                 program,
                 metadata=dict(program.metadata)
@@ -2859,6 +5751,9 @@ class AscendOptimizeSchedule(OptimizeSchedule):
                 },
             )
             mask_semantics = verify_ascend_attention_mask_semantics(attention_program)
+            attention_plan = _plan_ascend_attention_contract(
+                attention_program, attention_loop
+            )
             program = replace(
                 program,
                 metadata=dict(program.metadata)
@@ -2867,6 +5762,7 @@ class AscendOptimizeSchedule(OptimizeSchedule):
                     | {
                         "ascend_attention_loop": attention_loop,
                         "ascend_attention_mask_semantics": mask_semantics,
+                        "ascend_attention_plan": attention_plan,
                     }
                 },
             )
@@ -3005,6 +5901,14 @@ class AscendOptimizeSchedule(OptimizeSchedule):
             )
 
         if granularity == "exp-reduction-dot-region":
+            # The Attention contract is built and verified before the generic
+            # candidate selection pass.  Preserve that concrete mode and
+            # provenance when attaching candidate metadata; the old
+            # placeholder used ``mode=generic-online-softmax-loop`` and
+            # silently invalidated causal/non-causal specialization.
+            attention_contract = schedule.get("ascend_attention_loop")
+            if not isinstance(attention_contract, Mapping):
+                return ()
             return (
                 ScheduleCandidate(
                     name="ascend-generic-online-softmax-loop",
@@ -3012,10 +5916,7 @@ class AscendOptimizeSchedule(OptimizeSchedule):
                         "tile": {"elements": 256},
                         "vector_width": 1,
                         "core_dim_limit": _max_core_dim(context),
-                        "ascend_attention_loop": {
-                            "mode": "generic-online-softmax-loop",
-                            "status": "verified-static-public-online-softmax",
-                        },
+                        "ascend_attention_loop": dict(attention_contract),
                     },
                     constraints={
                         "layout": "public-access-template",

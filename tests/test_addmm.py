@@ -7,7 +7,7 @@ import ninetoothed
 import ninetoothed.language as ntl
 import tests.test_matmul as matmul
 from ninetoothed import Tensor
-from tests.utils import get_available_devices
+from tests.utils import backend_for_device, get_available_devices
 
 
 def arrangement(
@@ -38,7 +38,7 @@ def application(input, mat1, mat2, beta, alpha, output):
     output = beta * input + alpha * matmul_output
 
 
-def addmm(input, mat1, mat2, beta=1, alpha=1):
+def addmm(input, mat1, mat2, *, backend, beta=1, alpha=1):
     output = torch.empty(
         (mat1.shape[0], mat2.shape[1]), device=mat1.device, dtype=torch.float16
     )
@@ -47,6 +47,7 @@ def addmm(input, mat1, mat2, beta=1, alpha=1):
         arrangement,
         application,
         (Tensor(2), Tensor(2), Tensor(2), Tensor(0), Tensor(0), Tensor(2)),
+        backend=backend,
     )
 
     addmm_kernel(input, mat1, mat2, beta, alpha, output)
@@ -75,7 +76,7 @@ def test(m, n, k, dtype, device, atol):
         mat1 = mat1.to(dtype)
         mat2 = mat2.T.to(dtype)
 
-        output = addmm(input, mat1, mat2, beta=beta, alpha=alpha)
+        output = addmm(input, mat1, mat2, backend=backend_for_device(device), beta=beta, alpha=alpha)
         expected = torch.addmm(
             input.to(torch.float16),
             mat1.to(torch.float16),
@@ -84,7 +85,7 @@ def test(m, n, k, dtype, device, atol):
             alpha=alpha,
         )
     else:
-        output = addmm(input, mat1, mat2, beta=beta, alpha=alpha)
+        output = addmm(input, mat1, mat2, backend=backend_for_device(device), beta=beta, alpha=alpha)
         expected = torch.addmm(input, mat1, mat2, beta=beta, alpha=alpha)
 
     assert torch.allclose(output, expected, atol=atol)

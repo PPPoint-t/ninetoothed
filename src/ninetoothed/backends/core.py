@@ -15,6 +15,21 @@ class Target(str, Enum):
     ASCEND = "ascend"
 
 
+class BackendDeviceContractError(ValueError):
+    """Raised when a backend is paired with an incompatible device type."""
+
+
+# This is the backend runtime contract, rather than a hardware availability
+# probe.  Hardware discovery belongs to callers; every consumer must use this
+# single mapping when validating a backend/device pair.
+_BACKEND_DEVICE_TYPES = {
+    Target.TRITON: ("cuda",),
+    Target.TILELANG: ("cuda",),
+    Target.CUDA: ("cuda",),
+    Target.ASCEND: ("npu",),
+}
+
+
 _CANONICAL_BACKEND_NAMES = {
     None: Target.TRITON,
     "triton": Target.TRITON,
@@ -163,3 +178,35 @@ def normalize_target(name: Target | str | None) -> Target:
         raise ValueError(
             f"Unsupported backend `{name}`. Supported backends: {supported}."
         ) from exc
+
+
+def supported_device_types(target: Target | str | None) -> tuple[str, ...]:
+    """Return native PyTorch device types accepted by ``target``."""
+    normalized = normalize_target(target)
+    return _BACKEND_DEVICE_TYPES[normalized]
+
+
+def backend_supports_device(
+    target: Target | str | None,
+    device: str,
+) -> bool:
+    """Return whether a backend accepts a native device type or device name."""
+    device_type = str(device).split(":", 1)[0].lower()
+    return device_type in supported_device_types(target)
+
+
+def validate_backend_device(
+    target: Target | str | None,
+    device: str,
+) -> Target:
+    """Validate a backend/device pair and return the normalized target."""
+    normalized = normalize_target(target)
+    device_type = str(device).split(":", 1)[0].lower()
+    supported = supported_device_types(normalized)
+    if device_type not in supported:
+        expected = ", ".join(supported)
+        raise BackendDeviceContractError(
+            f"Backend `{normalized.value}` requires device type(s) {expected}; "
+            f"received `{device_type}` from device `{device}`."
+        )
+    return normalized

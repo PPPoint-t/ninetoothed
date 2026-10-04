@@ -7,7 +7,7 @@ import torch
 import ninetoothed
 from ninetoothed import Tensor
 from ninetoothed.compiler.cache import CACHE_DIR
-from tests.utils import get_available_devices
+from tests.utils import backend_device_params
 
 
 def arrangement(input, other, alpha, output, block_size=None):
@@ -39,7 +39,7 @@ def premake(size=None, dtype=None, block_size=None):
     return arrangement_, application, tensors
 
 
-@pytest.mark.parametrize("device", get_available_devices())
+@pytest.mark.parametrize("backend, device", backend_device_params(("ascend", "cuda")))
 @pytest.mark.parametrize(
     "dtype, ninetoothed_dtype, rtol, atol",
     (
@@ -48,7 +48,7 @@ def premake(size=None, dtype=None, block_size=None):
     ),
 )
 @pytest.mark.parametrize("size", (20260128, 1127))
-def test_auto_tuning(size, dtype, device, ninetoothed_dtype, rtol, atol):
+def test_auto_tuning(size, dtype, backend, device, ninetoothed_dtype, rtol, atol):
     caller = device
     kernel_name = "add"
     output_dir = CACHE_DIR / "test_auto_tuning"
@@ -88,6 +88,7 @@ def test_auto_tuning(size, dtype, device, ninetoothed_dtype, rtol, atol):
         premake,
         configs,
         meta_parameters=("block_size",),
+        backend=backend,
         caller=caller,
         kernel_name=kernel_name,
         output_dir=output_dir,

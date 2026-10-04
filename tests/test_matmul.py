@@ -4,7 +4,7 @@ import torch
 import ninetoothed
 import ninetoothed.language as ntl
 from ninetoothed import Symbol, Tensor
-from tests.utils import get_available_devices
+from tests.utils import backend_for_device, get_available_devices
 
 BLOCK_SIZE_M = Symbol("BLOCK_SIZE_M", meta=True)
 BLOCK_SIZE_N = Symbol("BLOCK_SIZE_N", meta=True)
@@ -47,13 +47,13 @@ def application(lhs, rhs, output):
     output = accumulator.to(ntl.float16)
 
 
-def matmul(lhs, rhs):
+def matmul(lhs, rhs, *, backend):
     output = torch.empty(
         (lhs.shape[0], rhs.shape[1]), device=lhs.device, dtype=torch.float16
     )
 
     matmul_kernel = ninetoothed.make(
-        arrangement, application, (Tensor(2), Tensor(2), Tensor(2))
+        arrangement, application, (Tensor(2), Tensor(2), Tensor(2)), backend=backend
     )
 
     matmul_kernel(lhs, rhs, output)
@@ -81,10 +81,10 @@ def test(m, n, k, dtype, device, atol):
         input = input.to(dtype)
         other = other.T.to(dtype)
 
-        output = matmul(input, other)
+        output = matmul(input, other, backend=backend_for_device(device))
         expected = torch.matmul(input.to(torch.float16), other.to(torch.float16))
     else:
-        output = matmul(input, other)
+        output = matmul(input, other, backend=backend_for_device(device))
         expected = torch.matmul(input, other)
 
     assert torch.allclose(output, expected, atol=atol)

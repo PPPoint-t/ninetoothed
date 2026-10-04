@@ -8,7 +8,7 @@ import torch.nn.functional as F
 import ninetoothed
 import tests.test_matmul as matmul
 from ninetoothed import Symbol, Tensor
-from tests.utils import get_available_devices
+from tests.utils import backend_for_device, get_available_devices
 
 
 def arrangement(
@@ -89,7 +89,7 @@ def premake(
     return arrangement_, application, tensors
 
 
-def conv2d(input, filter, padding=0):
+def conv2d(input, filter, padding=0, *, backend):
     if isinstance(padding, int):
         padding = (padding, padding)
 
@@ -106,9 +106,8 @@ def conv2d(input, filter, padding=0):
         functools.partial(arrangement, enable_padding=True),
         matmul.application,
         (Tensor(4), Tensor(4, shape_options={"constexpr": True}), Tensor(4)),
-        max_num_configs=(
-            50 if os.environ.get("NINETOOTHED_BACKEND", "triton") == "triton" else 1
-        ),
+        backend=backend,
+        max_num_configs=50 if backend == "triton" else 1,
     )
 
     conv2d_kernel(input, filter, output, padding_h=padding_h, padding_w=padding_w)
@@ -130,7 +129,9 @@ def test(n, c, h, w, k, r, s, padding, dtype, device, rtol, atol):
     input = torch.rand((n, c, h, w), dtype=dtype, device=device)
     weight = torch.rand((k, c, r, s), dtype=dtype, device=device)
 
-    output = conv2d(input, weight, padding=padding)
+    output = conv2d(
+        input, weight, padding=padding, backend=backend_for_device(device)
+    )
     expected = F.conv2d(input, weight, padding=padding)
 
     assert torch.allclose(output, expected, rtol=rtol, atol=atol)

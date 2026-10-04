@@ -9,7 +9,7 @@ import ninetoothed
 import ninetoothed.language as ntl
 import tests.test_matmul as matmul
 from ninetoothed import Tensor
-from tests.utils import get_available_devices
+from tests.utils import backend_for_device, get_available_devices
 
 
 @pytest.mark.parametrize("_device", get_available_devices())
@@ -32,7 +32,7 @@ def test_auto_tuning_generation(
 
     tensors = (Tensor(2), Tensor(2), Tensor(2))
 
-    backend = os.environ.get("NINETOOTHED_BACKEND", "triton")
+    backend = backend_for_device(_device)
 
     if backend != "triton" and (
         isinstance(num_warps, tuple) or isinstance(num_stages, tuple)
@@ -42,13 +42,19 @@ def test_auto_tuning_generation(
                 arrangement,
                 application,
                 tensors,
+                backend=backend,
                 num_warps=num_warps,
                 num_stages=num_stages,
             )
         return
 
     handle = ninetoothed.make(
-        arrangement, application, tensors, num_warps=num_warps, num_stages=num_stages
+        arrangement,
+        application,
+        tensors,
+        backend=backend,
+        num_warps=num_warps,
+        num_stages=num_stages,
     )
     candidates = handle._launch_plan.tuning_candidates
 
@@ -81,7 +87,12 @@ def test_arrangement_returning_a_single_tensor(_device):
     def application(x):
         x
 
-    ninetoothed.make(arrangement, application, (Tensor(1),))
+    ninetoothed.make(
+        arrangement,
+        application,
+        (Tensor(1),),
+        backend=backend_for_device(_device),
+    )
 
 
 @pytest.mark.parametrize("device", get_available_devices())
@@ -119,7 +130,9 @@ def test_squeezing_the_innermost_level(num_rows, num_cols, num_indices, device):
         Tensor(2, shape_options=shape_options),
     )
 
-    kernel = ninetoothed.make(arrangement, application, tensors)
+    kernel = ninetoothed.make(
+        arrangement, application, tensors, backend=backend_for_device(device)
+    )
 
     input = torch.randn((num_indices, num_cols), device=device)
     indices = torch.randint(0, num_rows, (num_indices,), device=device)
@@ -142,7 +155,12 @@ def test_unsqueezing_the_outermost_level(device):
     def application(x):
         x
 
-    kernel = ninetoothed.make(arrangement, application, (Tensor(1),))
+    kernel = ninetoothed.make(
+        arrangement,
+        application,
+        (Tensor(1),),
+        backend=backend_for_device(device),
+    )
 
     kernel(torch.randn((0,), device=device))
 
@@ -158,7 +176,9 @@ def test_non_int_constexpr(size, device):
 
     tensors = (Tensor(1), Tensor(0, constexpr=True), Tensor(1))
 
-    kernel = ninetoothed.make(arrangement, application, tensors)
+    kernel = ninetoothed.make(
+        arrangement, application, tensors, backend=backend_for_device(device)
+    )
 
     input = torch.randn((size,), device=device)
     other = math.pi
@@ -189,7 +209,12 @@ def test_loop_carried_row_sum_with_tensor_dtype(device):
 
         y = acc  # noqa: F841
 
-    kernel = ninetoothed.make(arrangement, application, (Tensor(2, other=0), Tensor(2)))
+    kernel = ninetoothed.make(
+        arrangement,
+        application,
+        (Tensor(2, other=0), Tensor(2)),
+        backend=backend_for_device(device),
+    )
     x = torch.randn((17, 70), device=device)
     y = torch.empty((17, 1), device=device)
 

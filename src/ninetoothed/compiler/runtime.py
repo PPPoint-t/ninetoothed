@@ -13,7 +13,11 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable
 
-from ninetoothed.backends.core import BuiltArtifact, Target
+from ninetoothed.backends.core import (
+    BuiltArtifact,
+    Target,
+    supported_device_types,
+)
 from ninetoothed.compiler.cache import (
     atomic_write_bytes,
     compilation_cache_key,
@@ -1235,15 +1239,12 @@ def _validate_tensor_contract(spec, value, expected_device, *, target: Target):
 
 def _device_type_for_target(target: Target) -> str:
     """Return the PyTorch device type required by a materialization target."""
-    if target == Target.ASCEND:
-        return "npu"
-
-    return "cuda"
+    return supported_device_types(target)[0]
 
 
 def _device_label_for_target(target: Target) -> str:
     """Return the user-facing PyTorch device label for a backend target."""
-    if target == Target.ASCEND:
+    if _device_type_for_target(target) == "npu":
         return "NPU"
 
     return "CUDA"

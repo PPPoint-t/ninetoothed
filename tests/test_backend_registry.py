@@ -4,11 +4,15 @@ from dataclasses import replace
 import pytest
 
 from ninetoothed.backends import (
+    BackendDeviceContractError,
     Target,
+    backend_supports_device,
     backend_capabilities,
     default_registry,
     emit,
     normalize_target,
+    supported_device_types,
+    validate_backend_device,
 )
 from ninetoothed.backends.toolchain import cuda_compile_command
 from ninetoothed.compiler import resolve_target
@@ -74,6 +78,24 @@ def _matmul_kernel(dtype: str = "float32") -> Kernel:
 
 
 class TestRegistry:
+    @pytest.mark.parametrize(
+        "backend, device",
+        (("ascend", "npu"), ("cuda", "cuda"), ("triton", "cuda"), ("tilelang", "cuda")),
+    )
+    def test_backend_device_contract_accepts_native_pairs(self, backend, device):
+        assert validate_backend_device(backend, device).value == backend
+        assert backend_supports_device(backend, device)
+        assert device in supported_device_types(backend)
+
+    @pytest.mark.parametrize(
+        "backend, device",
+        (("ascend", "cuda"), ("cuda", "npu"), ("triton", "npu"), ("tilelang", "npu")),
+    )
+    def test_backend_device_contract_rejects_incompatible_pairs(self, backend, device):
+        assert not backend_supports_device(backend, device)
+        with pytest.raises(BackendDeviceContractError, match="requires device type"):
+            validate_backend_device(backend, device)
+
     def test_backend_names_are_normalized_without_aliases(self):
         assert normalize_target(None) == Target.TRITON
         assert normalize_target("triton") == Target.TRITON

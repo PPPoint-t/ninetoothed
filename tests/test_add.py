@@ -3,13 +3,13 @@ import torch
 
 import ninetoothed
 from ninetoothed import Symbol, Tensor
-from tests.utils import get_available_devices
+from tests.utils import backend_for_device, get_available_devices
 
 
-def add(lhs, rhs):
+def add(lhs, rhs, *, backend):
     BLOCK_SIZE = Symbol("BLOCK_SIZE", meta=True)
 
-    @ninetoothed.jit
+    @ninetoothed.jit(backend=backend)
     def add_kernel(
         lhs: Tensor(1).tile((BLOCK_SIZE,)),
         rhs: Tensor(1).tile((BLOCK_SIZE,)),
@@ -31,7 +31,7 @@ def test(size, dtype, device):
     input = torch.rand(size, dtype=dtype, device=device)
     other = torch.rand(size, dtype=dtype, device=device)
 
-    output = add(input, other)
+    output = add(input, other, backend=backend_for_device(device))
     expected = input + other
 
     assert torch.allclose(output, expected)

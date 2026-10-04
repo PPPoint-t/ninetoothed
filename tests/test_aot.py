@@ -15,6 +15,7 @@ from ninetoothed.compiler.cache import CACHE_DIR
 from ninetoothed.compiler.runtime import overflow_terms
 from tests.utils import (
     assert_artifact_ready,
+    backend_for_device,
     device_count,
     get_available_devices,
     get_stream,
@@ -39,6 +40,7 @@ def test_add(test_multi_device, size, dtype, device, ninetoothed_dtype):
 
     tensors = tuple(Tensor(1, dtype=ninetoothed_dtype) for _ in range(3))
     caller = device
+    backend = backend_for_device(device)
     kernel_name = f"add{_generate_kernel_name_suffix()}"
     output_dir = CACHE_DIR
 
@@ -46,6 +48,7 @@ def test_add(test_multi_device, size, dtype, device, ninetoothed_dtype):
         _arrangement,
         _application,
         tensors,
+        backend=backend,
         caller=caller,
         kernel_name=kernel_name,
         output_dir=output_dir,
@@ -92,6 +95,7 @@ def test_addmm(m, n, k, dtype, device, ninetoothed_dtype, atol):
         Tensor(ndim, dtype=ninetoothed_dtype) for ndim in (2, 2, 2, 0, 0, 2)
     )
     caller = device
+    backend = backend_for_device(device)
     kernel_name = f"addmm{_generate_kernel_name_suffix()}"
     output_dir = CACHE_DIR
 
@@ -99,6 +103,7 @@ def test_addmm(m, n, k, dtype, device, ninetoothed_dtype, atol):
         arrangement,
         application,
         tensors,
+        backend=backend,
         caller=caller,
         kernel_name=kernel_name,
         output_dir=output_dir,
@@ -154,6 +159,7 @@ def test_attention(
     is_causal_ = Tensor(0, constexpr=True, value=1)
     tensors = (query_, key_, value_, is_causal_, output_)
     caller = device
+    backend = backend_for_device(device)
     kernel_name = f"attention{_generate_kernel_name_suffix()}"
     output_dir = CACHE_DIR
 
@@ -161,6 +167,7 @@ def test_attention(
         arrangement,
         application,
         tensors,
+        backend=backend,
         caller=caller,
         kernel_name=kernel_name,
         output_dir=output_dir,
@@ -197,6 +204,7 @@ def test_matmul(m, n, k, dtype, device, ninetoothed_dtype):
     application = matmul.application
     tensors = tuple(Tensor(2, dtype=ninetoothed_dtype) for _ in range(3))
     caller = device
+    backend = backend_for_device(device)
     kernel_name = f"matmul{_generate_kernel_name_suffix()}"
     output_dir = CACHE_DIR
 
@@ -204,6 +212,7 @@ def test_matmul(m, n, k, dtype, device, ninetoothed_dtype):
         arrangement,
         application,
         tensors,
+        backend=backend,
         caller=caller,
         kernel_name=kernel_name,
         output_dir=output_dir,
@@ -278,6 +287,7 @@ def test_conv2d(
         kernel = ninetoothed.build(
             premake,
             configs,
+            backend=backend_for_device(device),
             caller=caller,
             kernel_name=kernel_name,
             output_dir=output_dir,
@@ -289,6 +299,7 @@ def test_conv2d(
             arrangement,
             application,
             tensors,
+            backend=backend_for_device(device),
             caller=caller,
             kernel_name=kernel_name,
             output_dir=output_dir,
@@ -328,6 +339,7 @@ def test_fp32_scalar(device):
     )
 
     caller = device
+    backend = backend_for_device(device)
     kernel_name = f"fp32_scalar{_generate_kernel_name_suffix()}"
     output_dir = CACHE_DIR
 
@@ -335,6 +347,7 @@ def test_fp32_scalar(device):
         _arrangement,
         _application,
         tensors,
+        backend=backend,
         caller=caller,
         kernel_name=kernel_name,
         output_dir=output_dir,
@@ -375,6 +388,7 @@ def test_aot_with_static_non_power_of_two_innermost_sizes(device):
         _arrangement,
         _application,
         tensors,
+        backend=backend_for_device(device),
         caller=device,
         kernel_name=kernel_name,
         output_dir=output_dir,

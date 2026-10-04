@@ -13,7 +13,7 @@ from ninetoothed.compiler import (
     CompileRequest,
     load_built_artifact,
 )
-from tests.utils import get_available_devices
+from tests.utils import backend_device_pairs, get_available_devices
 
 
 def _arrangement(input, other, output):
@@ -24,8 +24,7 @@ def _application(input, other, output):
     output = input + other  # noqa: F841
 
 
-@pytest.mark.parametrize("device", get_available_devices())
-@pytest.mark.parametrize("backend", ("triton", "cuda", "tilelang"))
+@pytest.mark.parametrize("backend, device", backend_device_pairs(("triton", "cuda", "tilelang")))
 def test_aot_built_artifact_can_be_reloaded(backend, device, tmp_path):
     tensors = tuple(Tensor(shape=(257,), dtype=ninetoothed.float32) for _ in range(3))
     compilation = DEFAULT_COMPILER.compile(
@@ -113,16 +112,16 @@ def test_triton_aot_handle_is_reusable_across_cuda_contexts(tmp_path):
         check_launch(reloaded, device)
 
 
-@pytest.mark.parametrize("device", get_available_devices())
+@pytest.mark.parametrize("backend, device", (("cuda", device) for device in get_available_devices("cuda")))
 @pytest.mark.parametrize("mode", ("jit", "aot"))
-def test_cuda_empty_tensor_is_a_no_op(mode, device, tmp_path):
+def test_cuda_empty_tensor_is_a_no_op(backend, mode, device, tmp_path):
     tensors = tuple(Tensor(1, dtype=ninetoothed.float32) for _ in range(3))
     compilation = DEFAULT_COMPILER.compile(
         CompileRequest(
             arrangement=_arrangement,
             application=_application,
             tensors=tensors,
-            backend="cuda",
+            backend=backend,
             kernel_name=f"empty_cuda_{mode}",
         )
     )

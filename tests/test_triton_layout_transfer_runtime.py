@@ -10,7 +10,7 @@ from ninetoothed.backends.materializers.triton import _aot_wrapper
 from ninetoothed.compiler import load_built_artifact
 from ninetoothed.compiler.layout_runtime import build_layout_transfer_validator
 from ninetoothed.ir import LaunchABI, LaunchBinding
-from tests.utils import get_available_devices
+from tests.utils import backend_device_params
 
 BLOCK_SIZE = block_size(16, 32)
 
@@ -146,8 +146,8 @@ def test_layout_transfer_runtime_contract_and_aot_wiring():
     assert not function.called
 
 
-@pytest.mark.parametrize("device", get_available_devices())
-def test_layout_transfer_jit_aot_reload_with_dynamic_strides(device, tmp_path):
+@pytest.mark.parametrize("backend, device", backend_device_params(("triton",)))
+def test_layout_transfer_jit_aot_reload_with_dynamic_strides(backend, device, tmp_path):
     rows, columns = 127, 79
     input = torch.empty_strided(
         (rows, columns),
@@ -166,7 +166,7 @@ def test_layout_transfer_jit_aot_reload_with_dynamic_strides(device, tmp_path):
         _permutation_arrangement,
         _copy_application,
         (Tensor(2), Tensor(2)),
-        backend="triton",
+        backend=backend,
     )
 
     jit_kernel(input, output)
@@ -184,7 +184,7 @@ def test_layout_transfer_jit_aot_reload_with_dynamic_strides(device, tmp_path):
             Tensor(2, dtype=ninetoothed.float16),
             Tensor(2, dtype=ninetoothed.float16),
         ),
-        backend="triton",
+        backend=backend,
         caller=device,
         output_dir=tmp_path,
     )

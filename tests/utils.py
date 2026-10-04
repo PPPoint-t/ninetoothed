@@ -2,6 +2,13 @@ import contextlib
 import os
 
 import torch
+import pytest
+
+from ninetoothed.backends import (
+    backend_supports_device,
+    normalize_target,
+    supported_device_types,
+)
 
 
 class DeviceSpec(str):
@@ -13,7 +20,7 @@ class DeviceSpec(str):
         return value
 
 
-def get_available_devices():
+def get_available_devices(backend=None):
     """Return device strings annotated with their recommended backend."""
     devices = []
 
@@ -26,23 +33,64 @@ def get_available_devices():
     if hasattr(torch, "npu") and torch.npu.is_available():
         devices.append(DeviceSpec("npu", "ascend"))
 
-    # Keep backend selection centralized: an available NPU is preferred unless
-    # the caller explicitly selected a backend before importing test helpers.
-    if devices and any(str(device).split(":", 1)[0] == "npu" for device in devices):
-        os.environ.setdefault("NINETOOTHED_BACKEND", "ascend")
+    if backend is None:
+        return tuple(devices)
 
-    return tuple(devices)
+    normalized = normalize_target(backend)
+    return tuple(
+        device for device in devices if device_supports_backend(device, normalized)
+    )
 
 
 def backend_for_device(device):
-    """Resolve an explicit backend, preferring the environment override."""
-    override = os.environ.get("NINETOOTHED_BACKEND")
-    if override:
-        return override
+    """Resolve the backend from device metadata or its native device type."""
     kind = str(device).split(":", 1)[0]
     return getattr(
         device, "backend", {"npu": "ascend", "cuda": "cuda"}.get(kind, "triton")
     )
+
+
+def device_supports_backend(device, backend):
+    """Use the production backend/device contract for test parametrization."""
+    return backend_supports_device(normalize_target(backend), str(device))
+
+
+def backend_device_pairs(backends):
+    """Return only discovered ``(backend, device)`` pairs allowed by contract."""
+    return tuple(
+        (normalize_target(backend).value, device)
+        for backend in backends
+        for device in get_available_devices(backend)
+    )
+
+
+def backend_device_params(backends):
+    """Return ``(backend, device)`` pytest parameters, skipping absent hardware."""
+    params = []
+    for backend in backends:
+        normalized = normalize_target(backend).value
+        devices = get_available_devices(normalized)
+        if devices:
+            params.extend(
+                pytest.param(normalized, device, id=f"{normalized}-{device}")
+                for device in devices
+            )
+        else:
+            params.append(
+                pytest.param(
+                    normalized,
+                    None,
+                    id=f"{normalized}-unavailable",
+                    marks=pytest.mark.skip(
+                        reason=(
+                            f"backend `{normalized}` requires device type(s) "
+                            f"{', '.join(supported_device_types(normalized))}, "
+                            "but no compatible hardware is available"
+                        )
+                    ),
+                )
+            )
+    return tuple(params)
 
 
 def get_stream(device):

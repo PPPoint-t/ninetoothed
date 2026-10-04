@@ -15,7 +15,7 @@ import ninetoothed.compiler.runtime as runtime
 from ninetoothed import Tensor
 from ninetoothed.compiler import DEFAULT_COMPILER, CompileRequest
 from ninetoothed.ir import LaunchABI, LaunchBinding
-from tests.utils import get_available_devices
+from tests.utils import backend_device_params
 
 _prepared_test_kernel = None
 
@@ -1081,8 +1081,8 @@ def test_triton_zero_size_does_not_disturb_nonempty_prepared_call():
     assert tuner.calls == 1
 
 
-@pytest.mark.parametrize("device", get_available_devices())
-def test_triton_tuple_configurations_are_benchmarked_and_cached(device, monkeypatch):
+@pytest.mark.parametrize("backend, device", backend_device_params(("triton",)))
+def test_triton_tuple_configurations_are_benchmarked_and_cached(backend, device, monkeypatch):
     benchmarked = []
 
     def benchmark(function, args, kwargs):
@@ -1096,7 +1096,7 @@ def test_triton_tuple_configurations_are_benchmarked_and_cached(device, monkeypa
         _arrangement,
         _application,
         tuple(Tensor(shape=(257,), dtype=ninetoothed.float32) for _ in range(3)),
-        backend="triton",
+        backend=backend,
         kernel_name=f"runtime_auto_tuning_{uuid.uuid4().hex}",
         num_warps=(4, 8),
         num_stages=(1,),
@@ -1118,13 +1118,13 @@ def test_triton_tuple_configurations_are_benchmarked_and_cached(device, monkeypa
     assert len(benchmarked) == 2
 
 
-@pytest.mark.parametrize("device", get_available_devices())
-def test_triton_prepared_cache_releases_gpu_tensor_storage(device):
+@pytest.mark.parametrize("backend, device", backend_device_params(("triton",)))
+def test_triton_prepared_cache_releases_gpu_tensor_storage(backend, device):
     handle = ninetoothed.make(
         _arrangement,
         _application,
         tuple(Tensor(shape=(1 << 20,), dtype=ninetoothed.float32) for _ in range(3)),
-        backend="triton",
+        backend=backend,
         kernel_name=f"runtime_weak_cache_{uuid.uuid4().hex}",
     )
     warm_input = torch.randn(1 << 20, device=device)

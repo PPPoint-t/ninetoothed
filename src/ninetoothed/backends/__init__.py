@@ -5,11 +5,15 @@ from dataclasses import replace
 from ninetoothed.backends.core import (
     Artifact,
     Backend,
+    BackendDeviceContractError,
     BuiltArtifact,
     Capability,
     Registry,
     Target,
+    backend_supports_device,
     normalize_target,
+    supported_device_types,
+    validate_backend_device,
 )
 from ninetoothed.ir import Kernel
 
@@ -107,10 +111,12 @@ def backend_capabilities() -> tuple[Capability, ...]:
 
 __all__ = [
     "Backend",
+    "BackendDeviceContractError",
     "BuiltArtifact",
     "Artifact",
     "Capability",
     "Target",
+    "backend_supports_device",
     "Registry",
     "Kernel",
     "backend_capabilities",
@@ -118,4 +124,6 @@ __all__ = [
     "default_registry",
     "emit",
     "normalize_target",
+    "supported_device_types",
+    "validate_backend_device",
 ]

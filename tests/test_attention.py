@@ -5,7 +5,7 @@ import torch.nn.functional as F
 import ninetoothed
 import ninetoothed.language as ntl
 from ninetoothed import Tensor
-from tests.utils import get_available_devices
+from tests.utils import backend_for_device, get_available_devices
 
 BLOCK_SIZE_M = ninetoothed.block_size(lower_bound=64, upper_bound=128)
 BLOCK_SIZE_N = ninetoothed.block_size(lower_bound=32, upper_bound=64)
@@ -70,7 +70,7 @@ def application(q, k, v, is_causal, o):
     o = acc  # noqa: F841
 
 
-def attention(q, k, v, is_causal=False):
+def attention(q, k, v, is_causal=False, *, backend=None):
     o = torch.empty_like(q, dtype=v.dtype)
 
     q_, k_, v_, o_ = (
@@ -89,7 +89,9 @@ def attention(q, k, v, is_causal=False):
 
     tensors = (q_, k_, v_, is_causal_, o_)
 
-    attention_kernel = ninetoothed.make(arrangement, application, tensors)
+    attention_kernel = ninetoothed.make(
+        arrangement, application, tensors, backend=backend
+    )
 
     attention_kernel(q, k, v, is_causal, o)
 
@@ -111,7 +113,9 @@ def test(batch_size, num_heads, seq_len, emb_dim, dtype, device, is_causal, rtol
         for _ in range(3)
     )
 
-    output = attention(q, k, v, is_causal=is_causal)
+    output = attention(
+        q, k, v, is_causal=is_causal, backend=backend_for_device(device)
+    )
     expected = F.scaled_dot_product_attention(q, k, v, is_causal=is_causal, scale=1)
 
     assert torch.allclose(output, expected, rtol=rtol, atol=atol)

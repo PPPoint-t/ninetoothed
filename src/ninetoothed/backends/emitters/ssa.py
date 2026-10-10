@@ -403,11 +403,19 @@ def _render_source(
     )
 
     has_dot = any(op.opcode in {"linalg.dot", "linalg.matmul"} for op in walked_ops)
+    native_block_program = bool(
+        target.native_block_matmul
+        and split_outer_inner
+        and len(value_axes) == 2
+        and has_dot
+        and program.metadata.get("optimization", {}).get("preserve_linalg")
+    )
     vector_block_program = bool(
         target.vector_value_semantics
         and split_outer_inner
         and len(value_axes) == 2
         and has_dot
+        and not native_block_program
     )
     vector_scalar_program = bool(
         target.vector_value_semantics and primary_atomic is not None and not value_axes
@@ -425,14 +433,6 @@ def _render_source(
         and not vector_block_program
         and not cooperative_reduction_program
     )
-    native_block_program = bool(
-        target.native_block_matmul
-        and split_outer_inner
-        and len(value_axes) == 2
-        and has_dot
-        and program.metadata.get("optimization", {}).get("preserve_linalg")
-    )
-
     if vector_scalar_program:
         axes = outer_axes
         total = _target_index_expr(target, _product(outer_axes))
@@ -461,13 +461,25 @@ def _render_source(
     elif native_block_program:
         axes = value_axes
         total = _target_index_expr(target, _product(value_axes))
-        tile_rows = f"(({value_axes[0]}) + 15) / 16"
-        tile_cols = f"(({value_axes[1]}) + 15) / 16"
-        grid_total = _target_index_expr(
-            target, f"({_product(outer_axes)}) * ({tile_rows}) * ({tile_cols})"
-        )
-        outer_index_expr = "nt_outer_index"
-        inner_index_expr = f"(nt_matrix_row) * ({value_axes[1]}) + nt_matrix_col"
+        domain = target.native_program_domain(kernel, value_axes, outer_axes)
+        if domain is None:
+            # Preserve the pre-existing C-style native renderer contract. Its
+            # renderer owns the actual block/thread coordinates; these generic
+            # expressions are only used to construct the shared context.
+            if target.vector_value_semantics:
+                raise ValueError(
+                    f"{type(target).__name__} enabled vector native blocks "
+                    "without providing a target-owned native program domain."
+                )
+            tile_rows = f"(({value_axes[0]}) + 15) / 16"
+            tile_cols = f"(({value_axes[1]}) + 15) / 16"
+            grid_total = _target_index_expr(
+                target, f"({_product(outer_axes)}) * ({tile_rows}) * ({tile_cols})"
+            )
+            outer_index_expr = "nt_outer_index"
+            inner_index_expr = f"(nt_matrix_row) * ({value_axes[1]}) + nt_matrix_col"
+        else:
+            grid_total, outer_index_expr, inner_index_expr = domain
     elif split_outer_inner:
         axes = value_axes
         inner_total = _product(value_axes)
@@ -806,6 +818,8 @@ def _render_body(
         ),
         reduction_schedule=reduction_schedule,
     )
+
+    target.initialize_emit_context(ctx)
 
     if cooperative_reduction_program:
         _emit_cooperative_reduction_program(operations, ctx)
@@ -1180,6 +1194,10 @@ def _emit_value(name: str, ctx: _EmitContext) -> str:
 
         return ctx.memo[name]
 
+    specialized = ctx.target.emit_operation_expression(
+        op, _current_coords(_value_axes(name, ctx), ctx), ctx
+    )
+
     if op.opcode == "scf.if":
         if len(op.results) > 1:
             _emit_scf_if_results(op, ctx)
@@ -1187,6 +1205,8 @@ def _emit_value(name: str, ctx: _EmitContext) -> str:
             return ctx.memo[name]
 
         expr = _scf_if_expr(op, ctx)
+    elif specialized is not None:
+        expr = specialized
     elif (
         not ctx.target.vector_value_semantics
         and op.results
@@ -1545,7 +1565,11 @@ def _emit_element(name: str, coords: tuple[str, ...], ctx: _EmitContext) -> str:
     if ctx.bindings and name in ctx.bindings and not coords:
         return ctx.bindings[name]
 
-    if name in ctx.memo and coords == _current_coords(_value_axes(name, ctx), ctx):
+    if (
+        name in ctx.memo
+        and coords == _current_coords(_value_axes(name, ctx), ctx)
+        and ctx.target.can_reuse_element(name, coords, ctx)
+    ):
         return ctx.memo[name]
 
     if not name.startswith("%"):
@@ -1557,6 +1581,10 @@ def _emit_element(name: str, coords: tuple[str, ...], ctx: _EmitContext) -> str:
 
     if op is None:
         return _emit_value(name, ctx)
+
+    specialized = ctx.target.emit_operation_expression(op, coords, ctx)
+    if specialized is not None:
+        return specialized
 
     if op.opcode == "arith.constant":
         return ctx.target.literal(op.attrs.get("value"))
@@ -2414,7 +2442,12 @@ def _emit_scf_for(local: str, op: ssa.Operation, ctx: _EmitContext) -> str | Non
         initial_name = str(attr["initial"])
         init = _emit_value(initial_name, ctx)
 
-        if (
+        specialized = ctx.target.loop_state_initializer(
+            value, init, _loop_initializer_dtype(initial_name, value, ctx), ctx
+        )
+        if specialized is not None:
+            init = specialized
+        elif (
             ctx.target.vector_value_semantics
             and ctx.mask_expr is not None
             and ctx.target.needs_block_init(initial_name, value, ctx)
@@ -4033,6 +4066,7 @@ default_strides = _default_strides
 dot_accumulator_dtype = _dot_accumulator_dtype
 dtype_level = _dtype_level
 emit_element = _emit_element
+emit_index_value = _emit_index_value
 emit_loop_bound = _emit_loop_bound
 emit_operation = _emit_operation
 emit_value = _emit_value
@@ -4070,6 +4104,7 @@ __all__ = [
     "dtype_level",
     "emit",
     "emit_element",
+    "emit_index_value",
     "emit_loop_bound",
     "emit_operation",
     "emit_value",

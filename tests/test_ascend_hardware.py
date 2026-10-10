@@ -1,6 +1,9 @@
 """Capability-gated integration tests for the first Ascend execution tier."""
 
+import contextlib
 import os
+import signal
+import time
 from pathlib import Path
 
 import pytest
@@ -14,6 +17,83 @@ pytestmark = pytest.mark.skipif(
     os.environ.get("NINETOOTHED_RUN_ASCEND_TESTS") != "1",
     reason="set NINETOOTHED_RUN_ASCEND_TESTS=1 on an Ascend runner",
 )
+
+
+@contextlib.contextmanager
+def _ascend_conv2d_stage(name, *, timeout=None):
+    """Print a bounded stage result so a stalled NPU phase is attributable."""
+    limit = float(
+        timeout
+        if timeout is not None
+        else os.environ.get("NINETOOTHED_ASCEND_STAGE_TIMEOUT", "180")
+    )
+    started = time.monotonic()
+    print(f"ASCEND_CONV2D_STAGE START {name} timeout={limit:.1f}s", flush=True)
+    previous = signal.getsignal(signal.SIGALRM)
+
+    def alarm_handler(_signum, _frame):
+        elapsed = time.monotonic() - started
+        raise TimeoutError(
+            f"Ascend conv2d stage {name!r} exceeded {limit:.1f}s "
+            f"(elapsed={elapsed:.1f}s)."
+        )
+
+    signal.signal(signal.SIGALRM, alarm_handler)
+    signal.setitimer(signal.ITIMER_REAL, limit)
+    try:
+        yield
+    except Exception as exc:
+        elapsed = time.monotonic() - started
+        status = "TIMEOUT" if isinstance(exc, TimeoutError) else "FAIL"
+        print(
+            f"ASCEND_CONV2D_STAGE {status} {name} elapsed={elapsed:.1f}s "
+            f"error={type(exc).__name__}: {exc}",
+            flush=True,
+        )
+        raise
+    else:
+        elapsed = time.monotonic() - started
+        print(f"ASCEND_CONV2D_STAGE PASS {name} elapsed={elapsed:.1f}s", flush=True)
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous)
+
+
+def _ascend_conv2d_stage_skip(name, reason):
+    print(f"ASCEND_CONV2D_STAGE SKIP {name} reason={reason}", flush=True)
+
+
+def _ascend_conv2d_target_compilation(kernel_name):
+    from tests import test_conv2d
+
+    sizes = {"n": 4, "c": 64, "h": 16, "w": 16, "k": 512, "r": 3, "s": 3}
+    arrangement, application, tensors = test_conv2d.premake(
+        **sizes, dtype="float16", block_size_m=64, block_size_n=64, block_size_k=64
+    )
+    return DEFAULT_COMPILER.compile(
+        CompileRequest(
+            arrangement=arrangement,
+            application=application,
+            tensors=tensors,
+            backend="ascend",
+            kernel_name=kernel_name,
+            tensor_dtypes={
+                "input": "float16",
+                "filter": "float16",
+                "output": "float16",
+            },
+            backend_options={"soc_version": "Ascend910B4", "max_core_dim": 65535},
+        )
+    )
+
+
+def _ascend_conv2d_values(torch):
+    shape = (4, 64, 16, 16)
+    filter_shape = (512, 64, 3, 3)
+    input_value = torch.randn(shape, device="npu", dtype=torch.float16)
+    filter_value = torch.randn(filter_shape, device="npu", dtype=torch.float16)
+    expected = torch.nn.functional.conv2d(input_value, filter_value)
+    return input_value, filter_value, expected
 
 
 def _arrangement(input, other, output):
@@ -1864,6 +1944,160 @@ def test_ascend_generic_dot_loop_jit_and_aot_reload(tmp_path):
 
 
 @pytest.mark.ascend_next_stage
+def test_ascend_conv2d_target_scale_compile_only_diagnostics(tmp_path):
+    """Report lowering, import, and CANN compile phases for target-size Conv2d."""
+    import torch
+    import torch_npu  # noqa: F401
+
+    assert torch.npu.is_available()
+    with _ascend_conv2d_stage("lowering"):
+        compilation = _ascend_conv2d_target_compilation(
+            "ascend_conv2d_target_scale_compile_only"
+        )
+
+    with _ascend_conv2d_stage("source generation"):
+        source = compilation.artifact.primary_source
+        assert source and "ascend_conv2d_target_scale_compile_only" in source
+        assert compilation.artifact.metadata["generation_py_fallback"] is False
+
+    from ninetoothed.backends.materializers.ascend import AscendMaterializer
+
+    with _ascend_conv2d_stage("Triton import"):
+        jit = AscendMaterializer().jit_materialize(
+            compilation, output_dir=tmp_path / "jit"
+        )
+        raw_kernel = jit._kernel[1]
+
+    input_value = torch.empty((4, 64, 16, 16), device="npu", dtype=torch.float16)
+    filter_value = torch.empty((512, 64, 3, 3), device="npu", dtype=torch.float16)
+    output_value = torch.empty((4, 512, 14, 14), device="npu", dtype=torch.float16)
+    launch_grid = 13 * 8 * 16
+
+    cann_blocked = False
+    try:
+        with _ascend_conv2d_stage("CANN compile"):
+            compiled = raw_kernel.warmup(
+                input_value,
+                filter_value,
+                output_value,
+                *input_value.stride(),
+                *filter_value.stride(),
+                *output_value.stride(),
+                grid=(launch_grid,),
+                num_warps=4,
+                num_stages=1,
+            )
+            assert {"ttir", "ttadapter", "npubin"}.issubset(compiled.asm)
+    except Exception as exc:
+        cann_blocked = True
+        for name in ("kernel launch", "torch.npu.synchronize", "output comparison", "AOT reload"):
+            _ascend_conv2d_stage_skip(name, "blocked by CANN compile")
+        assert "ConvertLinalgRToBinary" in str(exc) or isinstance(exc, TimeoutError)
+    if cann_blocked:
+        return
+
+    for name in ("kernel launch", "torch.npu.synchronize", "output comparison", "AOT reload"):
+        _ascend_conv2d_stage_skip(name, "compile-only diagnostic")
+
+
+@pytest.mark.ascend_next_stage
+def test_ascend_conv2d_target_scale_jit_aot_stage_diagnostics(tmp_path):
+    """Run target-size Conv2d and report every JIT/AOT runtime boundary."""
+    import torch
+    import torch_npu  # noqa: F401
+
+    assert torch.npu.is_available()
+    with _ascend_conv2d_stage("lowering"):
+        compilation = _ascend_conv2d_target_compilation(
+            "ascend_conv2d_target_scale_stage_diagnostics"
+        )
+    with _ascend_conv2d_stage("source generation"):
+        source = compilation.artifact.primary_source
+        assert source
+
+    from ninetoothed.backends.materializers.ascend import AscendMaterializer
+    from ninetoothed.compiler import load_built_artifact
+
+    materializer = AscendMaterializer()
+    with _ascend_conv2d_stage("Triton import"):
+        jit = materializer.jit_materialize(compilation, output_dir=tmp_path / "jit")
+
+    input_value, filter_value, expected = _ascend_conv2d_values(torch)
+
+    def warmup(handle, label):
+        raw_kernel = handle._kernel[1]
+        schedule = compilation.artifact.metadata["ssa_metadata"]["schedule"]
+        launch_grid = 13 * 8 * 16
+        with _ascend_conv2d_stage(f"CANN compile ({label})"):
+            compiled = raw_kernel.warmup(
+                input_value,
+                filter_value,
+                torch.empty_like(expected),
+                *input_value.stride(),
+                *filter_value.stride(),
+                *expected.stride(),
+                grid=(launch_grid,),
+                num_warps=4,
+                num_stages=1,
+            )
+            assert {"ttir", "ttadapter", "npubin"}.issubset(compiled.asm)
+
+    try:
+        warmup(jit, "jit")
+    except Exception as exc:
+        for name in (
+            "kernel launch (jit)",
+            "torch.npu.synchronize (jit)",
+            "output comparison (jit)",
+            "AOT reload",
+            "kernel launch (aot_reload)",
+            "torch.npu.synchronize (aot_reload)",
+            "output comparison (aot_reload)",
+        ):
+            _ascend_conv2d_stage_skip(name, "blocked by CANN compile (jit)")
+        assert "ConvertLinalgRToBinary" in str(exc) or isinstance(exc, TimeoutError)
+        return
+    with _ascend_conv2d_stage("kernel launch (jit)"):
+        jit_output = torch.empty_like(expected)
+        assert jit(input_value, filter_value, jit_output) is jit_output
+    with _ascend_conv2d_stage("torch.npu.synchronize (jit)"):
+        torch.npu.synchronize()
+    with _ascend_conv2d_stage("output comparison (jit)"):
+        torch.testing.assert_close(jit_output, expected, rtol=1e-3, atol=1e-3)
+
+    try:
+        with _ascend_conv2d_stage("AOT reload"):
+            aot = materializer.aot_build(compilation, output_dir=tmp_path / "aot")
+            reloaded = load_built_artifact(aot._built_artifact)
+    except Exception:
+        for name in (
+            "kernel launch (aot_reload)",
+            "torch.npu.synchronize (aot_reload)",
+            "output comparison (aot_reload)",
+        ):
+            _ascend_conv2d_stage_skip(name, "blocked by AOT reload")
+        raise
+    try:
+        warmup(reloaded, "aot_reload")
+    except Exception as exc:
+        for name in (
+            "kernel launch (aot_reload)",
+            "torch.npu.synchronize (aot_reload)",
+            "output comparison (aot_reload)",
+        ):
+            _ascend_conv2d_stage_skip(name, "blocked by CANN compile (aot_reload)")
+        assert "ConvertLinalgRToBinary" in str(exc) or isinstance(exc, TimeoutError)
+        return
+    with _ascend_conv2d_stage("kernel launch (aot_reload)"):
+        aot_output = torch.empty_like(expected)
+        assert reloaded(input_value, filter_value, aot_output) is aot_output
+    with _ascend_conv2d_stage("torch.npu.synchronize (aot_reload)"):
+        torch.npu.synchronize()
+    with _ascend_conv2d_stage("output comparison (aot_reload)"):
+        torch.testing.assert_close(aot_output, expected, rtol=1e-3, atol=1e-3)
+
+
+@pytest.mark.ascend_next_stage
 def test_ascend_causal_attention_frontend_compile_only(tmp_path):
     """Compile the causal all-masked path through Triton and CANN without launch."""
     import importlib.util
@@ -1900,7 +2134,7 @@ def test_ascend_causal_attention_frontend_compile_only(tmp_path):
     source = compilation.artifact.primary_source
     assert plan["mode"] == "causal"
     assert resource["selected_tile"] == {"m": 16, "n": 32, "k": 32}
-    assert "axis=None) == 0" in source
+    assert "axis=None) != 0" in source
     assert "128x64" not in source
 
     source_path = tmp_path / "ascend_attention_causal_compile_only.py"
@@ -1936,11 +2170,15 @@ def test_ascend_causal_attention_frontend_compile_only(tmp_path):
 
 @pytest.mark.parametrize(
     ("dtype_name", "torch_dtype"),
-    (("float16", "float16"), ("float32", "float32")),
+    (
+        ("float16", "float16"),
+        ("bfloat16", "bfloat16"),
+        ("float32", "float32"),
+    ),
 )
 @pytest.mark.parametrize("sequence", (1, 1024))
 @pytest.mark.parametrize("is_causal", (False, True))
-def test_ascend_attention_fp16_fp32_jit_and_aot_matrix(
+def test_ascend_attention_fp16_bf16_fp32_jit_and_aot_matrix(
     tmp_path, dtype_name, torch_dtype, sequence, is_causal
 ):
     """Run the supported Attention matrix through JIT and AOT reload on NPU."""

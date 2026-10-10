@@ -1,8 +1,9 @@
 """Ascend Triton syntax hooks for the initial SSA emitter tier."""
 
+import ast
 import re
 from dataclasses import dataclass, replace
-from typing import Iterable
+from typing import Iterable, Mapping
 
 from ninetoothed.backends.ascend import (
     ASCEND_ELEMENTWISE_DTYPES,
@@ -23,8 +24,78 @@ from ninetoothed.backends.emitters.triton import TritonTarget
 from ninetoothed.ir import Kernel, ssa
 
 _access_template = common.access_template
+_access_axes = common.access_axes
+_combined_mask = common.combined_mask
 _current_coords = common.current_coords
+_dtype_level = common.dtype_level
+_emit_element = common.emit_element
+_emit_index_value = common.emit_index_value
+_indent_lines = common.indent_lines
+_load_other = common.load_other
+_local_symbol = common.local_symbol
+_product = common.product
+_source_index_for_value = common.source_index_for_value
+_target_index_expr = common.target_index_expr
 _value_axes = common.value_axes
+
+
+class _Conv2dIndexSimplifier(ast.NodeTransformer):
+    """Fold only algebraic identities in generated Conv2d pointer math."""
+
+    def visit_BinOp(self, node):  # noqa: N802 - ast visitor API
+        node = self.generic_visit(node)
+        left, right = node.left, node.right
+        if isinstance(right, ast.Constant) and right.value == 0:
+            if isinstance(node.op, (ast.Add, ast.Sub)):
+                return left
+            if isinstance(node.op, ast.Mult):
+                return ast.Constant(value=0)
+        if isinstance(right, ast.Constant) and right.value == 1:
+            if isinstance(node.op, (ast.Mult, ast.FloorDiv)):
+                return left
+            if isinstance(node.op, ast.Mod):
+                return ast.Constant(value=0)
+        if isinstance(left, ast.Constant) and left.value == 0:
+            if isinstance(node.op, ast.Add):
+                return right
+            if isinstance(node.op, ast.Mult):
+                return ast.Constant(value=0)
+        if isinstance(left, ast.Constant) and left.value == 1:
+            if isinstance(node.op, ast.Mult):
+                return right
+        if isinstance(left, ast.Constant) and isinstance(right, ast.Constant):
+            try:
+                if isinstance(node.op, ast.Add):
+                    return ast.Constant(value=left.value + right.value)
+                if isinstance(node.op, ast.Sub):
+                    return ast.Constant(value=left.value - right.value)
+                if isinstance(node.op, ast.Mult):
+                    return ast.Constant(value=left.value * right.value)
+                if isinstance(node.op, ast.FloorDiv):
+                    return ast.Constant(value=left.value // right.value)
+                if isinstance(node.op, ast.Mod):
+                    return ast.Constant(value=left.value % right.value)
+            except (ArithmeticError, TypeError):
+                pass
+        return node
+
+
+def _simplify_conv2d_index_expr(expression: str) -> str:
+    """Remove broadcast-neutral terms before Triton infers matrix layouts.
+
+    Access templates intentionally retain generic rank-4 provenance.  Their
+    algebra is correct, but expressions such as ``lane % 1`` and ``0 * row``
+    introduce extra broadcast dimensions in the Ascend AST.  Folding these
+    identities preserves the address while producing the same scalar/vector
+    form as the verified native Conv2d kernel.
+    """
+    try:
+        tree = ast.parse(str(expression), mode="eval")
+        tree = _Conv2dIndexSimplifier().visit(tree)
+        ast.fix_missing_locations(tree)
+        return ast.unparse(tree.body)
+    except (SyntaxError, ValueError):
+        return str(expression)
 
 
 def _unsupported_attention_emission(reason: str) -> UnsupportedBackendOpError:
@@ -115,6 +186,57 @@ class AscendTarget(TritonTarget):
     suffix: str = "ascend.py"
     source_route: str = "ssa-unified-ascend-triton-emitter"
     default_load_mask: bool = False
+    native_block_matmul: bool = True
+
+    def native_program_domain(self, kernel, axes, outer_axes):
+        schedule = kernel.ssa.metadata.get("schedule", {}) if kernel.ssa else {}
+        access = schedule.get("ascend_access_template_resources", {})
+        tile = access.get("tile", {}) if isinstance(access, Mapping) else {}
+        scheduled_tile = schedule.get("tile", {})
+        m = int(tile.get("m", scheduled_tile.get("block_m", 16)))
+        n = int(tile.get("n", scheduled_tile.get("block_n", 16)))
+        rows = f"triton.cdiv({axes[0]}, {m})"
+        cols = f"triton.cdiv({axes[1]}, {n})"
+        retile = schedule.get("ascend_attention_retile", {})
+        grid = retile.get("grid") if isinstance(retile, Mapping) else None
+        if not grid:
+            grid = f"({_product(outer_axes)}) * ({rows}) * ({cols})"
+        return str(grid), "nt_outer_index", f"(nt_matrix_row) * ({axes[1]}) + nt_matrix_col"
+
+    def initialize_emit_context(self, context) -> None:
+        """Install Ascend native tile coordinates before SSA traversal."""
+        if not context.native_block_program or len(context.output_axes) != 2:
+            return
+        schedule = context.kernel.ssa.metadata.get("schedule", {})
+        access = schedule.get("ascend_access_template_resources", {})
+        tile = access.get("tile", {}) if isinstance(access, Mapping) else {}
+        scheduled_tile = schedule.get("tile", {})
+        m = int(tile.get("m", scheduled_tile.get("block_m", 16)))
+        n = int(tile.get("n", scheduled_tile.get("block_n", 16)))
+        rows = f"triton.cdiv({context.output_axes[0]}, {m})"
+        cols = f"triton.cdiv({context.output_axes[1]}, {n})"
+        context.lines.extend(
+            [
+                "nt_native_program = tl.program_id(0)",
+                f"nt_tile_rows = {rows}",
+                f"nt_tile_cols = {cols}",
+                "nt_tiles_per_outer = nt_tile_rows * nt_tile_cols",
+                "nt_outer_index = nt_native_program // nt_tiles_per_outer",
+                "nt_tile_index = nt_native_program % nt_tiles_per_outer",
+                f"nt_tile_row = (nt_tile_index // nt_tile_cols) * {m}",
+                f"nt_tile_col = (nt_tile_index % nt_tile_cols) * {n}",
+                f"nt_matrix_row = nt_tile_row + tl.arange(0, {m})[:, None]",
+                f"nt_matrix_col = nt_tile_col + tl.arange(0, {n})[None, :]",
+                f"nt_matrix_active = (nt_matrix_row < {context.output_axes[0]}) & (nt_matrix_col < {context.output_axes[1]})",
+            ]
+        )
+        context.outer_index_expr = "nt_outer_index"
+        context.inner_index_expr = f"(nt_matrix_row) * ({context.output_axes[1]}) + nt_matrix_col"
+        context.index_expr = context.inner_index_expr
+        context.coordinate_exprs = ("nt_matrix_row", "nt_matrix_col")
+        context.row_expr = "nt_matrix_row"
+        context.col_expr = "nt_matrix_col"
+        context.mask_expr = "nt_matrix_active"
 
     def store_address_plan(
         self,
@@ -125,6 +247,25 @@ class AscendTarget(TritonTarget):
         context,
     ) -> StoreAddressPlan:
         """Provide coordinates for complete multidimensional Ascend stores."""
+        # Conv2d is emitted as a grid of physical 16x16 native matrix
+        # programs.  The SSA result still carries the logical outer
+        # application shape (for example 64x64), so the generic store path
+        # would flatten ``nt_matrix_row/col`` back through a 16-wide view and
+        # scramble the NCHW output mapping.  Keep the source access template
+        # responsible for NCHW strides, but pass the native matrix coordinates
+        # through unchanged.
+        schedule = context.kernel.ssa.metadata.get("schedule", {})
+        access = schedule.get("ascend_access_template_resources", {})
+        if (
+            isinstance(access, Mapping)
+            and access.get("operator") == "conv2d-im2col"
+            and str(getattr(tensor_info, "name", "")).lower() in {"output", "out"}
+        ):
+            return StoreAddressPlan(
+                value_coords=("nt_matrix_row", "nt_matrix_col"),
+                mask_coords=("nt_matrix_row", "nt_matrix_col"),
+                source="ascend-conv2d-native-tile",
+            )
         template = _access_template(tensor_info, level)
         if template is None:
             return StoreAddressPlan()
@@ -140,6 +281,332 @@ class AscendTarget(TritonTarget):
             mask_coords=coords,
             source="target",
         )
+
+    def emit_block_dot(self, operation, context, coords=None):
+        """Render the verified Conv2d dot as one physical M/N/K tile."""
+        schedule = context.kernel.ssa.metadata.get("schedule", {})
+        access = schedule.get("ascend_access_template_resources", {})
+        if not isinstance(access, dict) and not hasattr(access, "get"):
+            return None
+        if access.get("operator") != "conv2d-im2col":
+            return None
+        tile = access.get("tile", {})
+        m = int(tile.get("m", 16))
+        n = int(tile.get("n", 16))
+        k = int(tile.get("k", 16))
+        if len(operation.operands) < 2:
+            return None
+        row = "nt_matrix_row"
+        col = "nt_matrix_col"
+        lhs_type = context.value_types.get(operation.operands[0])
+        true_k = k
+        if lhs_type is not None and len(lhs_type.shape) == 2:
+            try:
+                true_k = int(str(lhs_type.shape[-1]))
+            except (TypeError, ValueError):
+                true_k = k
+        # Keep K tiling as a real loop, matching the verified raw Ascend
+        # kernel.  Statically unrolling the K chunks into the surrounding
+        # Conv2d reduction loop changes CANN's fragment-layout propagation and
+        # yields a transposed logical matrix even though each isolated dot is
+        # numerically correct.
+        local = f"{_local_symbol(operation.results[0].name, context)}_native"
+        context.lines.append(
+            context.target.local_decl(
+                ssa.Type(kind="tensor", shape=(str(m), str(n)), dtype="float32"),
+                local,
+                f"tl.zeros(({m}, {n}), tl.float32)",
+            )
+        )
+        k_loop = "nt_conv_k"
+        inner_lines = []
+        inner_context = context.child(
+            lines=inner_lines,
+            memo=dict(context.memo),
+            local_suffix=f"{context.local_suffix}_conv_k",
+        )
+        lhs_lane = f"({k_loop} + tl.arange(0, {k}))[None, :]"
+        rhs_lane = f"({k_loop} + tl.arange(0, {k}))[:, None]"
+        # The generic access-template mask contains every source-view
+        # predicate (including broadcasted rank-4 coordinates).  On Ascend
+        # that expression is legal Triton, but its large boolean tree is
+        # lowered together with the cube operand and can change inferred
+        # matrix layout.  Keep only physical tile/K bounds; the pointer still
+        # comes from the complete source access template.
+        lhs = self._emit_conv2d_dot_load(
+            operation.operands[0],
+            (row, lhs_lane),
+            inner_context,
+            role="lhs",
+            row=row,
+            col=col,
+            true_k=true_k,
+        )
+        rhs = self._emit_conv2d_dot_load(
+            operation.operands[1],
+            (rhs_lane, col),
+            inner_context,
+            role="rhs",
+            row=row,
+            col=col,
+            true_k=true_k,
+        )
+        inner_lines.append(f"{local} = {local} + tl.dot({lhs}, {rhs})")
+        context.lines.append(f"for {k_loop} in range(0, {true_k}, {k}):")
+        context.lines.extend(_indent_lines(inner_lines, context.target))
+        return local
+
+    def _emit_conv2d_dot_load(
+        self,
+        name,
+        coords,
+        context,
+        *,
+        role,
+        row,
+        col,
+        true_k,
+    ):
+        """Load one native Conv2d dot operand with a physical tile mask."""
+        operation = context.operations.get(name)
+        base = name
+        extract_indices = ()
+        if operation is not None and operation.opcode == "tensor.extract":
+            base = operation.operands[0]
+            extract_indices = tuple(
+                _emit_index_value(operand, context)
+                for operand in operation.operands[1:]
+            )
+        info = context.tensor_infos.get(base)
+        if info is None:
+            return common.emit_element(name, coords, context)
+        level = _dtype_level(base, context)
+        if operation is not None and operation.results:
+            level = int(
+                operation.results[0].type.attrs.get("dtype_level", level)
+            )
+        axes = _access_axes(
+            info, context, level, fallback=_value_axes(base, context)
+        )
+        view_index = common.linearized_index(coords, axes) if coords else "0"
+        source_index = _target_index_expr(
+            context.target,
+            _source_index_for_value(
+                info,
+                view_index,
+                context,
+                level=level,
+                extract_indices=extract_indices,
+                value_coords=coords,
+            ),
+        )
+        source_index = _simplify_conv2d_index_expr(source_index)
+        if role == "lhs":
+            mask = f"(({row}) < ({context.output_axes[0]})) & (({coords[1]}) < ({true_k}))"
+        else:
+            mask = f"(({col}) < ({context.output_axes[1]})) & (({coords[0]}) < ({true_k}))"
+        schedule = context.kernel.ssa.metadata.get("schedule", {})
+        access = schedule.get("ascend_access_template_resources", {})
+        if isinstance(access, Mapping) and access.get("padding_coordinates"):
+            mask = _combined_mask(
+                context.target,
+                None,
+                info,
+                view_index,
+                ctx=context,
+                level=level,
+                extract_indices=extract_indices,
+                value_coords=coords,
+            ) or mask
+        return context.target.load(
+            base,
+            source_index,
+            mask=mask,
+            other=_load_other(info),
+        )
+
+    def emit_operation_expression(self, operation, coords, context):
+        """Handle Ascend-only physical-domain expressions at one generic hook."""
+        if operation.opcode.startswith("cmp."):
+            return self._emit_score_mask(operation, coords, context)
+        if operation.opcode == "select.where":
+            return self._emit_score_where(operation, coords, context)
+        return None
+
+    def can_reuse_element(self, name, coords, context):
+        # A tagged score predicate must be rebuilt for its requested M/N
+        # coordinates; reusing a producer cached in the Q/K head-dimension
+        # domain recreates the original (M,64) versus (M,N) mismatch.
+        return not self._is_score_mask_value(name, context)
+
+    def _attention_score_coords(self, context, score_shape, coords):
+        schedule = context.kernel.ssa.metadata.get("schedule", {}) if getattr(context, "kernel", None) is not None else {}
+        retile = schedule.get("ascend_attention_retile", {})
+        sequence = str(retile.get("sequence", "1024"))
+        m, n = score_shape
+        query_tiles = f"(({sequence} + {int(m) - 1}) // {int(m)})" if str(m).isdigit() else f"triton.cdiv({sequence}, {m})"
+        query = f"((tl.program_id(0) % {query_tiles}) * {m} + tl.arange(0, {m}))"
+        reduce_index = str(getattr(context, "reduce_index", "") or "0")
+        if reduce_index == "0":
+            suffix = str(getattr(context, "local_suffix", ""))
+            if "_body" in suffix:
+                reduce_index = suffix.lstrip("_").split("_body", 1)[0] + "_i"
+        key = f"(({reduce_index}) * {n} + tl.arange(0, {n}))"
+        return query, key
+
+    def _emit_score_mask(self, operation, coords, context):
+        attrs = operation.attrs
+        score_domain = attrs.get("ascend_attention_mask") == "score-key-bounds"
+        if not score_domain and operation.opcode == "cmp.ge":
+            schedule = context.kernel.ssa.metadata.get("schedule", {}) if getattr(context, "kernel", None) is not None else {}
+            score_domain = bool(schedule.get("ascend_attention_retile"))
+        if not score_domain and attrs.get("predicate_source") != "K.access-template.bounds":
+            # bounds_valid is an identity select around the original K
+            # predicate.  The producer carries the score contract even when
+            # the comparison itself was not reached by the private retile.
+            for candidate in context.operations.values():
+                if candidate.opcode == "select.where" and candidate.results and operation.results:
+                    if operation.results[0].name in candidate.operands and candidate.attrs.get("ascend_attention_mask") == "bounds_valid":
+                        score_domain = True
+                        attrs = candidate.attrs
+                        break
+        if not score_domain:
+            return None
+        score_shape = tuple(str(dim) for dim in attrs.get("score_shape", ()))
+        if not score_shape and getattr(context, "kernel", None) is not None:
+            plan = context.kernel.ssa.metadata.get("schedule", {}).get("ascend_attention_plan", {})
+            score_shape = tuple(str(dim) for dim in plan.get("dot_tiles", {}).get("qk", {}).get("tile_shapes", {}).get("result", ()))
+        if operation.opcode not in {"cmp.lt", "cmp.ge"} or len(score_shape) != 2 or not coords:
+            raise UnsupportedBackendOpError(
+                "Ascend Attention score mask contract is incomplete.",
+                reason=f"opcode={operation.opcode!r}, score_shape={score_shape!r}, coords={coords!r}.",
+                suggestion="preserve score mask provenance from the canonical resource plan.",
+            )
+        sequence = str(attrs.get("sequence", ""))
+        if not sequence and getattr(context, "kernel", None) is not None:
+            sequence = str(context.kernel.ssa.metadata.get("schedule", {}).get("ascend_attention_retile", {}).get("sequence", ""))
+        if not sequence:
+            raise UnsupportedBackendOpError(
+                "Ascend Attention score mask has no source sequence extent.",
+                reason="the score bounds operation omitted its source dimension.",
+                suggestion="attach K source sequence extent during structured retile.",
+            )
+        key_coord = coords[-1]
+        if operation.opcode == "cmp.ge" and len(coords) >= 2:
+            query_coord, key_coord = self._attention_score_coords(context, score_shape, coords)
+            return f"(({query_coord})[:, None] >= ({key_coord})[None, :])"
+        if operation.opcode == "cmp.lt":
+            _, key_coord = self._attention_score_coords(context, score_shape, coords)
+        return f"(({key_coord}) < ({sequence}))"
+
+    def _is_score_mask_value(self, name, context):
+        """Recognize only values on an explicitly tagged score-mask chain."""
+        seen = set()
+        pending = [name]
+        while pending:
+            value = pending.pop()
+            if value in seen:
+                continue
+            seen.add(value)
+            operation = context.operations.get(value)
+            if operation is None:
+                continue
+            attrs = operation.attrs
+            if attrs.get("score_mask_role") == "qk-score-bounds":
+                return True
+            if attrs.get("ascend_attention_mask") in {
+                "bounds_valid",
+                "score-key-bounds",
+                "key_valid",
+            }:
+                return True
+            pending.extend(operation.operands)
+        return False
+
+    def _emit_score_where(self, operation, coords, context):
+        is_bounds = operation.attrs.get("ascend_attention_mask") == "bounds_valid" or operation.attrs.get("score_mask_role") == "qk-score-bounds"
+        if not is_bounds and operation.operands:
+            producer = context.operations.get(operation.operands[0])
+            producer_is_bounds = producer is not None and (
+                producer.attrs.get("ascend_attention_mask") == "bounds_valid"
+                or producer.attrs.get("score_mask_role") == "qk-score-bounds"
+            )
+            is_identity = (
+                len(operation.operands) == 3
+                and operation.operands[1] == operation.operands[2]
+            )
+            is_bounds = producer_is_bounds
+            if is_identity and is_bounds:
+                operation = producer
+        if is_bounds:
+            score_shape = tuple(str(dim) for dim in operation.attrs.get("score_shape", ()))
+            sequence = str(operation.attrs.get("sequence", ""))
+            if len(score_shape) == 2 and sequence:
+                key_coord = coords[-1] if coords else "0"
+                _, key_coord = self._attention_score_coords(context, score_shape, coords)
+                predicate = f"((({key_coord}) < ({sequence}))[None, :])"
+                # The bounds-valid identity select is itself a predicate
+                # carrier.  A score select has distinct true/false operands
+                # and must retain the score value and -inf replacement;
+                # returning only the predicate would silently erase QK.
+                identity = (
+                    len(operation.operands) == 3
+                    and operation.operands[1] == operation.operands[2]
+                )
+                if not identity:
+                    values = tuple(
+                        common.emit_element(operand, coords, context)
+                        for operand in operation.operands[1:]
+                    )
+                    if len(values) == 2:
+                        return self.where(predicate, values[0], values[1])
+                if len(coords) == 1:
+                    return f"(({key_coord}) < ({sequence}))"
+                suffix = "" if "[None, :]" in key_coord or "[:, None]" in key_coord else "[None, :]"
+                return predicate if suffix == "[None, :]" else f"((({key_coord}) < ({sequence})){suffix})"
+        result_axes = tuple(str(dim) for dim in operation.results[0].type.shape) if operation.results else ()
+        condition_axes = _value_axes(operation.operands[0], context) if operation.operands else ()
+        score_contract = context.kernel.ssa.metadata.get("schedule", {}).get("ascend_attention_retile", {}) if getattr(context, "kernel", None) is not None else {}
+        score_value = operation.operands[1] if len(operation.operands) > 1 else None
+        score_op = context.operations.get(score_value) if score_value else None
+        score_like = score_op is not None and score_op.opcode == "linalg.dot"
+        score_shape = tuple(str(dim) for dim in operation.results[0].type.shape) if operation.results else ()
+        if score_value in getattr(context, "value_types", {}):
+            score_value_shape = tuple(str(dim) for dim in context.value_types[score_value].shape)
+            plan = score_contract.get("dot_tiles", {}).get("qk", {}) if isinstance(score_contract, dict) else {}
+            planned = tuple(str(dim) for dim in plan.get("tile_shapes", {}).get("result", ()))
+            score_like = score_like or (planned and score_value_shape == planned and score_shape == planned)
+        if not score_like and score_value:
+            pending = [score_value]
+            seen = set()
+            while pending and not score_like:
+                value = pending.pop()
+                if value in seen:
+                    continue
+                seen.add(value)
+                producer = context.operations.get(value)
+                if producer is None:
+                    continue
+                score_like = producer.opcode == "linalg.dot"
+                pending.extend(producer.operands)
+        if not is_bounds and not (score_like and len(result_axes) == 2 and len(condition_axes) == 2 and result_axes != condition_axes and score_contract):
+            return None
+        score_shape = tuple(str(dim) for dim in operation.attrs.get("score_shape", ()))
+        if not score_shape:
+            score_shape = result_axes
+        if len(score_shape) != 2:
+            return None
+        sequence = str(operation.attrs.get("sequence", ""))
+        if not sequence:
+            return None
+        _, key_coord = self._attention_score_coords(context, score_shape, coords)
+        predicate = f"((({key_coord}) < ({sequence}))[None, :])"
+        if is_bounds:
+            return predicate
+        values = tuple(common.emit_element(operand, coords, context) for operand in operation.operands[1:])
+        if len(values) == 2:
+            return self.where(predicate, values[0], values[1])
+        return predicate
 
     def vector_reduce(self, operator: str, operand: str, axis: int | None) -> str:
         if operator == "all":
@@ -196,6 +663,16 @@ class AscendTarget(TritonTarget):
                     "Ascend RNG lowering requires seed and offset operands."
                 )
             return f"tl.rand({args[0]}, {args[1]})"
+
+        # The installed Triton-Ascend language module does not expose
+        # ``tl.tanh``, and its libdevice symbol is not accepted by the
+        # AST-to-TTIR path for vector values.  Express tanh through the
+        # available exponential intrinsic.  Keep this mapping private to
+        # Ascend so the CUDA/Triton emitters retain their native spelling.
+        if name == "tanh" and args:
+            args = tuple(self._upcast_fp32(arg) for arg in args)
+            value = args[0]
+            return f"(2.0 / (1.0 + tl.exp(-2.0 * ({value}))) - 1.0)"
 
         if name in _ASCEND_FP32_UNARY_INTRINSICS and args:
             # Ascend Vector math is most stable when low-precision operands are
@@ -259,6 +736,13 @@ class AscendTarget(TritonTarget):
 
         kernel = context.kernel
         body = common.rewrite_index_math(context.body, c_style=False)
+        schedule = kernel.ssa.metadata.get("schedule", {})
+        access = schedule.get("ascend_access_template_resources", {})
+        native_conv = (
+            kernel.ssa.metadata.get("optimization", {}).get("preserve_linalg")
+            and isinstance(access, Mapping)
+            and access.get("operator") == "conv2d-im2col"
+        )
         runtime_params = set(kernel.metadata.get("runtime_shape_params", ()))
         params = ",\n    ".join(
             (
@@ -268,7 +752,7 @@ class AscendTarget(TritonTarget):
                     axis if axis in runtime_params else f"{axis}: tl.constexpr"
                     for axis in context.shape_params
                 ],
-                "BLOCK: tl.constexpr",
+                *(("BLOCK: tl.constexpr",) if not native_conv else ()),
             )
         )
         kernel_args = ",\n        ".join(
@@ -277,9 +761,16 @@ class AscendTarget(TritonTarget):
         total = context.total
         mask_total = total
         launch_total = total
-        launch_grid = f"triton.cdiv({launch_total}, block)"
-        offsets_expression = "tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)"
-        schedule = kernel.ssa.metadata.get("schedule", {})
+        launch_grid = (
+            context.grid_total
+            if native_conv
+            else f"triton.cdiv({launch_total}, block)"
+        )
+        offsets_expression = (
+            "0"
+            if native_conv
+            else "tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)"
+        )
         tile = dict(schedule.get("ascend_tile_override", schedule.get("tile", {})))
         block_value = tile.get(
             "BLOCK_SIZE_M", tile.get("elements", tile.get("block_m", 256))
@@ -315,6 +806,7 @@ class AscendTarget(TritonTarget):
             offsets_expression = "tl.arange(0, BLOCK)"
 
         result = _output_result(context.outputs)
+        launch_block_arg = "" if native_conv else "BLOCK=block,"
 
         return f"""\"\"\"Ascend Triton lowering generated by NineToothed from ssa.Program.
 
@@ -341,7 +833,7 @@ def launch_{kernel.kernel_name}({", ".join((*context.variables, *context.outputs
     grid = ({launch_grid},)
     {kernel.kernel_name}_kernel[grid](
             {kernel_args},
-            BLOCK=block,
+            {launch_block_arg}
             {compiler_flags}
     )
     return {result}

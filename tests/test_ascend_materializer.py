@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 from ninetoothed.backends.ascend import (
+    ASCEND_ATTENTION_DTYPE_REGISTRY,
     ASCEND_ATTENTION_SOURCE_CONTRACT_ATTRIBUTE,
     UnsupportedBackendOpError,
     ascend_attention_source_contract,
@@ -18,6 +19,7 @@ from ninetoothed.backends.materializers.ascend import (
     AscendMaterializer,
     _ascend_wrapper,
     _current_npu_stream,
+    _canonical_contract_value,
     _load_source_module,
     _logical_offset,
     _validate_ascend_bindings,
@@ -120,6 +122,39 @@ def test_attention_runtime_grid_and_workspace_follow_resource_tile(tile_m):
     )
     assert plan["query_tiles"] == query_tiles
     assert plan["key_tiles"] == key_tiles
+
+
+def test_attention_runtime_rejects_mixed_qkv_output_storage_dtype():
+    specs, tensors, roles, plan, retile, source_contract = _attention_runtime_fixture(16)
+    tensors = dict(tensors)
+    tensors["v"].dtype = "torch.float16"
+
+    with pytest.raises(UnsupportedBackendOpError, match="one storage dtype"):
+        _validate_attention_runtime_contract(
+            specs,
+            tensors,
+            {"version": 2, "access_provenance": roles},
+            {
+                "k_score_mask_before_max": True,
+                "v_value_mask_zero_before_dot": True,
+                "causal_query_key_compare": True,
+                "loop_carried_state": ("acc", "m_i", "l_i"),
+                "all_masked_state_preserving_branch": True,
+            },
+            {"predicate": "%key_valid"},
+            {"all_masked": "%all_masked"},
+            plan,
+            max_core_dim=65535,
+            attention_dtype_registry=ASCEND_ATTENTION_DTYPE_REGISTRY,
+            attention_retile=retile,
+            attention_source_contract=source_contract,
+        )
+
+
+def test_ascend_reload_abi_contract_normalizes_json_sequences():
+    in_memory = {"public_args": ("q",), "kernel_args": ({"name": "q"},)}
+    sidecar = {"public_args": ["q"], "kernel_args": [{"name": "q"}]}
+    assert _canonical_contract_value(in_memory) == _canonical_contract_value(sidecar)
 
 
 def test_attention_runtime_resolves_symbolic_workspace_from_bound_shape():

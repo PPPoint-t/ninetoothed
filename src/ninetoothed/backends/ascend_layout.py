@@ -84,7 +84,7 @@ def admit_tensor_layout(
         # This is a target legality boundary, not a late CANN error.  Do not
         # attempt to materialize a physical address mapping for an aliased view
         # until the Ascend emitter has such a mapping contract.
-        raise UnsupportedBackendOpError(
+        raise AscendLayoutCapabilityError(
             "Ascend backend requires non-overlapping contiguous strides.",
             reason=(
                 f"tensor `{name}` has overlapping strides and its view aliases "

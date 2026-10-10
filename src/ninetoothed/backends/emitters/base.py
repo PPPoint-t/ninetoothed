@@ -114,6 +114,30 @@ class EmitterTarget(ABC):
 
         return None
 
+    def emit_operation_expression(self, operation, coords, context):
+        """Optionally render a target-owned expression for an SSA operation."""
+        del operation, coords, context
+        return None
+
+    def can_reuse_element(self, name, coords, context) -> bool:
+        """Whether a memoized value is valid in the requested coordinate domain."""
+        del name, coords, context
+        return True
+
+    def initialize_emit_context(self, context) -> None:
+        """Supply target-owned program coordinates before traversing the body."""
+        del context
+
+    def native_program_domain(self, kernel, axes, outer_axes):
+        """Optionally supply target-owned native program coordinates."""
+        del kernel, axes, outer_axes
+        return None
+
+    def loop_state_initializer(self, value, initializer, dtype, context):
+        """Optionally materialize a loop state in a target-owned physical domain."""
+        del value, initializer, dtype, context
+        return None
+
     def emit_block_dot(self, operation, context, coords=None):
         del operation, context, coords
 

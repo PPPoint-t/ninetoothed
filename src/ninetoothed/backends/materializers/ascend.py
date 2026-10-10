@@ -1,6 +1,7 @@
 """Ascend Triton Python artifact materialization and reload."""
 
 import types
+import json
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -37,6 +38,15 @@ from ninetoothed.compiler.cache import (
 )
 
 
+def _canonical_contract_value(value):
+    """Compare immutable in-memory contracts with their JSON form."""
+    if isinstance(value, Mapping):
+        return {str(key): _canonical_contract_value(item) for key, item in value.items()}
+    if isinstance(value, (tuple, list)):
+        return [_canonical_contract_value(item) for item in value]
+    return value
+
+
 class AscendMaterializer(Materializer):
     """Publish and reload source-only Ascend Triton artifacts."""
 
@@ -64,6 +74,18 @@ class AscendMaterializer(Materializer):
         specs = _runtime_specs(built.source)
         sidecar = read_ascend_sidecar(source_path)
         abi = ascend_abi_from_dict(sidecar["launch_abi"])
+        if built.abi and _canonical_contract_value(built.abi) != _canonical_contract_value(sidecar["launch_abi"]):
+            raise UnsupportedBackendOpError(
+                "Ascend AOT reload contract mismatch.",
+                reason="BuiltArtifact ABI differs from the sidecar ABI.",
+                suggestion="reload the source, manifest, and sidecar produced as one artifact.",
+            )
+        if sidecar.get("runtime_device") not in (None, "npu"):
+            raise UnsupportedBackendOpError(
+                "Ascend AOT reload contract mismatch.",
+                reason=f"runtime_device={sidecar.get('runtime_device')!r}, expected 'npu'.",
+                suggestion="launch Ascend artifacts only on an NPU device.",
+            )
         tensor_sources = {
             binding.source for binding in abi.kernel_args if binding.kind == "tensor"
         }
@@ -153,6 +175,18 @@ def _materialize(compilation, *, output_dir: str | Path | None):
             outputs=artifact.metadata.get("outputs", ()),
             metadata=artifact.metadata,
         )
+        # Keep the published manifest beside the atomically published source
+        # and sidecar.  The cache manifest remains useful for cache lookup,
+        # while consumers of output_dir receive a self-contained artifact.
+        from ninetoothed.compiler.cache import atomic_write_text, read_manifest
+        manifest = source.with_suffix(".manifest.json")
+        published_manifest = published_source.with_suffix(".manifest.json")
+        cached_manifest = read_manifest(manifest)
+        if cached_manifest is not None:
+            atomic_write_text(
+                published_manifest,
+                json.dumps(cached_manifest, sort_keys=True),
+            )
     module = _load_source_module(source, artifact.kernel_name)
 
     try:
@@ -504,6 +538,7 @@ def _validate_attention_runtime_contract(
     resolved = {role: resolve_tensor(role) for role in ("q", "k", "v", "o")}
     registry = attention_dtype_registry or {}
     expected_shapes = {}
+    runtime_dtypes = {}
     for role, (name, value) in resolved.items():
         shape = tuple(int(dim) for dim in tuple(value.shape))
         if len(shape) != 4:
@@ -519,6 +554,52 @@ def _validate_attention_runtime_contract(
                 "Ascend Attention runtime dtype is not in the verified capability registry.",
                 reason=f"{role} `{name}` has dtype {getattr(value, 'dtype', None)!r}; registry keys={tuple(registry)}.",
                 suggestion="add a complete compile, NPU, and AOT capability record before enabling this dtype.",
+            )
+        runtime_dtypes[role] = dtype
+
+    input_dtypes = set(runtime_dtypes.values())
+    if len(input_dtypes) != 1:
+        raise UnsupportedBackendOpError(
+            "Ascend Attention requires one storage dtype for Q/K/V/O.",
+            reason=f"runtime role dtypes={runtime_dtypes!r}.",
+            suggestion="compile a separate artifact for one supported Attention dtype.",
+        )
+    attention_dtype = next(iter(input_dtypes))
+    dtype_contract = registry.get(attention_dtype)
+    # Small unit fixtures historically pass {dtype: {}} because they exercise
+    # only shape/grid validation.  JIT/AOT artifacts carry the versioned
+    # registry entry and therefore receive the complete cross-stage check.
+    if isinstance(dtype_contract, Mapping) and dtype_contract.get("version") is not None:
+        canonical = ASCEND_ATTENTION_DTYPE_REGISTRY.get(attention_dtype)
+        if canonical is None:
+            raise UnsupportedBackendOpError(
+                "Ascend Attention dtype contract is not supported.",
+                reason=f"dtype={attention_dtype!r} is absent from the canonical registry.",
+                suggestion="publish one verified JIT/AOT registry contract before launch.",
+            )
+
+        def canonicalize(value):
+            if isinstance(value, Mapping):
+                return {str(key): canonicalize(item) for key, item in value.items()}
+            if isinstance(value, (tuple, list)):
+                return [canonicalize(item) for item in value]
+            return value
+
+        if canonicalize(dtype_contract) != canonicalize(canonical):
+            raise UnsupportedBackendOpError(
+                "Ascend Attention dtype contract differs from the canonical registry.",
+                reason=f"dtype={attention_dtype!r}, contract={dtype_contract!r}.",
+                suggestion="use the same registry entry for JIT materialization and AOT reload.",
+            )
+        expected_inputs = {
+            role: normalize_ascend_dtype(value)
+            for role, value in canonical["input"].items()
+        }
+        if runtime_dtypes != expected_inputs:
+            raise UnsupportedBackendOpError(
+                "Ascend Attention runtime dtype does not match its registry contract.",
+                reason=f"runtime={runtime_dtypes!r}, expected={expected_inputs!r}.",
+                suggestion="bind Q/K/V/O with the dtype used to compile this artifact.",
             )
 
     q_shape = expected_shapes["q"]

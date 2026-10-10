@@ -15,6 +15,7 @@ from ninetoothed.backends.ascend import (
     ascend_logical_domain,
     is_static_forward_view_offset,
     static_forward_view_offset,
+    UnsupportedBackendOpError,
 )
 from ninetoothed.backends.core import Target
 from ninetoothed.compiler import DEFAULT_COMPILER, CompileRequest
@@ -42,7 +43,7 @@ def test_ascend_attention_dtype_capability_matrix_is_explicit():
     assert attention["l_i"] == "float32"
     assert attention["accumulator"] == "float32"
     assert attention["error_tolerance"]["float32"] == {"rtol": 0.025, "atol": 0.025}
-    for dtype in ("float16", "float32"):
+    for dtype in ("float16", "bfloat16", "float32"):
         assert registry[dtype]["status"] == "verified-jit-aot-npu"
         assert registry[dtype]["runtime"] == {
             "device": "Ascend910B4",
@@ -51,7 +52,39 @@ def test_ascend_attention_dtype_capability_matrix_is_explicit():
             "triton": "3.2.0",
             "triton_ascend": "3.2.2",
         }
-    assert registry["bfloat16"]["status"] == "contract-only-awaiting-npu-gates"
+    assert registry["bfloat16"]["status"] == "verified-jit-aot-npu"
+    assert registry["bfloat16"]["input"] == {
+        "q": "bfloat16",
+        "k": "bfloat16",
+        "v": "bfloat16",
+        "o": "bfloat16",
+    }
+    assert registry["bfloat16"]["internal"] == {
+        "score": "float32",
+        "softmax": "float32",
+        "acc": "float32",
+        "m_i": "float32",
+        "l_i": "float32",
+    }
+    assert registry["bfloat16"]["error"] == {"rtol": 0.05, "atol": 0.1}
+
+
+@pytest.mark.parametrize("dtype", ("float64", "int8"))
+def test_ascend_attention_rejects_unverified_dtype_at_planning(dtype):
+    from tests import test_attention
+
+    q = k = v = output = Tensor(shape=(2, 4, 1, 64), dtype=dtype)
+    with pytest.raises(UnsupportedBackendOpError, match="dtype capability is unsupported"):
+        DEFAULT_COMPILER.compile(
+            CompileRequest(
+                arrangement=test_attention.arrangement,
+                application=test_attention.application,
+                tensors=(q, k, v, Tensor(0, constexpr=True), output),
+                backend=Target.ASCEND,
+                kernel_name=f"attention_unsupported_{dtype}",
+                backend_options={"soc_version": "Ascend910B4", "max_core_dim": 65535},
+            )
+        )
 
 
 def test_ascend_weight_only_and_fp8_capability_boundaries_are_explicit():
@@ -514,6 +547,77 @@ def test_ascend_attention_symbolic_key_loop_upper_uses_planned_n(monkeypatch):
     assert f"triton.cdiv(" in compilation.artifact.primary_source
     assert str(selected_tile["m"]) in schedule["ascend_attention_retile"]["grid"]
     assert schedule["ascend_attention_mask_semantics"]["all_masked_state_preserving_branch"]
+
+    provenance = schedule["ascend_tile_provenance"]
+    roles = {entry["role"]: entry for entry in provenance["entries"]}
+    assert set(roles) >= {"matmul-m", "matmul-n", "reduction-k"}
+    assert all(entry["candidate_values"] for entry in roles.values())
+    assert all(entry["resolved"] is not None for entry in roles.values())
+    assert all(entry["ssa_operations"] for entry in roles.values())
+
+
+def test_ascend_attention_retile_rejects_missing_resource_role():
+    from tests.test_attention import application, arrangement
+
+    qkv = tuple(Tensor(shape=(2, 4, 65, 64), dtype="float32") for _ in range(4))
+    captured = {}
+    original = ascend_backend._structured_retile_ascend_attention
+    def capture(kernel, provenance):
+        captured["kernel"] = kernel
+        return original(kernel, provenance)
+    # Stop at the private retile boundary so the test can mutate its input
+    # provenance without depending on the later emitter artifact wrapper.
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(ascend_backend, "_structured_retile_ascend_attention", capture)
+    DEFAULT_COMPILER.compile(
+        CompileRequest(
+            arrangement=arrangement,
+            application=application,
+            tensors=(*qkv[:3], Tensor(0, constexpr=True), qkv[3]),
+            backend=Target.ASCEND,
+        )
+    )
+    monkeypatch.undo()
+    kernel = captured["kernel"]
+    provenance = dict(kernel.ssa.metadata["schedule"]["ascend_tile_provenance"])
+    provenance["entries"] = tuple(
+        entry for entry in provenance["entries"] if entry["role"] != "matmul-n"
+    )
+    with pytest.raises(ValueError, match="requires M/N/K tile roles"):
+        ascend_backend._structured_retile_ascend_attention(kernel, provenance)
+
+
+def test_ascend_attention_retile_rejects_resource_plan_provenance_mismatch():
+    from tests.test_attention import application, arrangement
+
+    qkv = tuple(Tensor(shape=(2, 4, 65, 64), dtype="float32") for _ in range(4))
+    captured = {}
+    original = ascend_backend._structured_retile_ascend_attention
+    def capture(kernel, provenance):
+        captured["kernel"] = kernel
+        return original(kernel, provenance)
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(ascend_backend, "_structured_retile_ascend_attention", capture)
+    DEFAULT_COMPILER.compile(
+        CompileRequest(
+            arrangement=arrangement,
+            application=application,
+            tensors=(*qkv[:3], Tensor(0, constexpr=True), qkv[3]),
+            backend=Target.ASCEND,
+        )
+    )
+    monkeypatch.undo()
+    kernel = captured["kernel"]
+    provenance = dict(kernel.ssa.metadata["schedule"]["ascend_tile_provenance"])
+    entries = []
+    for entry in provenance["entries"]:
+        entry = dict(entry)
+        if entry["role"] == "matmul-m":
+            entry["resolved"] = int(entry["resolved"]) + 16
+        entries.append(entry)
+    provenance["entries"] = tuple(entries)
+    with pytest.raises(ValueError, match="does not match the resource plan"):
+        ascend_backend._structured_retile_ascend_attention(kernel, provenance)
 
 
 def test_ascend_rng_contract_requires_seed_and_offset():

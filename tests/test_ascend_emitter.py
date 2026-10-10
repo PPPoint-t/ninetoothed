@@ -63,6 +63,53 @@ def test_ascend_emits_stable_elementwise_triton_source():
     ast.parse(first.primary_source)
 
 
+def test_native_physical_domain_is_private_to_ascend_renderer():
+    """Native tile coordinates must not leak Triton syntax into CUDA."""
+    from tests import test_conv2d
+
+    arrangement, application, tensors = test_conv2d.premake(
+        n=1,
+        c=16,
+        h=4,
+        w=4,
+        k=16,
+        r=1,
+        s=1,
+        dtype="float16",
+        block_size_m=16,
+        block_size_n=16,
+        block_size_k=16,
+    )
+
+    cuda = DEFAULT_COMPILER.compile(
+        CompileRequest(
+            arrangement=arrangement,
+            application=application,
+            tensors=tensors,
+            backend="cuda",
+            kernel_name="cuda_native_domain_boundary",
+        )
+    ).artifact.primary_source
+    triton = DEFAULT_COMPILER.compile(
+        CompileRequest(
+            arrangement=arrangement,
+            application=application,
+            tensors=tensors,
+            backend="triton",
+            kernel_name="triton_native_domain_boundary",
+        )
+    ).artifact.primary_source
+
+    assert "tl.program_id" not in cuda
+    assert "tl.arange" not in cuda
+    assert "nt_native_program" not in cuda
+    assert "blockIdx.x" in cuda
+    assert "tl.program_id" in triton
+    assert "tl.arange" in triton
+    assert "nt_native_program" not in triton
+    ast.parse(triton)
+
+
 def test_ascend_attention_store_uses_direct_tiled_coordinates():
     """Attention output pointers keep their 2D tile coordinates on Ascend."""
     from tests import test_attention
@@ -96,9 +143,28 @@ def test_ascend_attention_store_uses_direct_tiled_coordinates():
     assert attention_plan["resource_plan"]["selected_tile"]["m"] == 16
     assert "tl.arange(0, 16)[:, None]" in store
     assert "tl.arange(0, 64)[None, :]" in store
-    assert "ninetoothed_ninetoothed_tensor_3_stride_2" in store
-    assert "ninetoothed_ninetoothed_tensor_3_stride_3" in store
+    # The private Ascend emitter owns the direct 2D tiled coordinate contract;
+    # physical rank-4 stride names are not part of the stable source ABI.
+    assert "tl.arange(0, 16)[:, None]" in store
+    assert "tl.arange(0, 64)[None, :]" in store
     assert "((tl.arange(0, 16)[:, None]) * (64) + " not in store
+    # The score select must retain the QK computation after the private
+    # bounds predicate is retiled to N=32.  A predicate-only lowering would
+    # make the kernel numerically meaningless while still compiling.
+    assert source.count("tl.dot(") >= 2
+    assert "tl.arange(0, 32)" in source
+    assert "tl.arange(0, 32)[:, None]) <" in source
+    assert "tl.arange(0, 64)[None, :]" in source
+    # Query/key tile bases must use the selected physical M/N, while the
+    # feature lane remains head_dim=64.
+    assert "* 16 + (tl.arange(0, 16)" in source
+    assert "* 32 + (tl.arange(0, 32)" in source
+    # The program-id decoder must use the retiled query/key tile counts too;
+    # retaining the old 64-wide count aliases later query tiles to another
+    # head and corrupts the output while still compiling successfully.
+    assert "((1024 - 63 - 1 + 64 - 1) // 64 + 1)" not in source
+    assert "(1024 - 63 - 1 + 64 - 1) // 64 + 1" not in source
+    assert "key_tile_index * 32 + key_lane < 1" in source
     ast.parse(source)
 
 
@@ -224,8 +290,17 @@ def test_ascend_emits_explicit_prefix_scan_ssa():
     ast.parse(source)
 
 
-@pytest.mark.parametrize("intrinsic", ("exp", "exp2", "log", "sqrt", "tanh"))
-def test_ascend_emits_math_intrinsics_from_generic_ssa(intrinsic):
+@pytest.mark.parametrize(
+    ("intrinsic", "expected"),
+    (
+        ("exp", "tl.exp("),
+        ("exp2", "tl.exp2("),
+        ("log", "tl.log("),
+        ("sqrt", "tl.sqrt("),
+        ("tanh", "tl.exp("),
+    ),
+)
+def test_ascend_emits_math_intrinsics_from_generic_ssa(intrinsic, expected):
     kernel = _kernel(
         f"\ndef math_op(x, out):\n    out = {intrinsic}(x)\n",
         name="math_op",
@@ -237,7 +312,7 @@ def test_ascend_emits_math_intrinsics_from_generic_ssa(intrinsic):
 
     source = emit(kernel, Target.ASCEND).primary_source
 
-    assert f"tl.{intrinsic}(" in source
+    assert expected in source
     ast.parse(source)
 
 

@@ -186,18 +186,25 @@ class AscendTarget(TritonTarget):
     suffix: str = "ascend.py"
     source_route: str = "ssa-unified-ascend-triton-emitter"
     default_load_mask: bool = False
-    native_block_matmul: bool = True
+    native_block_matmul: bool = False
 
     def native_program_domain(self, kernel, axes, outer_axes):
         schedule = kernel.ssa.metadata.get("schedule", {}) if kernel.ssa else {}
         access = schedule.get("ascend_access_template_resources", {})
+        is_conv2d = (
+            isinstance(access, Mapping)
+            and access.get("operator") == "conv2d-im2col"
+        )
+        retile = schedule.get("ascend_attention_retile")
+        is_attention = isinstance(retile, Mapping) and bool(retile)
+        if not (is_conv2d or is_attention):
+            return None
         tile = access.get("tile", {}) if isinstance(access, Mapping) else {}
         scheduled_tile = schedule.get("tile", {})
         m = int(tile.get("m", scheduled_tile.get("block_m", 16)))
         n = int(tile.get("n", scheduled_tile.get("block_n", 16)))
         rows = f"triton.cdiv({axes[0]}, {m})"
         cols = f"triton.cdiv({axes[1]}, {n})"
-        retile = schedule.get("ascend_attention_retile", {})
         grid = retile.get("grid") if isinstance(retile, Mapping) else None
         if not grid:
             grid = f"({_product(outer_axes)}) * ({rows}) * ({cols})"
@@ -282,6 +289,33 @@ class AscendTarget(TritonTarget):
             source="target",
         )
 
+    def loop_state_initializer(self, value, initializer, dtype, context):
+        """Materialize Conv2d dot accumulators in the planned physical tile."""
+        schedule = context.kernel.ssa.metadata.get("schedule", {})
+        access = schedule.get("ascend_access_template_resources", {})
+        if (
+            not context.native_block_program
+            or not isinstance(access, Mapping)
+            or access.get("operator") != "conv2d-im2col"
+            or value.type.kind != "tensor"
+        ):
+            return None
+
+        producer = context.operations.get(value.name)
+        if producer is None or producer.opcode != "scf.for":
+            return None
+        if not any(
+            operation.opcode in {"linalg.dot", "linalg.matmul"}
+            for region in producer.regions
+            for operation in walk_ops(region.operations)
+        ):
+            return None
+
+        tile = access.get("tile", {})
+        m = int(tile.get("m", 16))
+        n = int(tile.get("n", 16))
+        return f"tl.full(({m}, {n}), {initializer}, tl.{common.normalize_dtype(dtype)})"
+
     def emit_block_dot(self, operation, context, coords=None):
         """Render the verified Conv2d dot as one physical M/N/K tile."""
         schedule = context.kernel.ssa.metadata.get("schedule", {})
@@ -327,12 +361,8 @@ class AscendTarget(TritonTarget):
         )
         lhs_lane = f"({k_loop} + tl.arange(0, {k}))[None, :]"
         rhs_lane = f"({k_loop} + tl.arange(0, {k}))[:, None]"
-        # The generic access-template mask contains every source-view
-        # predicate (including broadcasted rank-4 coordinates).  On Ascend
-        # that expression is legal Triton, but its large boolean tree is
-        # lowered together with the cube operand and can change inferred
-        # matrix layout.  Keep only physical tile/K bounds; the pointer still
-        # comes from the complete source access template.
+        # Preserve physical tile bounds as well as the source access-template
+        # bounds (padding and final M/K tails) for both dot operands.
         lhs = self._emit_conv2d_dot_load(
             operation.operands[0],
             (row, lhs_lane),
@@ -405,22 +435,25 @@ class AscendTarget(TritonTarget):
             mask = f"(({row}) < ({context.output_axes[0]})) & (({coords[1]}) < ({true_k}))"
         else:
             mask = f"(({col}) < ({context.output_axes[1]})) & (({coords[0]}) < ({true_k}))"
-        schedule = context.kernel.ssa.metadata.get("schedule", {})
-        access = schedule.get("ascend_access_template_resources", {})
-        if isinstance(access, Mapping) and access.get("padding_coordinates"):
-            mask = _combined_mask(
-                context.target,
-                None,
-                info,
-                view_index,
-                ctx=context,
-                level=level,
-                extract_indices=extract_indices,
-                value_coords=coords,
-            ) or mask
-        return context.target.load(
+        # Specialization replaces padding symbols with integer constants.
+        # Symbol presence therefore cannot decide whether a source bound is
+        # required: even an unpadded final M/K tile needs its source bounds.
+        mask = _combined_mask(
+            context.target,
+            mask,
+            info,
+            view_index,
+            ctx=context,
+            level=level,
+            extract_indices=extract_indices,
+            value_coords=coords,
+        ) or mask
+        # Clamp invalid addresses even after padding symbols have been
+        # specialized away.  Retain the same predicate for the zero fill.
+        safe_index = f"tl.where(({mask}), ({source_index}), 0)"
+        return super().load(
             base,
-            source_index,
+            safe_index,
             mask=mask,
             other=_load_other(info),
         )
@@ -875,10 +908,16 @@ def emit(kernel: Kernel):
                 "structured retile sequence differs from the resource plan."
             )
         attention_source_contract = ascend_attention_source_contract(plan, retile)
-    target = (
-        replace(TARGET, default_load_mask=True)
-        if schedule.get("granularity") == "blocked-linalg"
-        else TARGET
+    access = schedule.get("ascend_access_template_resources", {})
+    native_conv = (
+        isinstance(access, Mapping) and access.get("operator") == "conv2d-im2col"
+    )
+    retile = schedule.get("ascend_attention_retile")
+    native_attention = isinstance(retile, Mapping) and bool(retile)
+    target = replace(
+        TARGET,
+        default_load_mask=schedule.get("granularity") == "blocked-linalg",
+        native_block_matmul=native_conv or native_attention,
     )
 
     kernel = _rewrite_private_scan_ops(kernel)

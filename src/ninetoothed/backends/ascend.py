@@ -716,7 +716,15 @@ def ascend_dtype_legality(dtypes):
         if normalized in UNSUPPORTED_DTYPES:
             if normalized.startswith("float8"):
                 raise UnsupportedBackendOpError(
-                    "Ascend 910B3 backend does not support float8 execution."
+                    f"Ascend 910B dtype capability is unsupported: {normalized}.",
+                    reason=(
+                        "the verified 910B3/910B4 CANN and torch_npu paths do not "
+                        "support FP8 tensor conversion or native FP8 dot operands."
+                    ),
+                    suggestion=(
+                        "provide float16/bfloat16/float32 inputs, or use a device "
+                        "and toolchain with verified FP8 tensor and dot support."
+                    ),
                 )
             raise UnsupportedBackendOpError(
                 f"Ascend 910B3 hardware does not support dtype {normalized}; "

@@ -8,6 +8,7 @@ import ast
 import functools
 import json
 from collections.abc import Mapping
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -172,6 +173,65 @@ def test_ascend_conv2d_static_aot_uses_verified_resource_tile(tile, tmp_path):
     # physical tile coordinates, so its kernel ABI must omit that parameter.
     assert "BLOCK: tl.constexpr" not in source
     assert "BLOCK=block" not in source
+    assert "tl.full((16, 16)," in source
+    assert not any(
+        isinstance(node, ast.Name) and node.id == "BLOCK"
+        for node in ast.walk(ast.parse(source))
+    )
+
+
+@pytest.mark.parametrize("padding", ((1, 1), (0, 1), (2, 0)))
+def test_ascend_specialized_conv2d_retains_source_bounds(padding):
+    """Constant padding must retain the exact source-view load predicate."""
+    import numpy as np
+
+    out_h = 4 + 2 * padding[0] - 3 + 1
+    out_w = 4 + 2 * padding[1] - 3 + 1
+    request = _padded_dot_loop_request()
+    request = replace(
+        request,
+        tensors=(*request.tensors[:2], Tensor(shape=(1, 3, out_h, out_w), dtype="float16")),
+        specialization_values={
+            "ninetoothed_constexpr_prefix_padding_h": padding[0],
+            "ninetoothed_constexpr_prefix_padding_w": padding[1],
+        },
+    )
+    compilation = DEFAULT_COMPILER.compile(request)
+    source = compilation.artifact.primary_source
+    schedule = compilation.artifact.metadata["ssa_metadata"]["schedule"]
+    # Reproduce the JIT boundary where all padding symbols have disappeared.
+    assert not schedule["ascend_access_template_resources"]["padding_coordinates"]
+    tree = ast.parse(source)
+    load = next(
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute) and node.func.attr == "load"
+        and any(isinstance(part, ast.Name) and part.id == "lhs"
+                for part in ast.walk(node.args[0]))
+    )
+    mask = next(keyword.value for keyword in load.keywords if keyword.arg == "mask")
+    # Evaluate only the emitted boolean predicate, with coordinates for the
+    # first output/K tile; this is a source test, not an operator fallback.
+    class Language:
+        arange = staticmethod(np.arange)
+
+    rows = np.arange(16)[:, None]
+    lanes = np.arange(16)[None, :]
+    names = {
+        "tl": Language,
+        "nt_matrix_row": rows,
+        "nt_matrix_col": np.arange(16)[None, :],
+        "nt_conv_k": 0,
+        "nt_outer_index": 0,
+        "vaccumulator_8_i": 0,
+    }
+    predicate = eval(compile(ast.Expression(mask), "<conv2d-load-mask>", "eval"),
+                     {"__builtins__": {}}, names)
+    in_h = rows % (out_h * out_w) // out_w + lanes % 9 // 3 - padding[0]
+    in_w = rows % (out_h * out_w) % out_w + lanes % 9 % 3 - padding[1]
+    expected = ((rows < out_h * out_w) & (in_h >= 0) & (in_h < 4)
+                & (in_w >= 0) & (in_w < 4))
+    np.testing.assert_array_equal(predicate, expected)
 
 
 def test_ascend_padded_conv_access_template_clamps_invalid_addresses():
@@ -185,7 +245,18 @@ def test_ascend_padded_conv_access_template_clamps_invalid_addresses():
     assert "ninetoothed_constexpr_prefix_padding_h" in source
     assert "ninetoothed_constexpr_prefix_padding_w" in source
     assert "tl.load(lhs + tl.where((" in source
-    assert "), 0), mask=(True &" in source
+    tree = ast.parse(source)
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "load"):
+            continue
+        pointer = node.args[0]
+        assert isinstance(pointer, ast.BinOp)
+        clamp = pointer.right
+        assert isinstance(clamp, ast.Call) and clamp.func.attr == "where"
+        mask = next(keyword.value for keyword in node.keywords if keyword.arg == "mask")
+        assert ast.dump(clamp.args[0]) == ast.dump(mask)
+        assert ast.literal_eval(clamp.args[2]) == 0
     ast.parse(source)
 
 

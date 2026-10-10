@@ -96,6 +96,26 @@ def test_ascend_weight_only_and_fp8_capability_boundaries_are_explicit():
     assert "not-supported" in matrix["dtypes"]["fail_closed"]["float8_e5m2"]
 
 
+@pytest.mark.parametrize("dtype", ("float8_e5m2", "float8_e4m3fn"))
+def test_ascend_matmul_fp8_rejected_before_emission(dtype):
+    from tests import test_matmul
+
+    with pytest.raises(UnsupportedBackendOpError, match="dtype capability is unsupported") as error:
+        DEFAULT_COMPILER.compile(
+            CompileRequest(
+                arrangement=test_matmul.arrangement,
+                application=test_matmul.application,
+                tensors=(Tensor(shape=(512, 512), dtype=dtype),
+                         Tensor(shape=(512, 512), dtype=dtype),
+                         Tensor(shape=(512, 512), dtype="float16")),
+                backend=Target.ASCEND,
+                backend_options={"soc_version": "Ascend910B4"},
+            )
+        )
+    assert dtype in str(error.value)
+    assert "native FP8 dot" in error.value.reason
+
+
 def test_ascend_pipeline_and_autotune_boundaries_are_explicit():
     micro = ascend_capability_matrix()["microarchitecture"]
     assert micro["double_buffering"].startswith("not-emittable")

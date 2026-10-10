@@ -2000,6 +2000,67 @@ def test_ascend_conv2d_target_scale_compile_only_diagnostics(tmp_path):
         _ascend_conv2d_stage_skip(name, "compile-only diagnostic")
 
 
+@pytest.mark.parametrize("padding", ((0, 0), (1, 1), (0, 1), (2, 0)))
+def test_ascend_conv2d_specialized_padding_compile_jit_aot_reload(tmp_path, padding):
+    """Target-size regression for physical state and specialized source masks."""
+    import functools
+
+    import torch
+    import torch_npu  # noqa: F401
+
+    from ninetoothed.compiler.runtime import _bound_values
+    from tests import test_conv2d
+
+    out_h = 16 + 2 * padding[0] - 3 + 1
+    out_w = 16 + 2 * padding[1] - 3 + 1
+    with _ascend_conv2d_stage("lowering/source generation"):
+        compilation = DEFAULT_COMPILER.compile(
+            CompileRequest(
+                arrangement=functools.partial(
+                    test_conv2d.arrangement, enable_padding=True,
+                    BLOCK_SIZE_M=64, BLOCK_SIZE_N=64, BLOCK_SIZE_K=64,
+                ),
+                application=test_conv2d.matmul.application,
+                tensors=(Tensor(shape=(4, 64, 16, 16), dtype="float16"),
+                         Tensor(shape=(512, 64, 3, 3), dtype="float16"),
+                         Tensor(shape=(4, 512, out_h, out_w), dtype="float16")),
+                backend="ascend",
+                specialization_values={
+                    "ninetoothed_constexpr_prefix_padding_h": padding[0],
+                    "ninetoothed_constexpr_prefix_padding_w": padding[1],
+                },
+            )
+        )
+    input_value = torch.rand((4, 64, 16, 16), device="npu", dtype=torch.float16)
+    filter_value = torch.rand((512, 64, 3, 3), device="npu", dtype=torch.float16)
+    output = torch.empty((4, 512, out_h, out_w), device="npu", dtype=torch.float16)
+    with _ascend_conv2d_stage("Triton import"):
+        jit = DEFAULT_COMPILER.materialize(compilation, output_dir=tmp_path / "jit", mode="jit")
+    public = {"lhs": input_value, "rhs": filter_value, "output": output}
+    values, _keepalive = _bound_values(compilation.launch_abi, public, scalar_mode="value")
+    grid = ((4 * out_h * out_w + 63) // 64) * 8 * 16
+    with _ascend_conv2d_stage("CANN compile (warmup, no launch)"):
+        compiled = jit._kernel[1].warmup(
+            *values, grid=(grid,), multibuffer=False, num_stages=1,
+        )
+        assert "npubin" in compiled.asm
+    with _ascend_conv2d_stage("AOT build"):
+        aot = DEFAULT_COMPILER.materialize(compilation, output_dir=tmp_path / "aot", mode="aot")
+    with _ascend_conv2d_stage("AOT reload"):
+        reloaded = load_built_artifact(aot._built_artifact)
+    expected = torch.nn.functional.conv2d(input_value, filter_value, padding=padding)
+    for name, launch in (("JIT", jit), ("AOT reload", reloaded)):
+        output.fill_(float("nan"))
+        with _ascend_conv2d_stage(f"{name} kernel launch"):
+            assert launch(input_value, filter_value, output) is output
+        with _ascend_conv2d_stage(f"{name} torch.npu.synchronize"):
+            torch.npu.synchronize()
+        with _ascend_conv2d_stage(f"{name} output contract"):
+            assert output.shape == expected.shape and output.dtype == torch.float16
+        with _ascend_conv2d_stage(f"{name} numerical comparison"):
+            torch.testing.assert_close(output, expected, rtol=0.001, atol=0.001)
+
+
 @pytest.mark.ascend_next_stage
 def test_ascend_conv2d_target_scale_jit_aot_stage_diagnostics(tmp_path):
     """Run target-size Conv2d and report every JIT/AOT runtime boundary."""

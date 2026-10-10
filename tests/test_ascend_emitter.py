@@ -110,6 +110,27 @@ def test_native_physical_domain_is_private_to_ascend_renderer():
     ast.parse(triton)
 
 
+def test_ascend_tiled_matmul_keeps_vector_domain():
+    """Exercise preserve_linalg with the public JIT matmul arrangement."""
+    from tests import test_matmul
+
+    compilation = DEFAULT_COMPILER.compile(
+        CompileRequest(
+            arrangement=test_matmul.arrangement,
+            application=test_matmul.application,
+            tensors=tuple(Tensor(shape=(512, 512), dtype="float16") for _ in range(3)),
+            backend=Target.ASCEND,
+        )
+    )
+    assert compilation.artifact.metadata["ssa_metadata"]["optimization"]["preserve_linalg"]
+    source = compilation.artifact.primary_source
+    assert "nt_native_program" not in source
+    assert "nt_matrix_row" not in source
+    assert "nt_matrix_col" not in source
+    assert "tl.arange(0," in source
+    ast.parse(source)
+
+
 def test_ascend_attention_store_uses_direct_tiled_coordinates():
     """Attention output pointers keep their 2D tile coordinates on Ascend."""
     from tests import test_attention
@@ -523,6 +544,10 @@ def test_ascend_emits_decomposed_matmul_with_tail_safe_loads():
     source = emit(kernel, Target.ASCEND).primary_source
 
     assert "linalg.matmul" not in source
+    # Ordinary matmul keeps the vector block domain.  Ascend's native 2D
+    # program coordinates are reserved for Conv2d/Attention contracts.
+    assert "nt_native_program" not in source
+    assert "nt_matrix_row" not in source
     assert "for v10_i in range(0, k, 1):" in source
     assert source.count("mask=mask, other=0.0") >= 2
     assert diagnose_opcode_coverage(kernel)["unsupported"] == ()
